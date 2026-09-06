@@ -344,11 +344,15 @@ fn robot_history_from_nested_dir_uses_beads_diff_when_message_has_no_id() {
     let nested_dir = repo_dir.join("nested/work");
     let beads_dir = repo_dir.join(".beads");
     let beads_dir_str = beads_dir.to_string_lossy().to_string();
+    let trace = repo_dir.join("git-trace.jsonl");
 
     let output = run_bvr_json_in_dir_with_env(
         &["--robot-history", "--history-limit", "20"],
         &nested_dir,
-        &[("BEADS_DIR", beads_dir_str.as_str())],
+        &[
+            ("BEADS_DIR", beads_dir_str.as_str()),
+            ("GIT_TRACE2_EVENT", trace.to_str().expect("trace path")),
+        ],
     );
 
     let commits = output["histories"]["HIST-3"]["commits"]
@@ -363,6 +367,35 @@ fn robot_history_from_nested_dir_uses_beads_diff_when_message_has_no_id() {
             .iter()
             .any(|commit| commit["message"] == "sync snapshots")
     );
+
+    let change = commits
+        .iter()
+        .find(|commit| commit["message"] == "sync snapshots")
+        .expect("snapshot correlation");
+    assert_eq!(change["method"], "co_committed");
+    assert_eq!(change["confidence"], 0.95);
+    assert!(change["field_changes"].as_array().is_some_and(|changes| {
+        changes.iter().any(|field| {
+            field["field"] == "status"
+                && field["old_value"] == "open"
+                && field["new_value"] == "in_progress"
+        })
+    }));
+
+    // louiselm-cvlc: the CLI used to run each identical git show twice,
+    // once for IDs and again for field changes. Count work, not wall time.
+    let trace = fs::read_to_string(trace).expect("Git trace");
+    let show_calls = trace
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("trace event"))
+        .filter(|event| {
+            event["event"] == "start"
+                && event["argv"]
+                    .as_array()
+                    .is_some_and(|args| args.iter().any(|arg| arg == "show"))
+        })
+        .count();
+    assert_eq!(show_calls, 2, "one diff read per Beads commit");
 }
 
 #[test]

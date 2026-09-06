@@ -278,10 +278,6 @@ pub fn correlate_histories_with_git_aliases(
     for commit in commits {
         let mut bead_ids = extract_ids_from_message(&commit.message, &known_ids);
         let mut bead_change_details = BTreeMap::<String, (Vec<FieldChange>, Vec<String>)>::new();
-        if bead_ids.is_empty() && commit.changed_beads {
-            let from_diff = extract_ids_from_beads_diffs(repo_root, commit, &known_ids);
-            bead_ids.extend(from_diff);
-        }
         if commit.changed_beads {
             bead_change_details = extract_bead_change_details(repo_root, commit, &known_ids);
             bead_ids.extend(bead_change_details.keys().cloned());
@@ -430,66 +426,6 @@ fn contains_issue_id_token(message: &str, issue_id: &str) -> bool {
 
 const fn is_issue_id_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
-}
-
-fn extract_ids_from_beads_diffs(
-    repo_root: &Path,
-    commit: &GitCommitRecord,
-    known_ids: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    let mut ids = BTreeSet::<String>::new();
-
-    for file in &commit.files {
-        if !is_beads_jsonl_path(&file.path) {
-            continue;
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .arg("show")
-            .arg("--format=")
-            .arg("--unified=0")
-            .arg(&commit.sha)
-            .arg("--")
-            .arg(&file.path)
-            .output();
-
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-
-        let text = String::from_utf8_lossy(&output.stdout);
-        for raw_line in text.lines() {
-            let line = raw_line.trim();
-            if !(line.starts_with('+') || line.starts_with('-'))
-                || line.starts_with("+++")
-                || line.starts_with("---")
-            {
-                continue;
-            }
-
-            let content = line.trim_start_matches(['+', '-']).trim();
-            if !(content.starts_with('{') && content.ends_with('}')) {
-                continue;
-            }
-
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-                continue;
-            };
-            let Some(raw_id) = value.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if let Some(canonical) = known_ids.get(&raw_id.to_ascii_lowercase()) {
-                ids.insert(canonical.clone());
-            }
-        }
-    }
-
-    ids
 }
 
 fn extract_bead_change_details(
