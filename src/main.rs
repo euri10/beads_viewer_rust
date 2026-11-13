@@ -9619,10 +9619,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_issues_from_jsonl_text_skips_unknown_status_and_malformed_lines() {
-        // Historical parsing must mirror the live loader's tolerance (issue
-        // #24): a custom status that `br` accepts and a malformed line must be
-        // skipped with a warning, not abort the whole snapshot load.
+    fn parse_issues_from_jsonl_text_keeps_custom_status_and_skips_malformed_lines() {
+        // Historical parsing must mirror the live loader (issues #24, #37): a
+        // custom status that `br` accepts is retained, and a malformed line is
+        // skipped with a warning rather than aborting the snapshot load.
         let text = concat!(
             "\u{feff}{\"id\":\"demo-1\",\"title\":\"ordinary\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\"}\n",
             "{\"id\":\"demo-2\",\"title\":\"glossary\",\"status\":\"reference\",\"priority\":4,\"issue_type\":\"vocabulary\"}\n",
@@ -9636,8 +9636,8 @@ mod tests {
         let ids: Vec<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["demo-1", "demo-3"],
-            "known-status issues around skipped records must survive"
+            ["demo-1", "demo-2", "demo-3"],
+            "custom-status records survive; only the malformed line is skipped"
         );
     }
 

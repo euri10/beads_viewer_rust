@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BvrError, Result};
 
+/// br's built-in statuses. Custom statuses are also valid (#37).
+#[cfg(test)]
 const KNOWN_STATUSES: &[&str] = &[
     "open",
     "in_progress",
@@ -339,12 +341,8 @@ impl Issue {
                 self.id
             )));
         }
-        if !KNOWN_STATUSES.contains(&status.as_str()) {
-            return Err(BvrError::InvalidIssue(format!(
-                "issue {} has unknown status: {}",
-                self.id, self.status
-            )));
-        }
+        // Custom statuses (e.g. br's `reference`) are valid: they stay
+        // open-like and non-actionable via the status predicates (#37).
 
         if let (Some(created_at), Some(updated_at)) = (self.created_at, self.updated_at)
             && updated_at < created_at
@@ -859,16 +857,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_unknown_status() {
+    fn validate_accepts_custom_status_as_parked() {
+        // br accepts custom statuses such as `reference` (#37); they must
+        // load, stay open-like, and never become ready work.
         let issue = Issue {
             id: "X-1".to_string(),
             title: "Test".to_string(),
-            issue_type: "task".to_string(),
-            status: "banana".to_string(),
+            issue_type: "vocabulary".to_string(),
+            status: "reference".to_string(),
             ..Default::default()
         };
-        let err = issue.validate().unwrap_err();
-        assert!(err.to_string().contains("unknown status"));
+        assert!(issue.validate().is_ok());
+        assert!(issue.is_open_like());
+        assert!(!issue.is_actionable_status());
+        assert!(!issue.is_claimable_status());
     }
 
     #[test]

@@ -1542,11 +1542,6 @@ mod historical_snapshot_integrity {
                 b"{\"title\":\"missing ID\"}\n".to_vec(),
                 "no valid issue records",
             ),
-            (
-                "custom-only",
-                issue_line("CUSTOM-1", "Unrecognized", "reference", 1).into_bytes(),
-                "no valid issue records",
-            ),
         ];
         for (name, bytes, diagnostic) in cases {
             let directory = tempfile::tempdir().expect("corrupt history fixture");
@@ -1792,13 +1787,19 @@ mod historical_snapshot_integrity {
         );
         fs::write(root.join(".beads/issues.jsonl"), &baseline).expect("mixed baseline");
         commit(root, "append duplicate update among tolerated records");
-        fs::write(root.join(".beads/issues.jsonl"), &final_record)
-            .expect("compacted current snapshot");
+        // Custom statuses are valid records (#37): compaction keeps CUSTOM-1.
+        let custom_record = issue_line("CUSTOM-1", "Custom status", "reference", 1);
+        fs::write(
+            root.join(".beads/issues.jsonl"),
+            format!("{custom_record}\n{final_record}"),
+        )
+        .expect("compacted current snapshot");
         commit(root, "compact valid records");
 
         let historical = json(root, &["--robot-triage", "--as-of", "HEAD~1"]);
         let current = json(root, &["--robot-triage"]);
-        assert_eq!(historical["triage"]["quick_ref"]["total_open"], 0);
+        assert_eq!(historical["triage"]["quick_ref"]["total_open"], 1);
+        assert_eq!(historical["triage"]["quick_ref"]["actionable_count"], 0);
         assert_eq!(historical["data_hash"], current["data_hash"]);
         let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
         assert_eq!(diff["diff"]["summary"]["total_changes"], 0);
