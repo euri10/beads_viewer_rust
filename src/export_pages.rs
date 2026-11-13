@@ -1,25 +1,26 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::analysis::Analyzer;
+use crate::analysis::git_history::HistoryBeadCompat;
 use crate::analysis::triage::TriageOptions;
 use crate::export_sqlite::{
     SQLITE_EXPORT_CONFIG_FILENAME, SQLITE_EXPORT_FILENAME, SqliteBootstrapOptions,
     SqliteBundleOptions, bootstrap_export_database, emit_bootstrap_config,
-    populate_export_database,
+    populate_export_database, snapshot_export_database,
 };
 use crate::model::Issue;
 use crate::{BvrError, Result};
@@ -29,6 +30,9 @@ const DEFAULT_PREVIEW_PORT: u16 = 9000;
 const MAX_PREVIEW_PORT_ATTEMPTS: u16 = 32;
 const PREVIEW_MAX_REQUESTS_ENV: &str = "BVR_PREVIEW_MAX_REQUESTS";
 const PREVIEW_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PREVIEW_MAX_CONNECTIONS: usize = 8;
+const PREVIEW_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const PREVIEW_MAX_HEADER_BYTES: usize = 8192;
 const PREVIEW_STATUS_PATH: &str = "/__preview__/status";
 const PREVIEW_RELOAD_PATH: &str = "/.bvr/livereload";
 
@@ -211,6 +215,49 @@ pub fn export_pages_bundle(
     output_dir: &Path,
     options: &ExportPagesOptions,
 ) -> Result<ExportPagesSummary> {
+    export_pages_bundle_with_history(issues, output_dir, options, &BTreeMap::new())
+}
+
+/// Publish a bundle with factual history prepared from the selected sources.
+///
+/// Entries are scoped to the exported issues and use their current titles and
+/// statuses. Issues without observed events retain the recorded-timestamp
+/// fallback. Resolve Git history before calling this function so a failed scan
+/// cannot modify the published bundle.
+pub fn export_pages_bundle_with_history(
+    issues: &[Issue],
+    output_dir: &Path,
+    options: &ExportPagesOptions,
+    history: &BTreeMap<String, HistoryBeadCompat>,
+) -> Result<ExportPagesSummary> {
+    let mut publication = PagesPublication::new(output_dir)?;
+    let database_guard =
+        snapshot_export_database(&publication.output_dir, &publication.staged_dir)?;
+    let summary = build_pages_bundle(
+        issues,
+        &publication.staged_dir,
+        output_dir,
+        options,
+        history,
+    )?;
+    publication.prepare(&summary.files)?;
+
+    // Keep SQLite's writer guard through construction and metadata preflight.
+    // Drop it before opening the original database for comparison or backup:
+    // closing another descriptor for that file can release POSIX SQLite locks.
+    drop(database_guard);
+    publication.back_up_existing()?;
+    publication.publish()?;
+    Ok(summary)
+}
+
+fn build_pages_bundle(
+    issues: &[Issue],
+    output_dir: &Path,
+    logical_output_dir: &Path,
+    options: &ExportPagesOptions,
+    prepared_history: &BTreeMap<String, HistoryBeadCompat>,
+) -> Result<ExportPagesSummary> {
     let title = options
         .title
         .as_deref()
@@ -231,23 +278,7 @@ pub fn export_pages_bundle(
         .cloned()
         .collect::<Vec<_>>();
 
-    // Pre-flight validation: ensure output directory is accessible.
-    if let Some(parent) = output_dir.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent).map_err(|error| {
-                BvrError::InvalidArgument(format!(
-                    "cannot create export directory {}: {error}",
-                    output_dir.display()
-                ))
-            })?;
-        }
-    }
-    fs::create_dir_all(output_dir.join("data")).map_err(|error| {
-        BvrError::InvalidArgument(format!(
-            "cannot prepare export directory {}: {error}",
-            output_dir.display()
-        ))
-    })?;
+    fs::create_dir_all(output_dir.join("data"))?;
 
     let analyzer = Analyzer::new(filtered.clone());
     let triage = analyzer.triage(TriageOptions {
@@ -314,9 +345,19 @@ pub fn export_pages_bundle(
         let histories = analyzer.history(None, history_limit);
         // Convert to the richer HistoryBeadCompat format that matches
         // --robot-history output shape (with commits/cycle_time/milestones).
-        let history_compat: std::collections::BTreeMap<String, _> = histories
+        let history_compat: BTreeMap<String, _> = histories
             .iter()
             .map(|h| {
+                if let Some(observed) = prepared_history
+                    .get(&h.id)
+                    .filter(|entry| !entry.events.is_empty())
+                {
+                    let mut entry = observed.clone();
+                    entry.bead_id.clone_from(&h.id);
+                    entry.title.clone_from(&h.title);
+                    entry.status.clone_from(&h.status);
+                    return (h.id.clone(), entry);
+                }
                 (
                     h.id.clone(),
                     crate::analysis::git_history::HistoryBeadCompat {
@@ -350,8 +391,6 @@ pub fn export_pages_bundle(
             .collect();
         write_json(history_path.clone(), &history_compat)?;
         files.push("data/history.json".to_string());
-    } else if history_path.exists() {
-        fs::remove_file(&history_path)?;
     }
 
     // Deploy-facing README so the bundle is self-describing.
@@ -368,7 +407,7 @@ pub fn export_pages_bundle(
     files.push("data/export_summary.json".to_string());
 
     let summary = ExportPagesSummary {
-        export_path: output_dir.to_string_lossy().to_string(),
+        export_path: logical_output_dir.to_string_lossy().to_string(),
         generated_at,
         issue_count: filtered.len(),
         include_closed: options.include_closed,
@@ -379,6 +418,487 @@ pub fn export_pages_bundle(
     write_json(output_dir.join("data/export_summary.json"), &summary)?;
 
     Ok(summary)
+}
+
+#[derive(Clone)]
+struct PublicationChange {
+    relative_path: PathBuf,
+    install: bool,
+    existed: bool,
+}
+
+struct PagesPublication {
+    output_dir: PathBuf,
+    staging: tempfile::TempDir,
+    staged_dir: PathBuf,
+    changes: Vec<PublicationChange>,
+    applied: usize,
+    created_dirs: Vec<PathBuf>,
+}
+
+impl PagesPublication {
+    fn new(output_dir: &Path) -> Result<Self> {
+        let output_dir = resolve_export_output_dir(output_dir)?;
+        let parent = output_dir.parent().ok_or_else(|| {
+            BvrError::InvalidArgument(
+                "cannot create sibling staging directory for a filesystem root".to_string(),
+            )
+        })?;
+        let staging = create_publication_staging(&output_dir, parent, &std::env::temp_dir())?;
+        let staged_dir = staging.path().join("bundle");
+        fs::create_dir(&staged_dir)?;
+        Ok(Self {
+            output_dir,
+            staging,
+            staged_dir,
+            changes: Vec::new(),
+            applied: 0,
+            created_dirs: Vec::new(),
+        })
+    }
+
+    fn prepare(&mut self, files: &[String]) -> Result<()> {
+        export_directory_exists(&self.output_dir)?;
+        let new_files = files.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+        let mut managed = new_files.clone();
+        managed.insert(PathBuf::from("data/history.json"));
+        let chunks_dir = self.output_dir.join("chunks");
+        if export_directory_exists(&chunks_dir)? {
+            for entry in fs::read_dir(&chunks_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if is_numbered_database_chunk(&name) {
+                    managed.insert(Path::new("chunks").join(name));
+                }
+            }
+        }
+
+        for relative_path in managed {
+            let existed = managed_export_file_exists(&self.output_dir, &relative_path)?;
+            let install = new_files.contains(&relative_path);
+            if install && !managed_export_file_exists(&self.staged_dir, &relative_path)? {
+                return Err(BvrError::InvalidArgument(format!(
+                    "staged export file is missing: {}",
+                    relative_path.display()
+                )));
+            }
+            if install || existed {
+                self.changes.push(PublicationChange {
+                    relative_path,
+                    install,
+                    existed,
+                });
+            }
+        }
+        self.changes.sort_by(|left, right| {
+            publication_order(&left.relative_path)
+                .cmp(&publication_order(&right.relative_path))
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        Ok(())
+    }
+
+    fn back_up_existing(&mut self) -> Result<()> {
+        let mut changed = Vec::with_capacity(self.changes.len());
+        for change in self.changes.drain(..) {
+            if managed_export_file_exists(&self.output_dir, &change.relative_path)?
+                != change.existed
+            {
+                return Err(BvrError::InvalidArgument(format!(
+                    "export target changed before backup: {}",
+                    change.relative_path.display()
+                )));
+            }
+            let published = self.output_dir.join(&change.relative_path);
+            let staged = self.staged_dir.join(&change.relative_path);
+            if change.existed && change.install && export_files_equal(&published, &staged)? {
+                continue;
+            }
+            if change.existed {
+                let backup = self
+                    .staging
+                    .path()
+                    .join("backups")
+                    .join(&change.relative_path);
+                create_private_parent(&backup)?;
+                fs::copy(&published, backup)?;
+                if change.install {
+                    // Replacing by rename must not widen the permissions that
+                    // an in-place write to the existing managed file retained.
+                    fs::set_permissions(&staged, fs::symlink_metadata(&published)?.permissions())?;
+                }
+            }
+            // Stale files move here during publication; installed files move
+            // back here during rollback. These parents remain private.
+            create_private_parent(&staged)?;
+            changed.push(change);
+        }
+        self.changes = changed;
+        Ok(())
+    }
+
+    fn apply_next(&mut self) -> Result<bool> {
+        let Some(change) = self.changes.get(self.applied).cloned() else {
+            return Ok(false);
+        };
+        let exists = managed_export_file_exists(&self.output_dir, &change.relative_path)?;
+        if exists != change.existed {
+            return Err(BvrError::InvalidArgument(format!(
+                "export target changed during publication: {}",
+                change.relative_path.display()
+            )));
+        }
+        let published = self.output_dir.join(&change.relative_path);
+        let staged = self.staged_dir.join(&change.relative_path);
+        let result = if change.install {
+            self.create_output_parents(&change.relative_path)?;
+            fs::rename(staged, &published)
+        } else {
+            fs::rename(&published, staged)
+        };
+        result.map_err(|error| {
+            BvrError::InvalidArgument(format!(
+                "cannot publish export file {}: {error}",
+                published.display()
+            ))
+        })?;
+        self.applied += 1;
+        Ok(true)
+    }
+
+    fn create_output_parents(&mut self, relative_path: &Path) -> Result<()> {
+        let mut path = self.output_dir.clone();
+        self.create_output_directory(&path)?;
+        if let Some(parent) = relative_path.parent() {
+            for component in parent.components() {
+                path.push(component);
+                self.create_output_directory(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_output_directory(&mut self, path: &Path) -> Result<()> {
+        if !export_directory_exists(path)? {
+            match fs::create_dir(path) {
+                Ok(()) => self.created_dirs.push(path.to_path_buf()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    export_directory_exists(path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_change(&self, change: &PublicationChange) -> Result<()> {
+        let exists = managed_export_file_exists(&self.output_dir, &change.relative_path)?;
+        if exists != change.install {
+            return Err(BvrError::InvalidArgument(format!(
+                "export target changed before rollback: {}",
+                change.relative_path.display()
+            )));
+        }
+        let published = self.output_dir.join(&change.relative_path);
+        if change.install {
+            let staged = self.staged_dir.join(&change.relative_path);
+            match fs::symlink_metadata(&staged) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(BvrError::InvalidArgument(format!(
+                        "rollback destination is occupied: {}",
+                        staged.display()
+                    )));
+                }
+            }
+            fs::rename(&published, staged)?;
+        }
+        if change.existed {
+            let backup = self
+                .staging
+                .path()
+                .join("backups")
+                .join(&change.relative_path);
+            // Restore without allocating another full file: publication may
+            // have failed because the disk is full. A successful rename leaves
+            // the old copy published; a failure leaves its backup available.
+            fs::rename(backup, published)?;
+        }
+        Ok(())
+    }
+
+    fn rollback(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for change in self.changes[..self.applied].iter().rev() {
+            if let Err(error) = self.restore_change(change) {
+                failures.push(format!("{}: {error}", change.relative_path.display()));
+            }
+        }
+        for path in self.created_dirs.iter().rev() {
+            if let Err(error) = fs::remove_dir(path) {
+                failures.push(format!("{}: {error}", path.display()));
+            }
+        }
+        failures
+    }
+
+    fn publish(mut self) -> Result<()> {
+        // Individual renames and reverse rollback handle ordinary I/O errors.
+        // This is not a multi-file transaction for independent readers, nor a
+        // crash-atomic operation; configuration and summary are installed last.
+        if let Err(error) = self.apply_all() {
+            let failures = self.rollback();
+            if failures.is_empty() {
+                close_publication_staging(self.staging);
+                return Err(BvrError::InvalidArgument(format!(
+                    "pages publication failed; previous bundle restored: {error}"
+                )));
+            }
+            let recovery = self.staging.keep();
+            return Err(BvrError::InvalidArgument(format!(
+                "pages publication failed: {error}; rollback incomplete: {}; recovery files retained at {}",
+                failures.join("; "),
+                recovery.display()
+            )));
+        }
+        if let Err(error) = remove_empty_chunks_directory(&self.output_dir) {
+            eprintln!("warning: cannot clean up empty export chunks directory: {error}");
+        }
+        close_publication_staging(self.staging);
+        Ok(())
+    }
+
+    fn apply_all(&mut self) -> Result<()> {
+        while self.apply_next()? {}
+        Ok(())
+    }
+}
+
+fn resolve_export_output_dir(output_dir: &Path) -> Result<PathBuf> {
+    match fs::metadata(output_dir) {
+        Ok(metadata) if metadata.is_dir() => return Ok(fs::canonicalize(output_dir)?),
+        Ok(_) => {
+            return Err(BvrError::InvalidArgument(format!(
+                "export output must be a directory: {}",
+                output_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(output_dir) {
+        Ok(_) => {
+            return Err(BvrError::InvalidArgument(format!(
+                "export output is a dangling symlink: {}",
+                output_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let name = output_dir.file_name().ok_or_else(|| {
+        BvrError::InvalidArgument(format!(
+            "invalid export directory: {}",
+            output_dir.display()
+        ))
+    })?;
+    let parent = output_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+fn create_publication_staging(
+    output_dir: &Path,
+    sibling_parent: &Path,
+    temporary_dir: &Path,
+) -> Result<tempfile::TempDir> {
+    let sibling_error = match try_publication_staging(output_dir, sibling_parent) {
+        Ok(staging) => return Ok(staging),
+        Err(error) => error,
+    };
+    #[cfg(unix)]
+    let fallback = try_publication_staging(output_dir, temporary_dir);
+    #[cfg(not(unix))]
+    let fallback: Result<tempfile::TempDir> = Err(BvrError::InvalidArgument(
+        "cannot verify the filesystem of an external temporary directory on this platform"
+            .to_string(),
+    ));
+    fallback.map_err(|error| {
+        BvrError::InvalidArgument(format!(
+            "cannot create safe export staging for {}: sibling location {}: {sibling_error}; temporary location {}: {error}",
+            output_dir.display(),
+            sibling_parent.display(),
+            temporary_dir.display()
+        ))
+    })
+}
+
+fn try_publication_staging(output_dir: &Path, location: &Path) -> Result<tempfile::TempDir> {
+    let location = fs::canonicalize(location)?;
+    ensure_staging_location(output_dir, &location)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".bvr-pages-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // TempDir otherwise follows the process umask. Keep staged assets and
+        // retained recovery copies private from the instant the directory exists.
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let staging = builder.tempdir_in(location)?;
+    // Verify the actual directory as well as its proposed parent before any
+    // bundle construction or published-file mutation can take place.
+    ensure_staging_location(output_dir, &fs::canonicalize(staging.path())?)?;
+    Ok(staging)
+}
+
+fn ensure_staging_location(output_dir: &Path, location: &Path) -> Result<()> {
+    if location.starts_with(output_dir) {
+        return Err(BvrError::InvalidArgument(format!(
+            "staging location must be outside the export output tree: {}",
+            location.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let output_metadata = match fs::metadata(output_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = output_dir.parent().ok_or_else(|| {
+                    BvrError::InvalidArgument(format!(
+                        "export output has no filesystem parent: {}",
+                        output_dir.display()
+                    ))
+                })?;
+                fs::metadata(parent)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if output_metadata.dev() != fs::metadata(location)?.dev() {
+            return Err(BvrError::InvalidArgument(format!(
+                "staging location must share the export output filesystem: {}",
+                location.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn export_directory_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(BvrError::InvalidArgument(format!(
+            "managed export directory must be a directory without symlinks: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn managed_export_file_exists(root: &Path, relative_path: &Path) -> Result<bool> {
+    if relative_path.as_os_str().is_empty()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(BvrError::InvalidArgument(format!(
+            "invalid managed export path: {}",
+            relative_path.display()
+        )));
+    }
+    if !export_directory_exists(root)? {
+        return Ok(false);
+    }
+    let mut path = root.to_path_buf();
+    let mut components = relative_path.components().peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        if components.peek().is_some() {
+            if !export_directory_exists(&path)? {
+                return Ok(false);
+            }
+        } else {
+            return match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+                Ok(_) => Err(BvrError::InvalidArgument(format!(
+                    "managed export file must be a regular file without symlinks: {}",
+                    path.display()
+                ))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            };
+        }
+    }
+    Ok(false)
+}
+
+fn is_numbered_database_chunk(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".bin"))
+        .is_some_and(|digits| digits.len() >= 5 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn publication_order(relative_path: &Path) -> u8 {
+    if relative_path == Path::new("data/export_summary.json") {
+        2
+    } else {
+        u8::from(relative_path == Path::new(SQLITE_EXPORT_CONFIG_FILENAME))
+    }
+}
+
+fn create_private_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn export_files_equal(left: &Path, right: &Path) -> Result<bool> {
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut remaining = left.metadata()?.len();
+    if remaining != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left_bytes = vec![0; 64 * 1024];
+    let mut right_bytes = vec![0; left_bytes.len()];
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(left_bytes.len() as u64))
+            .expect("comparison buffer length fits usize");
+        left.read_exact(&mut left_bytes[..amount])?;
+        right.read_exact(&mut right_bytes[..amount])?;
+        if left_bytes[..amount] != right_bytes[..amount] {
+            return Ok(false);
+        }
+        remaining -= amount as u64;
+    }
+    Ok(left.read(&mut left_bytes[..1])? == 0 && right.read(&mut right_bytes[..1])? == 0)
+}
+
+fn remove_empty_chunks_directory(output_dir: &Path) -> Result<()> {
+    let chunks = output_dir.join("chunks");
+    if export_directory_exists(&chunks)? && fs::read_dir(&chunks)?.next().is_none() {
+        fs::remove_dir(chunks)?;
+    }
+    Ok(())
+}
+
+fn close_publication_staging(staging: tempfile::TempDir) {
+    let path = staging.path().to_path_buf();
+    if let Err(error) = staging.close() {
+        eprintln!(
+            "warning: export finished but staging cleanup failed at {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn generate_deploy_readme(title: &str, meta: &PagesMeta) -> String {
@@ -457,45 +977,129 @@ pub fn run_preview_server(bundle_dir: &Path, live_reload: bool) -> Result<()> {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0);
-    let mut served = 0usize;
-
-    let shutdown_reason = loop {
-        if shutdown_requested.load(Ordering::Relaxed) {
-            break PreviewShutdownReason::ShutdownSignal;
-        }
-
-        match listener.accept() {
-            Ok((stream, _)) => {
-                match handle_preview_request(stream, bundle_dir, live_reload, port) {
-                    Ok(count_as_request) => {
-                        if count_as_request {
-                            served = served.saturating_add(1);
-                            if max_requests.is_some_and(|limit| served >= limit) {
-                                break PreviewShutdownReason::RequestLimitReached;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("warning: preview request failed: {error}");
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(PREVIEW_ACCEPT_POLL_INTERVAL);
-            }
-            Err(error) if shutdown_requested.load(Ordering::Relaxed) => {
-                eprintln!("warning: preview accept loop stopped after shutdown signal: {error}");
-                break PreviewShutdownReason::ShutdownSignal;
-            }
-            Err(error) => return Err(BvrError::Io(error)),
-        }
-    };
+    let shutdown_reason = serve_preview_connections(
+        &listener,
+        bundle_dir,
+        live_reload,
+        port,
+        &shutdown_requested,
+        max_requests,
+    )?;
 
     println!(
         "Preview server stopped: {}.",
         shutdown_reason.operator_summary()
     );
     Ok(())
+}
+
+fn serve_preview_connections(
+    listener: &TcpListener,
+    bundle_dir: &Path,
+    live_reload: bool,
+    port: u16,
+    shutdown_requested: &AtomicBool,
+    max_requests: Option<usize>,
+) -> Result<PreviewShutdownReason> {
+    thread::scope(|scope| {
+        let mut connections = PreviewConnections::default();
+        let mut served = 0usize;
+        loop {
+            if shutdown_requested.load(Ordering::Relaxed) {
+                return Ok(PreviewShutdownReason::ShutdownSignal);
+            }
+            served = served.saturating_add(connections.reap_finished());
+            if max_requests.is_some_and(|limit| served >= limit) {
+                return Ok(PreviewShutdownReason::RequestLimitReached);
+            }
+
+            // Reserve one remaining request for every active worker. Empty
+            // preconnects and failed transfers release their reservation when
+            // reaped, so concurrent completions cannot overshoot the limit.
+            let reserved = served.saturating_add(connections.active.len());
+            if connections.active.len() >= PREVIEW_MAX_CONNECTIONS
+                || max_requests.is_some_and(|limit| reserved >= limit)
+            {
+                thread::sleep(PREVIEW_ACCEPT_POLL_INTERVAL);
+                continue;
+            }
+
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let interrupt = stream.try_clone()?;
+                    let request = thread::Builder::new()
+                        .name("bvr-preview-request".to_string())
+                        .spawn_scoped(scope, move || {
+                            handle_preview_request(stream, bundle_dir, live_reload, port)
+                        })?;
+                    connections
+                        .active
+                        .push(PreviewConnection { interrupt, request });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(PREVIEW_ACCEPT_POLL_INTERVAL);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(_) if shutdown_requested.load(Ordering::Relaxed) => {
+                    return Ok(PreviewShutdownReason::ShutdownSignal);
+                }
+                Err(error) => return Err(BvrError::Io(error)),
+            }
+        }
+    })
+}
+
+struct PreviewConnection<'scope> {
+    interrupt: TcpStream,
+    request: thread::ScopedJoinHandle<'scope, Result<bool>>,
+}
+
+#[derive(Default)]
+struct PreviewConnections<'scope> {
+    active: Vec<PreviewConnection<'scope>>,
+}
+
+impl PreviewConnections<'_> {
+    fn reap_finished(&mut self) -> usize {
+        let mut served = 0;
+        let mut index = 0;
+        while index < self.active.len() {
+            if !self.active[index].request.is_finished() {
+                index += 1;
+                continue;
+            }
+            let connection = self.active.swap_remove(index);
+            let result = connection.request.join().unwrap_or_else(|_| {
+                Err(BvrError::Io(std::io::Error::other(
+                    "preview request worker panicked",
+                )))
+            });
+            match result {
+                Ok(true) => served += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!("warning: preview request failed: {error}"),
+            }
+        }
+        served
+    }
+}
+
+impl Drop for PreviewConnections<'_> {
+    fn drop(&mut self) {
+        // Cancel every socket before joining any worker. This runs on signals
+        // and all error exits, including failed accepts, clones, or spawns.
+        // Per-write timeouts alone do not bound a slowly progressing transfer.
+        for connection in &self.active {
+            let _ = connection.interrupt.shutdown(Shutdown::Both);
+        }
+        for connection in self.active.drain(..) {
+            let _ = connection.request.join();
+        }
+    }
 }
 
 fn bind_preview_listener() -> Result<(TcpListener, u16)> {
@@ -529,19 +1133,36 @@ fn handle_preview_request(
     live_reload: bool,
     port: u16,
 ) -> Result<bool> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // The listener is nonblocking so idle accepts can poll for shutdown. Some
+    // platforms (notably macOS/BSD) can inherit that mode on accepted sockets.
+    // write_all needs blocking I/O here or a full send buffer truncates the
+    // response with WouldBlock after we have already advertised HTTP 200.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(PREVIEW_HEADER_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut buffer = [0_u8; 8192];
-    let bytes = stream.read(&mut buffer)?;
-    if bytes == 0 {
-        return Ok(false);
-    }
-
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
-    let request_line = request.lines().next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or("/");
+    let mut buffer = [0_u8; PREVIEW_MAX_HEADER_BYTES];
+    let (header_len, rejection) = match read_preview_headers(&mut stream, &mut buffer)? {
+        PreviewHeaderRead::Empty => return Ok(false),
+        PreviewHeaderRead::Complete(len) => (len, None),
+        PreviewHeaderRead::Rejected { len, status } => (len, Some(status)),
+    };
+    let headers = &buffer[..header_len];
+    let (method, target) = match (rejection, parse_preview_request(headers)) {
+        (None, Some(request)) => request,
+        (status, _) => {
+            let status = status.unwrap_or("400 Bad Request");
+            let head_only =
+                headers.split(|byte| byte.is_ascii_whitespace()).next() == Some(&b"HEAD"[..]);
+            write_http_response(
+                &mut stream,
+                status,
+                "text/plain; charset=utf-8",
+                format!("{status}\n").as_bytes(),
+                head_only,
+            )?;
+            return Ok(true);
+        }
+    };
     let head_only = method == "HEAD";
 
     if method != "GET" && method != "HEAD" {
@@ -613,6 +1234,9 @@ fn handle_preview_request(
         return Ok(true);
     };
 
+    // Capture the complete asset before advertising success: a watched export
+    // can rewrite the source while a slow peer is still receiving its body.
+    // The connection cap bounds the number of simultaneous response snapshots.
     let mut body = fs::read(&file_path)?;
     let mime = mime_type_for_path(&file_path);
     if live_reload && mime.starts_with("text/html") {
@@ -621,6 +1245,149 @@ fn handle_preview_request(
 
     write_http_response(&mut stream, "200 OK", mime, &body, head_only)?;
     Ok(true)
+}
+
+enum PreviewHeaderRead {
+    Empty,
+    Complete(usize),
+    Rejected { len: usize, status: &'static str },
+}
+
+fn read_preview_headers(
+    stream: &mut TcpStream,
+    buffer: &mut [u8; PREVIEW_MAX_HEADER_BYTES],
+) -> std::io::Result<PreviewHeaderRead> {
+    let deadline = Instant::now() + PREVIEW_HEADER_TIMEOUT;
+    let mut used = 0usize;
+    loop {
+        if used == buffer.len() {
+            return Ok(PreviewHeaderRead::Rejected {
+                len: used,
+                status: "431 Request Header Fields Too Large",
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if used == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "preview request headers timed out",
+                ));
+            }
+            return Ok(PreviewHeaderRead::Rejected {
+                len: used,
+                status: "408 Request Timeout",
+            });
+        }
+        // A peer sending fragments must share one budget; a fresh five-second
+        // timeout for every read would let it occupy a worker indefinitely.
+        stream.set_read_timeout(Some(remaining))?;
+        let previous_len = used;
+        match stream.read(&mut buffer[used..]) {
+            Ok(0) if used == 0 => return Ok(PreviewHeaderRead::Empty),
+            Ok(0) => {
+                return Ok(PreviewHeaderRead::Rejected {
+                    len: used,
+                    status: "400 Bad Request",
+                });
+            }
+            Ok(bytes) => {
+                used += bytes;
+                if Instant::now() >= deadline {
+                    return Ok(PreviewHeaderRead::Rejected {
+                        len: used,
+                        status: "408 Request Timeout",
+                    });
+                }
+                // Only the final three old bytes can begin a delimiter that
+                // crosses this read. Do not rescan the whole growing header.
+                let start = previous_len.saturating_sub(3);
+                if let Some(offset) = buffer[start..used]
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    return Ok(PreviewHeaderRead::Complete(start + offset + 4));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if used > 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(PreviewHeaderRead::Rejected {
+                    len: used,
+                    status: "408 Request Timeout",
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_preview_request(headers: &[u8]) -> Option<(&str, &str)> {
+    let line_end = headers.windows(2).position(|bytes| bytes == b"\r\n")?;
+    let request_line = std::str::from_utf8(&headers[..line_end]).ok()?;
+    let mut parts = request_line.split(' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some()
+        || method.is_empty()
+        || !method.bytes().all(is_http_token_byte)
+        || target.is_empty()
+        || (matches!(method, "GET" | "HEAD") && !target.starts_with('/'))
+        || !target
+            .bytes()
+            .all(|byte| matches!(byte, b'!'..=b'~') && byte != b'#')
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return None;
+    }
+
+    // Header values are opaque bytes, not necessarily UTF-8. Validate their
+    // HTTP syntax without lossy decoding or accepting folded/control lines.
+    let mut fields = &headers[line_end + 2..];
+    loop {
+        let end = fields.windows(2).position(|bytes| bytes == b"\r\n")?;
+        if end == 0 {
+            return (fields.len() == 2).then_some((method, target));
+        }
+        let line = &fields[..end];
+        let colon = line.iter().position(|byte| *byte == b':')?;
+        if colon == 0
+            || !line[..colon].iter().copied().all(is_http_token_byte)
+            || !line[colon + 1..]
+                .iter()
+                .all(|byte| matches!(byte, b'\t' | b' '..=b'~' | 0x80..=0xff))
+        {
+            return None;
+        }
+        fields = &fields[end + 2..];
+    }
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn normalize_request_path(route: &str) -> Result<PathBuf> {
@@ -1070,6 +1837,8 @@ init().catch((error) => {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -1089,15 +1858,279 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             labels: Vec::new(),
             comments: Vec::new(),
             dependencies: Vec::new(),
             source_repo: ".".to_string(),
             workspace_prefix: None,
+            workspace_repo_path: None,
+            workspace_local_id: None,
             content_hash: None,
             external_ref: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_falls_back_to_an_external_temporary_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for existing_output in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let root = fs::canonicalize(temp.path()).expect("resolved temporary root");
+            let output = root.join("published");
+            if existing_output {
+                fs::create_dir(&output).expect("existing output directory");
+            }
+            let unusable = root.join("unusable-parent");
+            fs::write(&unusable, b"not a directory").expect("unusable first location");
+            let fallback = root.join("temporary");
+            fs::create_dir(&fallback).expect("same-filesystem fallback");
+
+            // A file deterministically prevents sibling creation even when
+            // tests run as root, unlike a chmod-based permission failure.
+            let staging = create_publication_staging(&output, &unusable, &fallback)
+                .expect("use verified fallback");
+
+            assert_eq!(staging.path().parent(), Some(fallback.as_path()));
+            assert!(!staging.path().starts_with(&output));
+            assert_eq!(output.exists(), existing_output);
+            assert_eq!(
+                fs::metadata(staging.path())
+                    .expect("private staging metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+            assert_eq!(
+                fs::read(&unusable).expect("unchanged file"),
+                b"not a directory"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_rejects_a_temporary_alias_inside_the_output_tree() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let root = fs::canonicalize(temp.path()).expect("resolved temporary root");
+        let output = root.join("published");
+        let inside = output.join("temporary");
+        fs::create_dir_all(&inside).expect("inside-output temporary directory");
+        let unusable = root.join("unusable-parent");
+        fs::write(&unusable, b"not a directory").expect("unusable first location");
+        let alias = root.join("temporary-alias");
+        symlink(&inside, &alias).expect("temporary alias into output");
+
+        let error = create_publication_staging(&output, &unusable, &alias)
+            .expect_err("no safe external staging location");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("outside the export output tree"),
+            "{message}"
+        );
+        assert!(message.contains("sibling location"), "{message}");
+        assert!(message.contains("temporary location"), "{message}");
+        assert!(
+            fs::read_dir(&inside)
+                .expect("unchanged output tree")
+                .next()
+                .is_none()
+        );
+        assert_eq!(fs::read_link(alias).expect("unchanged alias"), inside);
+    }
+
+    #[test]
+    fn publication_rolls_back_installed_and_removed_files_after_late_failure() {
+        let temp = tempdir().expect("tempdir");
+        let output = temp.path().join("published");
+        fs::create_dir_all(output.join("data")).expect("published directories");
+        fs::write(output.join("a-existing.txt"), b"old existing bytes").expect("old file");
+        fs::write(output.join("data/history.json"), b"old history").expect("old history");
+        fs::write(output.join("z-fail.txt"), b"old final bytes").expect("old final file");
+        fs::write(output.join("data/custom.json"), b"user content").expect("custom file");
+
+        let mut publication = PagesPublication::new(&output).expect("private staging");
+        let staging_path = publication.staging.path().to_path_buf();
+        let staged = publication.staged_dir.clone();
+        fs::create_dir(staged.join("b-new")).expect("new staged directory");
+        fs::write(staged.join("a-existing.txt"), b"new existing bytes").expect("replacement");
+        fs::write(staged.join("b-new/added.txt"), b"newly added file").expect("addition");
+        fs::write(staged.join("z-fail.txt"), b"new final bytes").expect("final replacement");
+        publication
+            .prepare(&[
+                "a-existing.txt".to_string(),
+                "b-new/added.txt".to_string(),
+                "z-fail.txt".to_string(),
+            ])
+            .expect("preflight");
+        publication.back_up_existing().expect("complete backups");
+        assert_eq!(
+            fs::read(staging_path.join("backups/z-fail.txt")).expect("final file backed up"),
+            b"old final bytes"
+        );
+
+        assert!(publication.apply_next().expect("install replacement"));
+        assert!(publication.apply_next().expect("install new file"));
+        assert!(publication.apply_next().expect("remove stale history"));
+        assert_eq!(
+            fs::read(output.join("a-existing.txt")).expect("installed replacement"),
+            b"new existing bytes"
+        );
+        assert!(output.join("b-new/added.txt").is_file());
+        assert!(!output.join("data/history.json").exists());
+        // A real rename failure after three completed changes, with all old
+        // files already backed up. No injected success/failure mock is used.
+        fs::rename(
+            staged.join("z-fail.txt"),
+            staging_path.join("withheld-final"),
+        )
+        .expect("withhold final staged source");
+
+        let error = publication.publish().expect_err("late publication failure");
+        assert!(error.to_string().contains("previous bundle restored"));
+        assert_eq!(
+            fs::read(output.join("a-existing.txt")).expect("restored replacement"),
+            b"old existing bytes"
+        );
+        assert_eq!(
+            fs::read(output.join("data/history.json")).expect("restored stale history"),
+            b"old history"
+        );
+        assert_eq!(
+            fs::read(output.join("z-fail.txt")).expect("untouched final file"),
+            b"old final bytes"
+        );
+        assert_eq!(
+            fs::read(output.join("data/custom.json")).expect("preserved custom file"),
+            b"user content"
+        );
+        assert!(!output.join("b-new").exists());
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn publication_retains_backups_when_rollback_cannot_restore_a_file() {
+        let temp = tempdir().expect("tempdir");
+        let output = temp.path().join("published");
+        fs::create_dir(&output).expect("published directory");
+        fs::write(output.join("a-existing.txt"), b"original bytes").expect("original file");
+        fs::write(output.join("z-fail.txt"), b"original final bytes").expect("final file");
+        let mut publication = PagesPublication::new(&output).expect("private staging");
+        let recovery = publication.staging.path().to_path_buf();
+        let staged = publication.staged_dir.clone();
+        fs::write(staged.join("a-existing.txt"), b"replacement bytes").expect("replacement");
+        fs::write(staged.join("z-fail.txt"), b"replacement final bytes")
+            .expect("final replacement");
+        publication
+            .prepare(&["a-existing.txt".to_string(), "z-fail.txt".to_string()])
+            .expect("preflight");
+        publication.back_up_existing().expect("complete backups");
+        assert!(publication.apply_next().expect("install first replacement"));
+        fs::rename(staged.join("z-fail.txt"), recovery.join("withheld-final"))
+            .expect("withhold final staged source");
+        fs::create_dir(staged.join("a-existing.txt")).expect("obstruct rollback destination");
+        fs::write(
+            staged.join("a-existing.txt/keep.txt"),
+            b"retain this content",
+        )
+        .expect("rollback obstruction contents");
+
+        let error = publication
+            .publish()
+            .expect_err("publication and rollback fail");
+        let message = error.to_string();
+        assert!(message.contains("rollback incomplete"), "{message}");
+        assert!(
+            message.contains(&recovery.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read(recovery.join("backups/a-existing.txt")).expect("retained original backup"),
+            b"original bytes"
+        );
+        assert_eq!(
+            fs::read(recovery.join("backups/z-fail.txt")).expect("retained final backup"),
+            b"original final bytes"
+        );
+        assert_eq!(
+            fs::read(output.join("a-existing.txt")).expect("retained installed version"),
+            b"replacement bytes"
+        );
+        assert_eq!(
+            fs::read(staged.join("a-existing.txt/keep.txt")).expect("retained obstruction"),
+            b"retain this content"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publication_preserves_file_permissions_and_skips_unchanged_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempdir().expect("tempdir");
+        let output = temp.path().join("published");
+        fs::create_dir(&output).expect("published directory");
+        fs::write(output.join("private.txt"), b"old private bytes").expect("private file");
+        fs::set_permissions(
+            output.join("private.txt"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("private permissions");
+        fs::write(output.join("unchanged.txt"), b"stable bytes").expect("unchanged file");
+        let root_inode = fs::metadata(&output).expect("root metadata").ino();
+        let unchanged_inode = fs::metadata(output.join("unchanged.txt"))
+            .expect("unchanged metadata")
+            .ino();
+        let mut publication = PagesPublication::new(&output).expect("private staging");
+        fs::write(
+            publication.staged_dir.join("private.txt"),
+            b"new private bytes",
+        )
+        .expect("private replacement");
+        fs::write(
+            publication.staged_dir.join("unchanged.txt"),
+            b"stable bytes",
+        )
+        .expect("unchanged staged content");
+        publication
+            .prepare(&["private.txt".to_string(), "unchanged.txt".to_string()])
+            .expect("preflight");
+        publication
+            .back_up_existing()
+            .expect("back up changed file");
+        assert_eq!(publication.changes.len(), 1);
+
+        publication.publish().expect("successful publication");
+
+        assert_eq!(
+            fs::metadata(output.join("private.txt"))
+                .expect("private metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(output.join("private.txt")).expect("replacement bytes"),
+            b"new private bytes"
+        );
+        assert_eq!(
+            fs::metadata(&output).expect("root metadata").ino(),
+            root_inode
+        );
+        assert_eq!(
+            fs::metadata(output.join("unchanged.txt"))
+                .expect("unchanged metadata")
+                .ino(),
+            unchanged_inode
+        );
     }
 
     #[test]
@@ -1170,6 +2203,81 @@ mod tests {
     }
 
     #[test]
+    fn prepared_history_preserves_facts_and_scopes_entries_to_exported_issues() {
+        use crate::analysis::git_history::{HistoryEventCompat, HistoryMilestonesCompat};
+
+        let temp = tempdir().expect("tempdir");
+        let out = temp.path().join("pages");
+        let mut fallback = make_issue("C", "open");
+        fallback.created_at = crate::model::ts("2020-01-02T03:04:05Z");
+        let issues = vec![make_issue("A", "open"), make_issue("B", "closed"), fallback];
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let history = ["A", "B", "NOT-EXPORTED"]
+            .into_iter()
+            .map(|id| {
+                let event = HistoryEventCompat {
+                    bead_id: id.to_string(),
+                    event_type: "reopened".to_string(),
+                    timestamp: "2026-09-10T11:12:13Z".to_string(),
+                    commit_sha: sha.to_string(),
+                    commit_message: "Recorded state change".to_string(),
+                    author: "History Author".to_string(),
+                    author_email: "history@example.test".to_string(),
+                };
+                (
+                    id.to_string(),
+                    HistoryBeadCompat {
+                        bead_id: id.to_string(),
+                        title: "Historical title".to_string(),
+                        status: "Historical status".to_string(),
+                        events: vec![event.clone()],
+                        milestones: HistoryMilestonesCompat {
+                            reopened: Some(event),
+                            ..HistoryMilestonesCompat::default()
+                        },
+                        commits: None,
+                        cycle_time: None,
+                        last_author: "History Author".to_string(),
+                    },
+                )
+            })
+            .collect();
+
+        export_pages_bundle_with_history(
+            &issues,
+            &out,
+            &ExportPagesOptions {
+                title: None,
+                subtitle: None,
+                include_closed: false,
+                include_history: true,
+            },
+            &history,
+        )
+        .expect("export prepared history");
+
+        let exported: serde_json::Value = serde_json::from_slice(
+            &fs::read(out.join("data/history.json")).expect("history bytes"),
+        )
+        .expect("history JSON");
+        assert_eq!(exported.as_object().expect("per-issue map").len(), 2);
+        assert!(exported.get("B").is_none());
+        assert!(exported.get("NOT-EXPORTED").is_none());
+        assert_eq!(exported["A"]["title"], "Issue A");
+        assert_eq!(exported["A"]["status"], "open");
+        assert_eq!(exported["A"]["events"].as_array().expect("events").len(), 1);
+        assert_eq!(exported["A"]["events"][0]["commit_sha"], sha);
+        assert_eq!(exported["A"]["events"][0]["author"], "History Author");
+        assert_eq!(exported["A"]["milestones"]["reopened"]["commit_sha"], sha);
+        assert_eq!(exported["C"]["events"][0]["event_type"], "created");
+        assert_eq!(
+            exported["C"]["events"][0]["timestamp"],
+            "2020-01-02T03:04:05Z"
+        );
+        assert_eq!(exported["C"]["events"][0]["commit_sha"], "");
+    }
+
+    #[test]
     fn export_pages_bundle_writes_sqlite_bootstrap_config_with_hash() {
         let temp = tempdir().expect("tempdir");
         let out = temp.path().join("pages");
@@ -1201,6 +2309,247 @@ mod tests {
     fn normalize_request_path_rejects_parent_segments() {
         let result = normalize_request_path("/../../etc/passwd");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn preview_request_parser_accepts_http_versions_and_opaque_header_values() {
+        for (request, method, target) in [
+            (&b"GET / HTTP/1.0\r\n\r\n"[..], "GET", "/"),
+            (
+                &b"HEAD /assets/viewer.js?version=1 HTTP/1.1\r\n\r\n"[..],
+                "HEAD",
+                "/assets/viewer.js?version=1",
+            ),
+            (
+                &b"GET / HTTP/1.1\r\nX-!#$%&'*+-.^_`|~: \t\xff\x80\r\nEmpty:\r\n\r\n"[..],
+                "GET",
+                "/",
+            ),
+            (&b"OPTIONS * HTTP/1.1\r\n\r\n"[..], "OPTIONS", "*"),
+            (
+                &b"CONNECT localhost:443 HTTP/1.1\r\n\r\n"[..],
+                "CONNECT",
+                "localhost:443",
+            ),
+        ] {
+            assert_eq!(parse_preview_request(request), Some((method, target)));
+        }
+    }
+
+    #[test]
+    fn preview_request_parser_rejects_malformed_request_lines() {
+        for line in [
+            "GET /",
+            "GET / HTTP/1.1 extra",
+            "GET  / HTTP/1.1",
+            "GET /  HTTP/1.1",
+            "GET / HTTP/1.1 ",
+            " GET / HTTP/1.1",
+            "GET\t/\tHTTP/1.1",
+            "G(ET / HTTP/1.1",
+            "GET * HTTP/1.1",
+            "HEAD http://localhost/ HTTP/1.1",
+            "GET /#fragment HTTP/1.1",
+            "GET /\u{7f} HTTP/1.1",
+            "GET /\u{0} HTTP/1.1",
+            "GET /é HTTP/1.1",
+            "GET / HTTP/2.0",
+            "POST  HTTP/1.1",
+        ] {
+            let request = format!("{line}\r\n\r\n");
+            assert!(
+                parse_preview_request(request.as_bytes()).is_none(),
+                "accepted malformed request line {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_request_parser_rejects_malformed_header_fields() {
+        for field in [
+            &b": value"[..],
+            &b"Bad Header: value"[..],
+            &b"Bad:Name: value\x00"[..],
+            &b"Name : value"[..],
+            &b"Missing-Colon"[..],
+            &b"\tFolded: value"[..],
+            &b"Name: value\x7f"[..],
+            &b"Name: value\x0b"[..],
+            &b"Name: value\x0c"[..],
+            &b"Name: value\nnext"[..],
+            &b"Name: value\rnext"[..],
+            &b"N\xffme: value"[..],
+        ] {
+            let mut request = b"GET / HTTP/1.1\r\n".to_vec();
+            request.extend_from_slice(field);
+            request.extend_from_slice(b"\r\n\r\n");
+            assert!(
+                parse_preview_request(&request).is_none(),
+                "accepted malformed header field {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_request_header_reader_stops_at_first_complete_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let mut client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect client");
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("client write timeout");
+        let (mut server, _) = listener.accept().expect("accept client");
+        let first = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut requests = first.to_vec();
+        requests.extend_from_slice(b"POST /bad HTTP/2.0\r\nInvalid Header\r\n\r\n\xff");
+        client.write_all(&requests).expect("send requests");
+
+        let mut buffer = [0_u8; PREVIEW_MAX_HEADER_BYTES];
+        let PreviewHeaderRead::Complete(len) =
+            read_preview_headers(&mut server, &mut buffer).expect("read header")
+        else {
+            panic!("first request did not complete");
+        };
+        assert_eq!(&buffer[..len], first);
+        assert_eq!(parse_preview_request(&buffer[..len]), Some(("GET", "/")));
+    }
+
+    #[test]
+    fn preview_request_serves_large_body_on_nonblocking_accepted_socket() {
+        let bundle = tempdir().expect("tempdir");
+        let payload: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        fs::write(bundle.path().join("large.bin"), &payload).expect("write large asset");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("client write timeout");
+        let (server, _) = listener.accept().expect("accept client");
+        // Reproduce inherited O_NONBLOCK even on Linux, where accept normally
+        // clears it. Exercise the actual request handler, not a test-only path.
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking connection");
+        client
+            .write_all(b"GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send request");
+
+        let (response, serve_result) = thread::scope(|scope| {
+            let serving =
+                scope.spawn(|| handle_preview_request(server, bundle.path(), false, port));
+            // Hold off draining until a body much larger than the usual TCP
+            // send buffer has put the server under backpressure.
+            thread::sleep(Duration::from_millis(300));
+            let mut response = Vec::new();
+            let read_result = client.read_to_end(&mut response);
+            drop(client);
+            let serve_result = serving.join().expect("request worker");
+            read_result.expect("read complete response");
+            (response, serve_result)
+        });
+
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP headers")
+            + 4;
+        let headers = std::str::from_utf8(&response[..header_end]).expect("ASCII headers");
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains(&format!("Content-Length: {}\r\n", payload.len())));
+        let body = &response[header_end..];
+        assert_eq!(body.len(), payload.len(), "preview truncated the body");
+        assert!(body == payload.as_slice(), "preview corrupted the body");
+        assert!(serve_result.expect("serve complete response"));
+    }
+
+    #[test]
+    fn preview_request_times_out_writes_without_progress() {
+        use std::io::ErrorKind;
+        use std::time::Instant;
+
+        let bundle = tempdir().expect("tempdir");
+        fs::write(bundle.path().join("index.html"), b"preview").expect("write index");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect client");
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("client write timeout");
+        let (mut server, _) = listener.accept().expect("accept client");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send request");
+
+        // A large response alone does not establish a no-progress write:
+        // buffered TCP data can advance across several per-write timeouts.
+        // First saturate the socket and let delayed acknowledgments settle,
+        // while this peer stays connected without reading any data.
+        server
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .expect("prefill timeout");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_progress = Instant::now();
+        let buffer = vec![0_u8; 64 * 1024];
+        let mut probe = buffer.as_slice();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "failed to establish backpressure"
+            );
+            match server.write(probe) {
+                Ok(0) => panic!("peer closed during prefill"),
+                Ok(_) => last_progress = Instant::now(),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    if probe.len() > 1 {
+                        // BSD send low-water marks can block a large write
+                        // while a short HTTP header would still fit. Exhaust
+                        // that remaining space before measuring the timeout.
+                        probe = &buffer[..1];
+                        last_progress = Instant::now();
+                    } else if last_progress.elapsed() >= Duration::from_secs(1) {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => panic!("prefill failed: {error}"),
+            }
+        }
+
+        let (elapsed, result) = thread::scope(|scope| {
+            let (completed, completion) = mpsc::sync_channel(1);
+            let serving = scope.spawn(move || {
+                let started = Instant::now();
+                let result = handle_preview_request(server, bundle.path(), false, port);
+                let _ = completed.send((started.elapsed(), result));
+            });
+            let outcome = completion.recv_timeout(Duration::from_secs(15));
+            // Even if the handler loses its timeout, close the peer before
+            // joining so this regression cannot leave a blocked test thread.
+            let _ = client.shutdown(Shutdown::Both);
+            drop(client);
+            serving.join().expect("request worker");
+            outcome.expect("stalled write exceeded the timeout allowance")
+        });
+
+        assert!(
+            elapsed >= Duration::from_secs(8) && elapsed < Duration::from_secs(15),
+            "handler did not retain its ten-second write timeout: {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Err(BvrError::Io(ref error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "expected a write timeout, got {result:?}"
+        );
     }
 
     #[test]

@@ -466,6 +466,14 @@ pub struct Recommendation {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
     pub assignee: String,
+    /// Scheduler deferral, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Machine-readable top-pick gate (legacy #199): true iff this item would
+    /// be surfaced as a claimable robot pick (open, unassigned, unblocked,
+    /// not an epic or parent with open children, no not-ready label).
+    #[serde(default)]
+    pub claimable: bool,
     pub claim_command: String,
     pub show_command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,22 +504,36 @@ pub struct RecommendationsByLabel {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QuickRef {
+    /// Every non-closed issue (alias of `not_closed_count`).
     pub total_open: usize,
     pub total_actionable: usize,
+    /// Strict: issues whose status is exactly `open` (legacy #165).
     pub open_count: usize,
     pub actionable_count: usize,
+    /// Strict: issues whose status is exactly `blocked` (legacy #165).
     pub blocked_count: usize,
     pub in_progress_count: usize,
+    /// Every non-closed issue; `actionable_count + not_actionable_count`.
+    pub not_closed_count: usize,
+    /// Non-closed issues that are not actionable (open blockers, parked
+    /// status, or deferral), whatever their status.
+    pub not_actionable_count: usize,
     pub top_picks: Vec<QuickPick>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectHealthCounts {
     pub total: usize,
+    /// Strict: status exactly `open` (equals `by_status.open`).
     pub open: usize,
     pub closed: usize,
     pub actionable: usize,
+    /// Strict: status exactly `blocked` (equals `by_status.blocked`).
     pub blocked: usize,
+    /// Every non-closed issue.
+    pub not_closed: usize,
+    /// Non-closed, non-actionable issues (`not_closed - actionable`).
+    pub dependency_blocked: usize,
     pub by_status: BTreeMap<String, usize>,
     pub by_priority: BTreeMap<i32, usize>,
     pub by_type: BTreeMap<String, usize>,
@@ -632,6 +654,28 @@ pub struct TriageOptions {
     pub group_by_label: bool,
     pub max_recommendations: usize,
     pub scoring: TriageScoringOptions,
+    /// Opt-in label class marking beads that are graph-ready but not
+    /// work-ready (`--robot-not-ready-labels` / `BV_ROBOT_NOT_READY_LABELS`).
+    /// Such beads stay in `recommendations` but are never a claimable pick.
+    pub not_ready_labels: Vec<String>,
+    /// IDs to treat as blocked although this graph shows no open blocker:
+    /// `--graph-root` triage runs on a subtree, whose graph does not contain
+    /// blockers outside it.
+    pub extra_blocked: HashSet<String>,
+}
+
+/// Whether an issue is directly claimable work as a robot top pick.
+///
+/// Requires status
+/// exactly `open`, unassigned, not an epic, and carrying none of the opt-in
+/// not-ready labels. Graph gates (open blockers, deferral, parents with open
+/// children) are applied by the caller.
+#[must_use]
+pub fn is_claimable_issue(issue: &Issue, not_ready_labels: &[String]) -> bool {
+    issue.is_claimable_status()
+        && issue.assignee.trim().is_empty()
+        && !issue.issue_type.trim().eq_ignore_ascii_case("epic")
+        && !issue.has_any_label(not_ready_labels)
 }
 
 #[derive(Debug, Clone)]
@@ -652,7 +696,11 @@ pub fn compute_triage(
         options.max_recommendations
     };
 
-    let actionable: HashSet<String> = graph.actionable_ids().into_iter().collect();
+    let actionable: HashSet<String> = graph
+        .actionable_ids()
+        .into_iter()
+        .filter(|id| !options.extra_blocked.contains(id))
+        .collect();
     let total_open = issues.iter().filter(|issue| issue.is_open_like()).count();
 
     let ctx = ScoringContext::from_metrics(metrics, total_open);
@@ -756,8 +804,10 @@ pub fn compute_triage(
             unblocks_ids,
             blocked_by: open_blocker_ids,
             assignee: issue.assignee.clone(),
-            claim_command: format!("br update {} --status=in_progress", issue.id),
-            show_command: format!("br show {}", issue.id),
+            defer_until: issue.defer_until,
+            claimable: false,
+            claim_command: issue.claim_command(),
+            show_command: issue.show_command(),
             breakdown: Some(impact.breakdown),
         });
     }
@@ -768,7 +818,8 @@ pub fn compute_triage(
             .total_cmp(&left.score)
             .then_with(|| left.id.cmp(&right.id))
     });
-    recommendations.truncate(max_recommendations);
+    // Truncated only after top_picks and quick_wins are drawn below: claimable
+    // work ranked past the cutoff must still reach --robot-next.
 
     // Parents with open children are excluded from claimable picks (issue #17):
     // a parent/epic with still-open child work is a planning container, not
@@ -779,18 +830,34 @@ pub fn compute_triage(
     // (parity with the Go viewer's beads_viewer#158 contract).
     let parents_with_open_children = graph.parents_with_open_children();
 
-    // Top picks exclude in_progress issues (already being worked) to match
-    // legacy behavior: recommendations should surface NEW work to pick up, and
-    // exclude parents that still have open child work (issue #17).
-    let top_picks: Vec<QuickPick> = recommendations
+    // Claimable-pick gate shared by top_picks (--robot-next), quick_wins, and
+    // the per-track / per-label top picks. The recommendation set is already
+    // status-gated by `actionable_ids()` (open/in_progress, not deferred,
+    // issue #25); on top of that a pick must be directly claimable work:
+    // - status exactly `open` (in_progress is already being worked);
+    // - unassigned (an assigned bead belongs to someone else, even if open);
+    // - not an epic (planning containers are never claimed directly);
+    // - not a parent that still has open child work (issue #17);
+    // - not carrying an opt-in not-ready label (`--robot-not-ready-labels`).
+    let claimable: HashSet<String> = recommendations
         .iter()
         .filter(|rec| {
             !parents_with_open_children.contains(&rec.id)
                 && lookups
                     .issue_by_id
                     .get(rec.id.as_str())
-                    .is_none_or(|issue| issue.normalized_status() != "in_progress")
+                    .is_none_or(|issue| is_claimable_issue(issue, &options.not_ready_labels))
         })
+        .map(|rec| rec.id.clone())
+        .collect();
+    for rec in &mut recommendations {
+        rec.claimable = claimable.contains(&rec.id);
+    }
+    let is_claimable_pick = |rec: &Recommendation| -> bool { claimable.contains(&rec.id) };
+
+    let top_picks: Vec<QuickPick> = recommendations
+        .iter()
+        .filter(|rec| is_claimable_pick(rec))
         .take(3)
         .map(|rec| QuickPick {
             id: rec.id.clone(),
@@ -801,36 +868,47 @@ pub fn compute_triage(
         })
         .collect();
 
+    // Quick wins are things to start now, so they use the same claimable gate
+    // as top_picks before the effort/impact heuristic.
     let quick_wins = recommendations
         .iter()
         .filter(|rec| {
-            lookups
-                .issue_by_id
-                .get(rec.id.as_str())
-                .is_some_and(|issue| {
-                    issue.estimated_minutes.is_some_and(|mins| mins <= 120)
-                        || (issue.priority <= 2 && rec.unblocks > 0)
-                })
+            is_claimable_pick(rec)
+                && lookups
+                    .issue_by_id
+                    .get(rec.id.as_str())
+                    .is_some_and(|issue| {
+                        issue.estimated_minutes.is_some_and(|mins| mins <= 120)
+                            || (issue.priority <= 2 && rec.unblocks > 0)
+                    })
         })
         .take(10)
         .cloned()
         .collect();
 
+    recommendations.truncate(max_recommendations);
+
     let blockers_to_clear = compute_blockers_to_clear(issues, metrics, &actionable, &lookups);
 
     let recommendations_by_track = if options.group_by_track {
-        compute_recommendations_by_track(graph, &recommendations, &parents_with_open_children)
+        compute_recommendations_by_track(graph, &recommendations, &claimable)
     } else {
         Vec::new()
     };
 
     let recommendations_by_label = if options.group_by_label {
-        compute_recommendations_by_label(&recommendations, &parents_with_open_children)
+        compute_recommendations_by_label(&recommendations, &claimable)
     } else {
         Vec::new()
     };
 
-    let blocked_count = total_open.saturating_sub(actionable.len());
+    let not_actionable_count = total_open.saturating_sub(actionable.len());
+    let status_count = |status: &str| {
+        issues
+            .iter()
+            .filter(|issue| issue.normalized_status() == status)
+            .count()
+    };
     let in_progress_count = issues
         .iter()
         .filter(|issue| issue.is_open_like() && issue.normalized_status() == "in_progress")
@@ -838,10 +916,12 @@ pub fn compute_triage(
 
     let claim_top = top_picks
         .first()
-        .map(|pick| format!("CI=1 br update {} --status in_progress --json", pick.id));
+        .and_then(|pick| lookups.issue_by_id.get(pick.id.as_str()))
+        .map(|issue| issue.tracker_command("CI=1", "update {id} --status in_progress --json"));
     let show_top = top_picks
         .first()
-        .map(|pick| format!("CI=1 br show {} --json", pick.id));
+        .and_then(|pick| lookups.issue_by_id.get(pick.id.as_str()))
+        .map(|issue| issue.tracker_command("CI=1", "show {id} --json"));
 
     let result = TriageResult {
         meta: TriageMeta {
@@ -854,10 +934,12 @@ pub fn compute_triage(
         quick_ref: QuickRef {
             total_open,
             total_actionable: actionable.len(),
-            open_count: total_open,
+            open_count: status_count("open"),
             actionable_count: actionable.len(),
-            blocked_count,
+            blocked_count: status_count("blocked"),
             in_progress_count,
+            not_closed_count: total_open,
+            not_actionable_count,
             top_picks,
         },
         recommendations,
@@ -953,7 +1035,7 @@ fn compute_project_health(
         }
     }
 
-    let blocked_count = total_open.saturating_sub(actionable_count);
+    let dependency_blocked = total_open.saturating_sub(actionable_count);
     let node_count = graph.node_count();
     let edge_count = graph.edge_count();
     let density = if node_count <= 1 {
@@ -965,10 +1047,12 @@ fn compute_project_health(
     ProjectHealth {
         counts: ProjectHealthCounts {
             total: issues.len(),
-            open: total_open,
+            open: by_status.get("open").copied().unwrap_or(0),
             closed: closed_count,
             actionable: actionable_count,
-            blocked: blocked_count,
+            blocked: by_status.get("blocked").copied().unwrap_or(0),
+            not_closed: total_open,
+            dependency_blocked,
             by_status,
             by_priority,
             by_type,
@@ -1075,7 +1159,7 @@ fn compute_blockers_to_clear(
 fn compute_recommendations_by_track(
     graph: &IssueGraph,
     recommendations: &[Recommendation],
-    parents_with_open_children: &HashSet<String>,
+    claimable: &HashSet<String>,
 ) -> Vec<RecommendationsByTrack> {
     let component_lookup = graph.connected_open_components();
     let rec_by_id: HashMap<&str, &Recommendation> = recommendations
@@ -1102,11 +1186,11 @@ fn compute_recommendations_by_track(
             continue;
         }
 
-        // The claimable top pick skips parents that still have open children
-        // (issue #17); they remain listed in item_ids as track members.
+        // The top pick is the best claimable member (see `is_claimable_issue`);
+        // unclaimable members stay listed in item_ids as track members.
         let top_pick = items
             .iter()
-            .find(|item| !parents_with_open_children.contains(&item.id))
+            .find(|item| claimable.contains(&item.id))
             .map(|item| (**item).clone());
 
         by_track.push(RecommendationsByTrack {
@@ -1121,7 +1205,7 @@ fn compute_recommendations_by_track(
 
 fn compute_recommendations_by_label(
     recommendations: &[Recommendation],
-    parents_with_open_children: &HashSet<String>,
+    claimable: &HashSet<String>,
 ) -> Vec<RecommendationsByLabel> {
     let mut groups: BTreeMap<String, Vec<Recommendation>> = BTreeMap::new();
 
@@ -1140,12 +1224,9 @@ fn compute_recommendations_by_label(
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // The claimable top pick skips parents that still have open children
-        // (issue #17); they remain listed in item_ids under their label.
-        let top_pick = recs
-            .iter()
-            .find(|rec| !parents_with_open_children.contains(&rec.id))
-            .cloned();
+        // The top pick is the best claimable member (see `is_claimable_issue`);
+        // unclaimable members stay listed in item_ids under their label.
+        let top_pick = recs.iter().find(|rec| claimable.contains(&rec.id)).cloned();
 
         out.push(RecommendationsByLabel {
             label,
@@ -1172,6 +1253,61 @@ mod tests {
         metrics: &'a GraphMetrics,
     ) -> super::TriageLookupCache<'a> {
         super::TriageLookupCache::new(issues, graph, metrics)
+    }
+
+    #[test]
+    fn top_picks_reach_claimable_work_ranked_past_the_cutoff() {
+        // Ten higher-ranked beads are all assigned (not claimable); the only
+        // claimable bead ranks eleventh. --robot-next must still offer it.
+        let mut issues: Vec<Issue> = (0..10)
+            .map(|n| Issue {
+                id: format!("A{n:02}"),
+                title: format!("Assigned {n}"),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                priority: 0,
+                assignee: "someone".to_string(),
+                ..Issue::default()
+            })
+            .collect();
+        issues.push(Issue {
+            id: "Z".to_string(),
+            title: "Unassigned".to_string(),
+            status: "open".to_string(),
+            issue_type: "task".to_string(),
+            priority: 4,
+            ..Issue::default()
+        });
+
+        let graph = IssueGraph::build(&issues);
+        let metrics = graph.compute_metrics();
+        let triage = compute_triage(
+            &issues,
+            &graph,
+            &metrics,
+            &TriageOptions {
+                max_recommendations: 10,
+                ..TriageOptions::default()
+            },
+        );
+
+        assert_eq!(triage.result.recommendations.len(), 10);
+        assert!(
+            triage
+                .result
+                .recommendations
+                .iter()
+                .all(|rec| rec.id != "Z"),
+            "fixture must rank Z past the cutoff"
+        );
+        let picks: Vec<&str> = triage
+            .result
+            .quick_ref
+            .top_picks
+            .iter()
+            .map(|pick| pick.id.as_str())
+            .collect();
+        assert_eq!(picks, ["Z"]);
     }
 
     #[test]
@@ -1217,18 +1353,128 @@ mod tests {
 
         assert_eq!(triage.result.quick_ref.total_open, 2);
         assert_eq!(triage.result.quick_ref.total_actionable, 1);
-        assert_eq!(triage.result.quick_ref.open_count, 2);
+        assert_eq!(triage.result.quick_ref.not_closed_count, 2);
         assert_eq!(triage.result.quick_ref.actionable_count, 1);
-        assert_eq!(triage.result.quick_ref.blocked_count, 1);
+        assert_eq!(triage.result.quick_ref.not_actionable_count, 1);
         assert_eq!(triage.result.quick_ref.in_progress_count, 0);
+        // Strict status counts (legacy #165) always reconcile with by_status.
+        let by_status = &triage.result.project_health.counts.by_status;
+        assert_eq!(
+            triage.result.quick_ref.open_count,
+            by_status.get("open").copied().unwrap_or(0)
+        );
+        assert_eq!(
+            triage.result.quick_ref.blocked_count,
+            by_status.get("blocked").copied().unwrap_or(0)
+        );
         assert_eq!(triage.result.recommendations.len(), 1);
         assert_eq!(triage.result.recommendations[0].id, "A");
         assert_eq!(triage.result.project_health.counts.total, 2);
-        assert_eq!(triage.result.project_health.counts.open, 2);
-        assert_eq!(triage.result.project_health.counts.blocked, 1);
+        assert_eq!(triage.result.project_health.counts.not_closed, 2);
+        assert_eq!(triage.result.project_health.counts.dependency_blocked, 1);
+        assert_eq!(
+            triage.result.project_health.counts.open,
+            triage.result.quick_ref.open_count
+        );
         assert_eq!(triage.result.project_health.graph.node_count, 2);
         assert_eq!(triage.result.project_health.graph.edge_count, 1);
         assert!(triage.result.project_health.graph.phase2_ready);
+    }
+
+    #[test]
+    fn top_picks_require_claimable_work() {
+        let open = |id: &str| Issue {
+            id: id.to_string(),
+            title: format!("Issue {id}"),
+            status: "open".to_string(),
+            issue_type: "task".to_string(),
+            priority: 1,
+            ..Issue::default()
+        };
+        let issues = vec![
+            Issue {
+                assignee: "alice".to_string(),
+                ..open("assigned")
+            },
+            Issue {
+                issue_type: "epic".to_string(),
+                ..open("epic")
+            },
+            Issue {
+                labels: vec!["Needs-Design".to_string()],
+                ..open("not-ready")
+            },
+            Issue {
+                defer_until: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+                ..open("deferred")
+            },
+            Issue {
+                defer_until: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+                ..open("defer-elapsed")
+            },
+            open("free"),
+        ];
+
+        let graph = IssueGraph::build(&issues);
+        let metrics = graph.compute_metrics();
+        let triage = compute_triage(
+            &issues,
+            &graph,
+            &metrics,
+            &TriageOptions {
+                group_by_track: true,
+                group_by_label: true,
+                not_ready_labels: vec![" needs-design ".to_string()],
+                ..TriageOptions::default()
+            },
+        );
+
+        // A future deferral withholds the bead from ready work entirely.
+        let rec_ids: Vec<&str> = triage
+            .result
+            .recommendations
+            .iter()
+            .map(|rec| rec.id.as_str())
+            .collect();
+        assert!(!rec_ids.contains(&"deferred"), "{rec_ids:?}");
+        assert!(rec_ids.contains(&"assigned") && rec_ids.contains(&"epic"));
+
+        let mut pick_ids: Vec<&str> = triage
+            .result
+            .quick_ref
+            .top_picks
+            .iter()
+            .map(|pick| pick.id.as_str())
+            .collect();
+        pick_ids.sort_unstable();
+        assert_eq!(pick_ids, vec!["defer-elapsed", "free"]);
+
+        // `claimable` mirrors the top-pick gate on every recommendation.
+        for rec in &triage.result.recommendations {
+            assert_eq!(
+                rec.claimable,
+                pick_ids.contains(&rec.id.as_str()),
+                "claimable flag for {}",
+                rec.id
+            );
+        }
+
+        for track in &triage.result.recommendations_by_track {
+            if let Some(pick) = &track.top_pick {
+                assert!(
+                    pick_ids.contains(&pick.id.as_str()),
+                    "track pick {}",
+                    pick.id
+                );
+            }
+        }
+        for group in &triage.result.recommendations_by_label {
+            assert!(
+                group.top_pick.is_none(),
+                "label {} has no claimable work",
+                group.label
+            );
+        }
     }
 
     #[test]
@@ -1382,6 +1628,177 @@ mod tests {
         assert_eq!(triage.result.quick_ref.total_open, 0);
         assert_eq!(triage.result.quick_ref.open_count, 0);
         assert!(triage.result.recommendations.is_empty());
+    }
+
+    #[test]
+    fn triage_never_picks_a_parked_status_bead() {
+        // Issue #25: the reporter's 4-bead graph. A deferred P0 blocker with
+        // fan-out would outrank the open P3 leaf on every ranking if it were
+        // admitted; it must not reach recommendations, quick_wins, top_picks
+        // (--robot-next), the by-track / by-label picks, or actionable_count.
+        for status in ["deferred", "draft", "blocked", "custom-parked"] {
+            let blocked_by_def1 = |id: &str, title: &str| Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                priority: 2,
+                labels: vec!["lane".to_string()],
+                dependencies: vec![crate::model::Dependency {
+                    issue_id: id.to_string(),
+                    depends_on_id: "bd-def1".to_string(),
+                    dep_type: "blocks".to_string(),
+                    ..crate::model::Dependency::default()
+                }],
+                ..Issue::default()
+            };
+            let issues = vec![
+                Issue {
+                    id: "bd-def1".to_string(),
+                    title: "Parked P0 blocker".to_string(),
+                    status: status.to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 0,
+                    labels: vec!["lane".to_string()],
+                    ..Issue::default()
+                },
+                blocked_by_def1("bd-dep1", "Downstream work A"),
+                blocked_by_def1("bd-dep2", "Downstream work B"),
+                Issue {
+                    id: "bd-ready1".to_string(),
+                    title: "Only claimable leaf".to_string(),
+                    status: "open".to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 3,
+                    labels: vec!["lane".to_string()],
+                    ..Issue::default()
+                },
+            ];
+
+            let graph = IssueGraph::build(&issues);
+            let metrics = graph.compute_metrics();
+            let triage = compute_triage(
+                &issues,
+                &graph,
+                &metrics,
+                &TriageOptions {
+                    group_by_track: true,
+                    group_by_label: true,
+                    max_recommendations: 10,
+                    ..TriageOptions::default()
+                },
+            );
+            let result = &triage.result;
+
+            assert_eq!(result.quick_ref.actionable_count, 1, "status {status:?}");
+            assert_eq!(result.quick_ref.total_open, 4, "status {status:?}");
+            assert_eq!(
+                result.quick_ref.not_actionable_count, 3,
+                "status {status:?}"
+            );
+            assert_eq!(
+                result.quick_ref.not_closed_count,
+                result.quick_ref.actionable_count + result.quick_ref.not_actionable_count
+            );
+
+            let rec_ids: Vec<&str> = result
+                .recommendations
+                .iter()
+                .map(|rec| rec.id.as_str())
+                .collect();
+            assert_eq!(rec_ids, vec!["bd-ready1"], "status {status:?}");
+            assert_eq!(
+                result.recommendations[0].action, "Start work on this issue",
+                "status {status:?}"
+            );
+
+            let pick_ids: Vec<&str> = result
+                .quick_ref
+                .top_picks
+                .iter()
+                .map(|pick| pick.id.as_str())
+                .collect();
+            assert_eq!(pick_ids, vec!["bd-ready1"], "status {status:?}");
+
+            assert!(
+                result.quick_wins.iter().all(|rec| rec.id != "bd-def1"),
+                "status {status:?}: parked bead leaked into quick_wins"
+            );
+            assert!(
+                result.quick_wins.iter().all(|rec| rec.status == "open"),
+                "status {status:?}: quick_wins must carry an open status"
+            );
+
+            for group in &result.recommendations_by_track {
+                assert!(
+                    group
+                        .top_pick
+                        .as_ref()
+                        .is_none_or(|pick| pick.id != "bd-def1"),
+                    "status {status:?}: parked bead leaked into track pick"
+                );
+            }
+            for group in &result.recommendations_by_label {
+                assert!(
+                    group
+                        .top_pick
+                        .as_ref()
+                        .is_none_or(|pick| pick.id != "bd-def1"),
+                    "status {status:?}: parked bead leaked into label pick"
+                );
+            }
+            assert_eq!(
+                result.commands.claim_top.as_deref(),
+                Some("CI=1 br update bd-ready1 --status in_progress --json"),
+                "status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_wins_exclude_in_progress_items() {
+        // quick_wins share the claimable gate with top_picks: an in_progress
+        // item is actionable (it stays in recommendations) but is already
+        // being worked, so it is not a "start here" quick win.
+        let issues = vec![
+            Issue {
+                id: "WIP".to_string(),
+                title: "Already claimed".to_string(),
+                status: "in_progress".to_string(),
+                issue_type: "task".to_string(),
+                priority: 1,
+                estimated_minutes: Some(30),
+                ..Issue::default()
+            },
+            Issue {
+                id: "NEW".to_string(),
+                title: "Fresh work".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                priority: 1,
+                estimated_minutes: Some(30),
+                ..Issue::default()
+            },
+        ];
+        let graph = IssueGraph::build(&issues);
+        let metrics = graph.compute_metrics();
+        let triage = compute_triage(
+            &issues,
+            &graph,
+            &metrics,
+            &TriageOptions {
+                max_recommendations: 10,
+                ..TriageOptions::default()
+            },
+        );
+        assert_eq!(triage.result.recommendations.len(), 2);
+        let quick_win_ids: Vec<&str> = triage
+            .result
+            .quick_wins
+            .iter()
+            .map(|rec| rec.id.as_str())
+            .collect();
+        assert_eq!(quick_win_ids, vec!["NEW"]);
     }
 
     #[test]

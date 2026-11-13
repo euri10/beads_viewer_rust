@@ -508,24 +508,76 @@ impl IssueGraph {
             .collect()
     }
 
+    /// Issues that are ready work: an actionable status
+    /// (`Issue::is_actionable_status`: open/in_progress) AND no open blocking
+    /// dependency, directly or inherited through a blocked parent.
+    ///
+    /// Every triage surface (`recommendations`, `quick_wins`, `top_picks`,
+    /// `--robot-next`, `actionable_count`, plan/drift) derives from this set,
+    /// so the status gate lives here and is enforced once (issue #25). For the
+    /// dependency-only view (which issues have no open blockers, whatever
+    /// their status — what-if simulations and cascade alerts) see
+    /// [`Self::dependency_unblocked_ids`].
+    ///
+    /// A scheduler deferral (`defer_until` still in the future) also withholds
+    /// an issue, exactly as `br ready` does.
     #[must_use]
     pub fn actionable_ids(&self) -> Vec<String> {
+        self.actionable_ids_at(chrono::Utc::now())
+    }
+
+    /// [`Self::actionable_ids`] evaluated against an explicit clock, so the
+    /// `defer_until` gate is deterministic in tests and pinned-clock flows.
+    #[must_use]
+    pub fn actionable_ids_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+        let mut ids = self.dependency_unblocked_ids();
+        ids.retain(|id| {
+            self.issue(id)
+                .is_some_and(|issue| issue.is_actionable_status() && !issue.is_deferred_at(now))
+        });
+        ids
+    }
+
+    /// Non-closed issues with no open blocking dependency (directly or via a
+    /// blocked parent), regardless of their own status. A `blocked`/`deferred`
+    /// bead whose blockers are all closed IS in this set — it is
+    /// dependency-unblocked even though it is not actionable until its status
+    /// changes. This is the graph-structural view used by what-if
+    /// simulations; use [`Self::actionable_ids`] for "ready to work on".
+    #[must_use]
+    pub fn dependency_unblocked_ids(&self) -> Vec<String> {
+        self.dependency_unblocked_ids_with_closed(None)
+    }
+
+    /// Evaluate the same dependency readiness rules with one issue treated as
+    /// closed, without cloning issue records or rebuilding graph topology.
+    #[must_use]
+    pub(crate) fn dependency_unblocked_ids_after_closing(&self, issue_id: &str) -> Vec<String> {
+        self.dependency_unblocked_ids_with_closed(Some(issue_id))
+    }
+
+    fn dependency_unblocked_ids_with_closed(&self, completed: Option<&str>) -> Vec<String> {
+        let is_open = |issue: &Issue| issue.is_open_like() && completed != Some(issue.id.as_str());
         // Phase 1: Compute directly blocked issues (open blocking dependencies).
-        let mut directly_blocked = HashSet::<String>::new();
+        let mut directly_blocked = HashSet::<&str>::new();
         for issue in &self.issues {
-            let id = &issue.id;
-            if issue.is_closed_like() {
+            let id = issue.id.as_str();
+            if !is_open(issue) {
                 continue;
             }
-            if !self.open_blockers(id).is_empty() {
-                directly_blocked.insert(id.clone());
+            if self.blockers_by_issue.get(id).is_some_and(|blockers| {
+                blockers
+                    .iter()
+                    .any(|blocker| self.issue(blocker).is_some_and(is_open))
+            }) {
+                directly_blocked.insert(id);
             }
         }
 
         // Phase 2: Build parent->children index from parent-child dependencies.
         // A child has a dep with dep_type="parent-child" and depends_on_id pointing
         // to the parent. We invert: parent -> [children].
-        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
         for issue in &self.issues {
             for dep in &issue.dependencies {
                 if dep.is_parent_child()
@@ -533,41 +585,38 @@ impl IssueGraph {
                     && self.id_to_index.contains_key(&dep.depends_on_id)
                 {
                     children_of
-                        .entry(dep.depends_on_id.clone())
+                        .entry(dep.depends_on_id.as_str())
                         .or_default()
-                        .push(issue.id.clone());
+                        .push(issue.id.as_str());
                 }
             }
         }
 
         // Phase 3: Propagate blocked status through parent-child relationships.
         // If a parent is blocked, its children are also blocked (transitively).
-        let mut blocked = directly_blocked.clone();
-        let max_depth = 50;
-        for _ in 0..max_depth {
-            let mut newly_blocked = Vec::<String>::new();
-            for parent_id in &blocked {
-                if let Some(children) = children_of.get(parent_id) {
-                    for child_id in children {
-                        if !blocked.contains(child_id)
-                            && self
-                                .issue(child_id)
-                                .is_some_and(|issue| !issue.is_closed_like())
-                        {
-                            newly_blocked.push(child_id.clone());
-                        }
+        // Visit each blocked parent once instead of limiting hierarchy depth
+        // or repeatedly rescanning its descendants. Mark children when queued
+        // so cycles and shared descendants cannot keep the worklist alive.
+        let mut pending = directly_blocked.iter().copied().collect::<Vec<_>>();
+        let mut blocked = directly_blocked;
+        while let Some(parent_id) = pending.pop() {
+            if let Some(children) = children_of.get(parent_id) {
+                for &child_id in children {
+                    if !blocked.contains(child_id) && self.issue(child_id).is_some_and(is_open) {
+                        blocked.insert(child_id);
+                        pending.push(child_id);
                     }
                 }
             }
-            if newly_blocked.is_empty() {
-                break;
-            }
-            for id in newly_blocked {
-                blocked.insert(id);
-            }
         }
 
-        // Phase 4: Collect actionable issues (open, not blocked).
+        // Phase 4: Collect non-closed, dependency-unblocked issues. The status
+        // gate (`Issue::is_actionable_status`) is applied by `actionable_ids`
+        // on top of this set: a bead parked in `deferred`, `draft`, `blocked`,
+        // `pinned`, `hooked`, `review` or a custom status is dependency-
+        // unblocked here but withheld there, exactly as `br ready` withholds it
+        // (issue #25). Such a bead still blocks its dependents in Phase 1
+        // because it is not closed.
         //
         // NOTE: a standalone open parent with open children remains actionable
         // here. parent-child is a rollup edge that never gates the parent's own
@@ -578,7 +627,7 @@ impl IssueGraph {
         // enforced via `parents_with_open_children` at the recommendation
         // chokepoint, not here.
         let mut ids = self.issue_ids_sorted();
-        ids.retain(|id| self.issue(id).is_some_and(Issue::is_open_like) && !blocked.contains(id));
+        ids.retain(|id| self.issue(id).is_some_and(is_open) && !blocked.contains(id.as_str()));
         ids
     }
 
@@ -803,7 +852,7 @@ impl IssueGraph {
         }
     }
 
-    fn compute_pagerank(&self) -> HashMap<String, f64> {
+    pub(crate) fn compute_pagerank(&self) -> HashMap<String, f64> {
         let node_count = self.node_to_id.len();
         if node_count == 0 {
             return HashMap::new();
@@ -1167,29 +1216,7 @@ impl IssueGraph {
             })
             .collect::<Vec<_>>();
 
-        let mut disc = vec![0usize; n];
-        let mut low = vec![0usize; n];
-        let mut parent = vec![usize::MAX; n];
-        let mut visited = vec![false; n];
-        let mut is_ap = vec![false; n];
-        let mut time = 0usize;
-
-        for node in 0..n {
-            if !visited[node] {
-                tarjan_articulation_dfs(
-                    node,
-                    &neighbors,
-                    &mut disc,
-                    &mut low,
-                    &mut parent,
-                    &mut visited,
-                    &mut is_ap,
-                    &mut time,
-                );
-            }
-        }
-
-        is_ap
+        tarjan_articulation_points(&neighbors)
             .iter()
             .enumerate()
             .filter_map(|(index, &value)| {
@@ -1313,42 +1340,74 @@ fn normalize_l2(values: &mut [f64]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn tarjan_articulation_dfs(
-    node: usize,
-    neighbors: &[Vec<usize>],
-    disc: &mut [usize],
-    low: &mut [usize],
-    parent: &mut [usize],
-    visited: &mut [bool],
-    is_ap: &mut [bool],
-    time: &mut usize,
-) {
-    visited[node] = true;
-    *time = time.saturating_add(1);
-    disc[node] = *time;
-    low[node] = *time;
-    let mut children = 0usize;
+fn tarjan_articulation_points(neighbors: &[Vec<usize>]) -> Vec<bool> {
+    struct Frame {
+        node: usize,
+        next_neighbor: usize,
+        children: usize,
+    }
 
-    for &next in &neighbors[node] {
-        if !visited[next] {
-            children = children.saturating_add(1);
-            parent[next] = node;
+    let n = neighbors.len();
+    let mut disc = vec![0usize; n];
+    let mut low = vec![0usize; n];
+    let mut parent = vec![usize::MAX; n];
+    let mut is_ap = vec![false; n];
+    let mut time = 0usize;
+    let mut stack = Vec::<Frame>::new();
 
-            tarjan_articulation_dfs(next, neighbors, disc, low, parent, visited, is_ap, time);
+    for root in 0..n {
+        if disc[root] != 0 {
+            continue;
+        }
+        time = time.saturating_add(1);
+        disc[root] = time;
+        low[root] = time;
+        stack.push(Frame {
+            node: root,
+            next_neighbor: 0,
+            children: 0,
+        });
 
-            low[node] = low[node].min(low[next]);
-
-            if parent[node] == usize::MAX && children > 1 {
-                is_ap[node] = true;
+        // A dependency chain can be arbitrarily deep. Keep DFS frames on the
+        // heap and apply child low-link values only when their frames finish,
+        // exactly where recursive traversal would return to the parent.
+        while let Some(frame) = stack.last_mut() {
+            let node = frame.node;
+            if let Some(&next) = neighbors[node].get(frame.next_neighbor) {
+                frame.next_neighbor += 1;
+                if disc[next] == 0 {
+                    frame.children += 1;
+                    parent[next] = node;
+                    time = time.saturating_add(1);
+                    disc[next] = time;
+                    low[next] = time;
+                    stack.push(Frame {
+                        node: next,
+                        next_neighbor: 0,
+                        children: 0,
+                    });
+                } else if next != parent[node] {
+                    low[node] = low[node].min(disc[next]);
+                }
+            } else {
+                let children = frame.children;
+                stack.pop();
+                let parent_node = parent[node];
+                if parent_node == usize::MAX {
+                    // A root is a cut point only if DFS found multiple child
+                    // subtrees; its ordinary undirected degree is not enough.
+                    is_ap[node] = children > 1;
+                } else {
+                    low[parent_node] = low[parent_node].min(low[node]);
+                    if parent[parent_node] != usize::MAX && low[node] >= disc[parent_node] {
+                        is_ap[parent_node] = true;
+                    }
+                }
             }
-            if parent[node] != usize::MAX && low[next] >= disc[node] {
-                is_ap[node] = true;
-            }
-        } else if next != parent[node] {
-            low[node] = low[node].min(disc[next]);
         }
     }
+
+    is_ap
 }
 
 #[cfg(test)]
@@ -1483,6 +1542,141 @@ mod tests {
         let metrics = graph.compute_metrics();
 
         assert!(metrics.articulation_points.contains("A"));
+    }
+
+    fn articulation_graph(node_count: usize, edges: &[(usize, usize)]) -> IssueGraph {
+        let mut issues = (0..node_count)
+            .map(|node| hierarchy_issue(&format!("N-{node:05}"), "open", &[]))
+            .collect::<Vec<_>>();
+        for &(source, target) in edges {
+            let target_id = issues[target].id.clone();
+            let issue = &mut issues[source];
+            issue.dependencies.push(Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: target_id,
+                dep_type: "blocks".to_string(),
+                ..Dependency::default()
+            });
+        }
+        IssueGraph::build(&issues)
+    }
+
+    #[test]
+    fn articulation_points_handle_deep_dependency_chains_without_recursion() {
+        // A 25,000-issue chain previously aborted --robot-triage with a stack
+        // overflow. Exercise the production articulation path without running
+        // unrelated, more expensive graph metrics on this deliberately deep DAG.
+        let node_count = 25_000;
+        let edges = (1..node_count)
+            .map(|node| (node - 1, node))
+            .collect::<Vec<_>>();
+        let graph = articulation_graph(node_count, &edges);
+
+        let points = graph.compute_articulation_points();
+
+        assert_eq!(points.len(), node_count - 2);
+        assert!(!points.contains("N-00000"));
+        assert!(!points.contains(&format!("N-{:05}", node_count - 1)));
+        for node in 1..node_count - 1 {
+            assert!(points.contains(&format!("N-{node:05}")), "missing {node}");
+        }
+    }
+
+    #[test]
+    fn articulation_points_preserve_roots_back_edges_and_disconnected_components() {
+        let graph = articulation_graph(
+            8,
+            &[
+                (0, 1),
+                (0, 2),
+                (3, 4),
+                (4, 5),
+                (5, 3),
+                (5, 6),
+                (3, 4),
+                (4, 3),
+                (7, 7),
+            ],
+        );
+
+        // Root 0 has two DFS children. Root 3 has only one despite its two
+        // neighbors in the cycle; only vertex 5 separates that cycle's tail.
+        // Duplicate/reverse dependencies and the isolated self-loop do not
+        // introduce additional articulation points.
+        assert_eq!(
+            graph.compute_articulation_points(),
+            ["N-00000".to_string(), "N-00005".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn articulation_points_match_vertex_removal_oracle_for_small_graphs() {
+        fn component_count(
+            node_count: usize,
+            edges: &[(usize, usize)],
+            removed: Option<usize>,
+        ) -> usize {
+            let mut visited = vec![false; node_count];
+            if let Some(node) = removed {
+                visited[node] = true;
+            }
+            let mut count = 0;
+            for start in 0..node_count {
+                if visited[start] {
+                    continue;
+                }
+                count += 1;
+                visited[start] = true;
+                let mut pending = vec![start];
+                while let Some(node) = pending.pop() {
+                    for &(left, right) in edges {
+                        let next = if left == node {
+                            right
+                        } else if right == node {
+                            left
+                        } else {
+                            continue;
+                        };
+                        if !visited[next] {
+                            visited[next] = true;
+                            pending.push(next);
+                        }
+                    }
+                }
+            }
+            count
+        }
+
+        // Compare every simple undirected graph through five vertices with an
+        // independent definition: removing a cut vertex increases the number
+        // of connected components. No DFS timestamps or low-link values are
+        // used by this oracle.
+        for node_count in 0..=5 {
+            let possible_edges = (0..node_count)
+                .flat_map(|left| (left + 1..node_count).map(move |right| (left, right)))
+                .collect::<Vec<_>>();
+            for edge_mask in 0usize..(1usize << possible_edges.len()) {
+                let edges = possible_edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(bit, &edge)| (edge_mask & (1 << bit) != 0).then_some(edge))
+                    .collect::<Vec<_>>();
+                let original_components = component_count(node_count, &edges, None);
+                let expected = (0..node_count)
+                    .filter(|&removed| {
+                        component_count(node_count, &edges, Some(removed)) > original_components
+                    })
+                    .map(|node| format!("N-{node:05}"))
+                    .collect();
+                assert_eq!(
+                    articulation_graph(node_count, &edges).compute_articulation_points(),
+                    expected,
+                    "node_count={node_count}, edge_mask={edge_mask:#x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1747,6 +1941,259 @@ mod tests {
         let actionable = graph.actionable_ids();
 
         assert_eq!(actionable, vec!["C".to_string(), "E".to_string()]);
+    }
+
+    fn hierarchy_issue(id: &str, status: &str, dependencies: &[(&str, &str)]) -> Issue {
+        Issue {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            issue_type: "task".to_string(),
+            dependencies: dependencies
+                .iter()
+                .map(|(kind, target)| Dependency {
+                    issue_id: id.to_string(),
+                    depends_on_id: (*target).to_string(),
+                    dep_type: (*kind).to_string(),
+                    ..Dependency::default()
+                })
+                .collect(),
+            ..Issue::default()
+        }
+    }
+
+    #[test]
+    fn completion_readiness_view_matches_rebuilt_closed_snapshots() {
+        let mut issues = vec![
+            hierarchy_issue("BLOCKER", "open", &[]),
+            hierarchy_issue("OTHER", "deferred", &[]),
+            hierarchy_issue(
+                "ROOT",
+                "blocked",
+                &[("blocks", "BLOCKER"), ("parent-child", "PARENT-CYCLE")],
+            ),
+            hierarchy_issue("PARENT-CYCLE", "open", &[("parent-child", "ROOT")]),
+            hierarchy_issue("SECOND-PARENT", "blocked", &[("waits-for", "OTHER")]),
+            hierarchy_issue(
+                "SHARED",
+                "deferred",
+                &[
+                    ("parent-child", "ROOT"),
+                    ("parent-child", "SECOND-PARENT"),
+                    ("parent-child", "ROOT"),
+                ],
+            ),
+            hierarchy_issue("GRANDCHILD", "blocked", &[("parent-child", "SHARED")]),
+            hierarchy_issue("EXPLICIT", "open", &[("blocks", "ROOT")]),
+            hierarchy_issue("CLOSED", "closed", &[("parent-child", "ROOT")]),
+            hierarchy_issue("AFTER-CLOSED", "open", &[("parent-child", "CLOSED")]),
+            hierarchy_issue("TOMBSTONE", "tombstone", &[("blocks", "BLOCKER")]),
+            hierarchy_issue(
+                "DEPENDENCY-A",
+                "open",
+                &[("blocks", "DEPENDENCY-B"), ("parent-child", "ROOT")],
+            ),
+            hierarchy_issue("DEPENDENCY-B", "open", &[("blocks", "DEPENDENCY-A")]),
+            hierarchy_issue("MISSING-PARENT", "open", &[("parent-child", "ABSENT")]),
+            hierarchy_issue("RELATED", "open", &[("related", "ROOT")]),
+            hierarchy_issue("SELF-PARENT", "open", &[("parent-child", "SELF-PARENT")]),
+            hierarchy_issue("SELF-BLOCKER", "open", &[("blocks", "SELF-BLOCKER")]),
+        ];
+
+        for reverse in [false, true] {
+            if reverse {
+                issues.reverse();
+            }
+            let graph = IssueGraph::build(&issues);
+            let original = graph.dependency_unblocked_ids();
+            assert_eq!(
+                original,
+                vec![
+                    "AFTER-CLOSED",
+                    "BLOCKER",
+                    "MISSING-PARENT",
+                    "OTHER",
+                    "RELATED",
+                    "SELF-PARENT",
+                ]
+            );
+
+            for target in issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .chain(std::iter::once("UNKNOWN"))
+            {
+                // The oracle changes the actual snapshot and rebuilds all
+                // indexes. It does not use the hypothetical-closure helper.
+                let mut completed = issues.clone();
+                for issue in &mut completed {
+                    if issue.id == target {
+                        issue.status = "closed".to_string();
+                    }
+                }
+                let expected = IssueGraph::build(&completed).dependency_unblocked_ids();
+                assert_eq!(
+                    graph.dependency_unblocked_ids_after_closing(target),
+                    expected,
+                    "closure view differs for {target} (reverse={reverse})"
+                );
+                assert_eq!(graph.dependency_unblocked_ids(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_blocking_reaches_beyond_fifty_parent_levels() {
+        let mut issues = vec![
+            hierarchy_issue("Z-READY", "open", &[]),
+            hierarchy_issue("BLOCKER", "open", &[]),
+            hierarchy_issue("A-READY", "open", &[]),
+        ];
+        for depth in 0..=128 {
+            let id = format!("LEVEL-{depth:03}");
+            let (kind, parent) = if depth == 0 {
+                ("blocks", "BLOCKER".to_string())
+            } else {
+                ("parent-child", format!("LEVEL-{:03}", depth - 1))
+            };
+            issues.push(hierarchy_issue(&id, "open", &[(kind, &parent)]));
+        }
+
+        // The former fifty-round propagation only reached LEVEL-050; every
+        // deeper child was incorrectly ready regardless of insertion order.
+        for reverse in [false, true] {
+            if reverse {
+                issues.reverse();
+            }
+            let graph = IssueGraph::build(&issues);
+            let expected = vec!["A-READY", "BLOCKER", "Z-READY"];
+            assert_eq!(graph.dependency_unblocked_ids(), expected);
+            assert_eq!(graph.actionable_ids(), expected);
+        }
+
+        issues
+            .iter_mut()
+            .find(|issue| issue.id == "BLOCKER")
+            .expect("root prerequisite")
+            .status = "closed".to_string();
+        let graph = IssueGraph::build(&issues);
+        let mut released = (0..=128)
+            .map(|depth| format!("LEVEL-{depth:03}"))
+            .collect::<Vec<_>>();
+        released.extend(["A-READY".to_string(), "Z-READY".to_string()]);
+        released.sort();
+        assert_eq!(graph.actionable_ids(), released);
+    }
+
+    #[test]
+    fn inherited_blocking_handles_parent_cycles_and_shared_descendants() {
+        let mut issues = vec![
+            hierarchy_issue("BLOCKER", "open", &[]),
+            hierarchy_issue("A", "open", &[("blocks", "BLOCKER"), ("parent-child", "C")]),
+            hierarchy_issue("C", "open", &[("parent-child", "A")]),
+            hierarchy_issue(
+                "SHARED",
+                "open",
+                &[
+                    ("parent-child", "C"),
+                    ("parent-child", "A"),
+                    ("parent-child", "A"),
+                ],
+            ),
+            hierarchy_issue("LEAF", "open", &[("parent-child", "SHARED")]),
+            hierarchy_issue("UNBLOCKED-A", "open", &[("parent-child", "UNBLOCKED-B")]),
+            hierarchy_issue("UNBLOCKED-B", "open", &[("parent-child", "UNBLOCKED-A")]),
+            hierarchy_issue("READY", "open", &[]),
+        ];
+        for reverse in [false, true] {
+            if reverse {
+                issues.reverse();
+            }
+            let graph = IssueGraph::build(&issues);
+            // Parent edges alone do not block work. Only the cycle connected
+            // to an open prerequisite, and its descendants, inherit blocking.
+            assert_eq!(
+                graph.actionable_ids(),
+                vec!["BLOCKER", "READY", "UNBLOCKED-A", "UNBLOCKED-B"]
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_blocking_preserves_closed_and_non_parent_boundaries() {
+        for terminal_status in ["closed", "tombstone"] {
+            let issues = vec![
+                hierarchy_issue("BLOCKER", "open", &[]),
+                hierarchy_issue("ROOT", "open", &[("blocks", "BLOCKER")]),
+                hierarchy_issue("TERMINAL", terminal_status, &[("parent-child", "ROOT")]),
+                hierarchy_issue("AFTER-TERMINAL", "open", &[("parent-child", "TERMINAL")]),
+                hierarchy_issue("PARKED", "deferred", &[(" Parent-Child ", "ROOT")]),
+                hierarchy_issue("AFTER-PARKED", "open", &[("parent-child", "PARKED")]),
+                hierarchy_issue("RELATED", "open", &[("related", "ROOT")]),
+                hierarchy_issue("UNKNOWN-PARENT", "open", &[("parent-child", "MISSING")]),
+            ];
+            let graph = IssueGraph::build(&issues);
+            // Closed/tombstone nodes stop inheritance, while nonterminal
+            // parked nodes still pass it to their open descendants.
+            let expected = vec!["AFTER-TERMINAL", "BLOCKER", "RELATED", "UNKNOWN-PARENT"];
+            assert_eq!(graph.dependency_unblocked_ids(), expected);
+            assert_eq!(graph.actionable_ids(), expected);
+        }
+    }
+
+    #[test]
+    fn actionable_ids_excludes_parked_statuses() {
+        // Issue #25: every status `br ready` excludes must be excluded here,
+        // even with no dependencies at all. The parked bead still blocks its
+        // dependent because it is not closed, so only the open leaf remains.
+        for status in [
+            "deferred",
+            "draft",
+            "blocked",
+            "pinned",
+            "hooked",
+            "review",
+            "custom-parked",
+        ] {
+            let issues = vec![
+                Issue {
+                    id: "PARKED".to_string(),
+                    title: "Parked P0 blocker".to_string(),
+                    status: status.to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 0,
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "DEP".to_string(),
+                    title: "Blocked by PARKED".to_string(),
+                    status: "open".to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 2,
+                    dependencies: vec![Dependency {
+                        issue_id: "DEP".to_string(),
+                        depends_on_id: "PARKED".to_string(),
+                        dep_type: "blocks".to_string(),
+                        ..Dependency::default()
+                    }],
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "READY".to_string(),
+                    title: "Open leaf".to_string(),
+                    status: "open".to_string(),
+                    issue_type: "task".to_string(),
+                    priority: 3,
+                    ..Issue::default()
+                },
+            ];
+            let graph = IssueGraph::build(&issues);
+            assert_eq!(
+                graph.actionable_ids(),
+                vec!["READY".to_string()],
+                "status {status:?} must not be actionable"
+            );
+        }
     }
 
     #[test]

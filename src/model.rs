@@ -15,7 +15,7 @@ const KNOWN_STATUSES: &[&str] = &[
     "tombstone",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, Default)]
 pub struct Issue {
     #[serde(default)]
     pub id: String,
@@ -43,8 +43,15 @@ pub struct Issue {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
-    #[serde(default)]
+    /// Due date. beads_rust (`br`) exports this as `due_at`; legacy `bd`
+    /// exports used `due_date`. Both spellings load into this field.
+    #[serde(default, alias = "due_at")]
     pub due_date: Option<DateTime<Utc>>,
+    /// Scheduler deferral (`br defer --until`): the issue is hidden from
+    /// ready/actionable work until this instant passes, exactly as `br ready`
+    /// withholds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub closed_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -59,6 +66,14 @@ pub struct Issue {
     /// workspace issues. Computed during workspace loading and never emitted.
     #[serde(skip)]
     pub workspace_prefix: Option<String>,
+    /// Internal repository root a workspace issue was loaded from. Tracker
+    /// commands for workspace issues run there, against the local ID.
+    #[serde(skip)]
+    pub workspace_repo_path: Option<std::path::PathBuf>,
+    /// Internal: the ID exactly as the issue's own tracker stored it, before
+    /// workspace namespacing. Never emitted.
+    #[serde(skip)]
+    pub workspace_local_id: Option<String>,
     /// Internal content hash for dedup — computed, not serialized to JSON output.
     #[serde(default, skip_serializing)]
     pub content_hash: Option<String>,
@@ -67,7 +82,7 @@ pub struct Issue {
     pub external_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, Default)]
 pub struct Dependency {
     #[serde(default)]
     pub issue_id: String,
@@ -81,7 +96,7 @@ pub struct Dependency {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, Default)]
 pub struct Comment {
     #[serde(default)]
     pub id: i64,
@@ -172,9 +187,123 @@ impl Issue {
         self.normalized_status() == "in_progress"
     }
 
+    /// Returns true for any non-terminal status. This is a "not closed"
+    /// predicate, NOT a readiness predicate: blocked/deferred/draft/pinned/
+    /// hooked/review and custom statuses are open-like (they still block
+    /// their dependents and count toward open totals) but are not actionable.
+    /// Use [`Self::is_actionable_status`] for readiness.
     #[must_use]
     pub fn is_open_like(&self) -> bool {
         !self.is_closed_like()
+    }
+
+    /// Returns true when the status alone makes this issue ready work.
+    ///
+    /// This is the single status gate behind `actionable_ids()` and therefore
+    /// behind every triage surface (`recommendations`, `quick_wins`,
+    /// `top_picks`, `--robot-next`, `actionable_count`). It mirrors the
+    /// status rule `br ready` applies: only `open` is ready work, and every
+    /// parked status — `blocked`, `deferred`, `draft`, `pinned`, `hooked`,
+    /// `review`, and any custom status — is excluded (issue #25).
+    ///
+    /// The one deliberate difference from `br ready` is `in_progress`:
+    /// `br ready` hides it because it is already claimed, while bvr keeps it
+    /// actionable because it is live work (health counts and the "Continue
+    /// work" recommendations rely on that). The claimable pick surfaces
+    /// (`top_picks` / `--robot-next` / `quick_wins`) additionally require
+    /// [`Self::is_claimable_status`].
+    #[must_use]
+    pub fn is_actionable_status(&self) -> bool {
+        matches!(self.normalized_status().as_str(), "open" | "in_progress")
+    }
+
+    /// Returns true when the status alone allows an agent to claim this
+    /// issue: exactly `open` (the `br ready` status rule). `in_progress` is
+    /// actionable but already claimed, so it is not claimable.
+    #[must_use]
+    pub fn is_claimable_status(&self) -> bool {
+        self.normalized_status() == "open"
+    }
+
+    /// Returns true while a scheduler deferral (`defer_until`) is still in
+    /// the future at `now`. A deferred issue is withheld from ready work —
+    /// and therefore from every triage pick — until the instant passes.
+    #[must_use]
+    pub fn is_deferred_at(&self, now: DateTime<Utc>) -> bool {
+        self.defer_until.is_some_and(|until| until > now)
+    }
+
+    /// The ID the issue's own tracker knows it by: workspace loading prefixes
+    /// IDs (`api-bd-12`), but `br` in that repository only knows `bd-12`.
+    #[must_use]
+    pub fn local_id(&self) -> &str {
+        // A native ID that already carried the workspace prefix (`api-12` in
+        // repo `api`) is kept as-is by namespacing; stripping the prefix
+        // again would name an issue br does not know.
+        if let Some(local) = self
+            .workspace_local_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            return local;
+        }
+        self.workspace_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .and_then(|prefix| {
+                let id = self.id.as_str();
+                id.get(..prefix.len())
+                    .filter(|head| head.eq_ignore_ascii_case(prefix))
+                    .map(|_| &id[prefix.len()..])
+            })
+            .filter(|local| !local.is_empty())
+            .unwrap_or(&self.id)
+    }
+
+    /// A runnable `br` command line for this issue. `args` uses `{id}` as
+    /// the placeholder for the (shell-quoted) local ID; `env` is an optional
+    /// environment prefix such as `CI=1`. Workspace issues `cd` into their
+    /// repository first so `br` resolves the right tracker.
+    #[must_use]
+    pub fn tracker_command(&self, env: &str, args: &str) -> String {
+        let command = args.replace("{id}", &shell_quote(self.local_id()));
+        let command = if env.trim().is_empty() {
+            format!("br {command}")
+        } else {
+            format!("{} br {command}", env.trim())
+        };
+        match &self.workspace_repo_path {
+            Some(repo) => format!("cd {} && {command}", shell_quote(&repo.to_string_lossy())),
+            None => command,
+        }
+    }
+
+    /// `br update <id> --status=in_progress`, workspace-aware.
+    #[must_use]
+    pub fn claim_command(&self) -> String {
+        self.tracker_command("", "update {id} --status=in_progress")
+    }
+
+    /// `br show <id>`, workspace-aware.
+    #[must_use]
+    pub fn show_command(&self) -> String {
+        self.tracker_command("", "show {id}")
+    }
+
+    /// Returns true when the issue carries any of `labels`, compared
+    /// case-insensitively after trimming. An empty `labels` set never matches.
+    #[must_use]
+    pub fn has_any_label(&self, labels: &[String]) -> bool {
+        if labels.is_empty() {
+            return false;
+        }
+        self.labels.iter().any(|have| {
+            let have = have.trim();
+            labels
+                .iter()
+                .any(|want| have.eq_ignore_ascii_case(want.trim()))
+        })
     }
 
     #[must_use]
@@ -237,6 +366,41 @@ impl Issue {
 
         Ok(())
     }
+}
+
+/// Quote a value for POSIX shells only when it holds characters outside the
+/// conservative safe set, so ordinary bead IDs stay unquoted and readable.
+#[must_use]
+pub fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '-' | '_' | '.' | '/' | ':' | '+' | '@' | '=')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Claim command for `id`, looked up in `issues` (workspace-aware); falls
+/// back to the plain form when the ID is unknown.
+#[must_use]
+pub fn claim_command_for(issues: &[Issue], id: &str) -> String {
+    issues.iter().find(|issue| issue.id == id).map_or_else(
+        || format!("br update {} --status=in_progress", shell_quote(id)),
+        Issue::claim_command,
+    )
+}
+
+/// Show command for `id`, looked up in `issues` (workspace-aware).
+#[must_use]
+pub fn show_command_for(issues: &[Issue], id: &str) -> String {
+    issues.iter().find(|issue| issue.id == id).map_or_else(
+        || format!("br show {}", shell_quote(id)),
+        Issue::show_command,
+    )
 }
 
 const fn default_priority() -> i32 {
@@ -426,6 +590,45 @@ mod tests {
     }
 
     #[test]
+    fn actionable_and_claimable_status_mirror_br_ready() {
+        // Issue #25: only open/in_progress are actionable; only open is claimable.
+        for status in ["open", "OPEN", " open "] {
+            let issue = Issue {
+                status: status.to_string(),
+                ..Default::default()
+            };
+            assert!(issue.is_actionable_status(), "{status:?} is actionable");
+            assert!(issue.is_claimable_status(), "{status:?} is claimable");
+        }
+        let in_progress = Issue {
+            status: "in_progress".to_string(),
+            ..Default::default()
+        };
+        assert!(in_progress.is_actionable_status());
+        assert!(!in_progress.is_claimable_status());
+
+        for status in [
+            "blocked",
+            "deferred",
+            "draft",
+            "pinned",
+            "hooked",
+            "review",
+            "custom-parked",
+            "closed",
+            "tombstone",
+            "",
+        ] {
+            let issue = Issue {
+                status: status.to_string(),
+                ..Default::default()
+            };
+            assert!(!issue.is_actionable_status(), "{status:?} is parked");
+            assert!(!issue.is_claimable_status(), "{status:?} is not claimable");
+        }
+    }
+
+    #[test]
     fn is_open_like_for_all_open_statuses() {
         for status in [
             "open",
@@ -446,6 +649,53 @@ mod tests {
                 "{status} should not be closed-like"
             );
         }
+    }
+
+    #[test]
+    fn tracker_commands_use_local_id_and_repo_for_workspace_issues() {
+        let plain = Issue {
+            id: "bd-12".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(plain.local_id(), "bd-12");
+        assert_eq!(
+            plain.claim_command(),
+            "br update bd-12 --status=in_progress"
+        );
+        assert_eq!(plain.show_command(), "br show bd-12");
+
+        let workspace = Issue {
+            id: "api-bd-12".to_string(),
+            workspace_prefix: Some("api-".to_string()),
+            workspace_repo_path: Some(std::path::PathBuf::from("/work/my api")),
+            ..Default::default()
+        };
+        assert_eq!(workspace.local_id(), "bd-12");
+        assert_eq!(
+            workspace.claim_command(),
+            "cd '/work/my api' && br update bd-12 --status=in_progress"
+        );
+        assert_eq!(
+            workspace.tracker_command("CI=1", "show {id} --json"),
+            "cd '/work/my api' && CI=1 br show bd-12 --json"
+        );
+
+        // A prefix that does not match leaves the ID intact.
+        let mismatched = Issue {
+            id: "bd-3".to_string(),
+            workspace_prefix: Some("web-".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(mismatched.local_id(), "bd-3");
+    }
+
+    #[test]
+    fn shell_quote_only_quotes_unsafe_values() {
+        assert_eq!(shell_quote("bd-1.2"), "bd-1.2");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("x;rm -rf /"), "'x;rm -rf /'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]

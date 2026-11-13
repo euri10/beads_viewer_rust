@@ -1,0 +1,2985 @@
+#!/usr/bin/env node
+'use strict';
+
+// Run with an existing Playwright installation (no npm project is needed):
+// NODE_PATH=/path/to/node_modules node --test scripts/test_viewer_search.cjs
+// BVR_CHROMIUM_EXECUTABLE (or CHROMIUM_PATH) selects an installed Chromium.
+// The security scenarios run the real exporter. Build bvr first, or set BVR_BIN
+// to a freshly built binary (defaults to target/debug/bvr). Run just these with:
+// NODE_PATH=/path/to/node_modules BVR_BIN=/path/to/bvr \
+//   node --test --test-name-pattern='security:' scripts/test_viewer_search.cjs
+// BVR_VIEWER_ARTIFACT_DIR optionally chooses the parent of retained export fixtures.
+// BVR_VIEWER_REVISION optionally serves index.html/viewer.js/graph.js from a git revision
+// to demonstrate that these regressions fail before a fix, without changing files.
+// Exported SQLite/data files always come from BVR_BIN, including in revision mode.
+// BVR_EXPORT_ASSET_REVISION validates every exported asset against that exact
+// revision when BVR_BIN is a preserved baseline binary. Otherwise the complete
+// inventory must match this checkout, independently of browser source overlays.
+// Standalone graph tests always serve actual --export-graph output; revision mode
+// verifies that BVR_BIN embedded that revision's template instead of replacing it.
+// BVR_DOMPURIFY_REVISION serves only vendor/dompurify.min.js from a git revision
+// for sanitizer comparisons with current application code and exported data.
+
+const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { mkdir, mkdtemp, readFile, writeFile } = require('node:fs/promises');
+const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
+const { after, before, test } = require('node:test');
+const { chromium } = require('playwright');
+
+const root = path.resolve(__dirname, '..');
+const assets = path.join(root, 'viewer_assets');
+const specialQuery = 'C++ / #28 & café 50%?';
+const issues = [
+  ['bv-open', 'Needle open ready', '', 'open', 1, 'bug', 'Ada', '["viewer"]', '', 2],
+  ['bv-blocked', 'Needle open blocked', '', 'open', 2, 'task', 'Ben', '["frontend"]', 'bv-open', 0],
+  ['bv-progress', 'Needle in progress', '', 'in_progress', 0, 'feature', 'Ada', '["backend"]', '', 0],
+  ['bv-closed', 'Needle closed', '', 'closed', 3, 'bug', '', '["viewer"]', '', 0],
+  ['bv-description', 'Description match', 'A needle appears in the description.', 'open', 4, 'task', 'Ben', '["frontend"]', '', 0],
+  ['bv-other', 'Unrelated blocked task', '', 'open', 2, 'task', '', '[]', 'bv-open', 0],
+  ['bv-special', specialQuery, '', 'open', 2, 'task', '', '[]', '', 0],
+];
+const dependencies = [
+  ['bv-blocked', 'bv-open', 'blocks'],
+  ['bv-other', 'bv-open', 'blocks'],
+];
+// A separate graph fixture keeps the original search expectations unchanged.
+// Closing root makes left/right ready; completing BOTH then unlocks join/tail.
+const graphIssues = [
+  ['graph-root', 'Root prerequisite', '', 'open', 1, 'task', '', '[]', '', 2],
+  ['graph-left', 'Left branch', '', 'open', 2, 'task', '', '[]', 'graph-root', 1],
+  ['graph-right', 'Right branch', '', 'open', 2, 'task', '', '[]', 'graph-root', 1],
+  ['graph-join', 'Two prerequisite join', '', 'open', 2, 'task', '', '[]', 'graph-left,graph-right', 1],
+  ['graph-tail', 'Tail after join', '', 'open', 2, 'task', '', '[]', 'graph-join', 0],
+  ['graph-closed', 'Completed prerequisite', '', 'closed', 2, 'task', '', '[]', '', 0],
+  ['graph-tombstone', 'Tombstoned prerequisite', '', 'tombstone', 2, 'task', '', '[]', '', 0],
+  ['graph-ready', 'Ready after resolved prerequisites', '', 'open', 2, 'task', '', '[]', '', 0],
+  ['graph-isolated', 'Standalone actionable issue', '', 'open', 2, 'task', '', '[]', '', 0],
+  ['graph-info', 'Nonblocking relationships', '', 'open', 2, 'task', '', '[]', '', 0],
+  ['graph-external', 'Reference outside this export', '', 'open', 2, 'task', '', '[]', '', 0],
+];
+const graphDependencies = [
+  ['graph-left', 'graph-root', 'blocks'],
+  ['graph-right', 'graph-root', 'waits-for'],
+  ['graph-join', 'graph-left', 'conditional-blocks'],
+  ['graph-join', 'graph-right', 'blocks'],
+  ['graph-tail', 'graph-join', 'blocks'],
+  ['graph-ready', 'graph-closed', 'blocks'],
+  ['graph-ready', 'graph-tombstone', 'waits-for'],
+  ['graph-info', 'graph-root', 'related'],
+  ['graph-info', 'graph-tail', 'parent-child'],
+  ['graph-external', 'missing-blocker', 'blocks'],
+  ['missing-dependent', 'graph-root', 'blocks'],
+];
+// Match data/history.json emitted by export_pages.rs: a flat map keyed by ID,
+// with individually timestamped events and empty commit SHAs. Same-day entries
+// must remain separate; the current database includes a closed prerequisite.
+const historyEvent = (id, kind, timestamp, message = '', sha = '') => ({
+  bead_id: id, event_type: kind, timestamp, commit_sha: sha,
+  commit_message: message, author: '', author_email: '',
+});
+const recordedEvents = [
+  historyEvent('graph-root', 'created', '2026-10-06T09:00:00Z', 'Root recorded'),
+  historyEvent('graph-closed', 'created', '2026-10-06T09:00:00Z', 'Same instant, separate issue'),
+  historyEvent('graph-left', 'created', '2026-10-06T09:00:30Z', 'Left recorded'),
+  historyEvent('graph-root', 'updated', '2026-10-06T09:01:00Z', '<b>Literal recorded update</b>'),
+  historyEvent('graph-closed', 'closed', '2026-10-06T09:02:00Z', 'Completed prerequisite'),
+];
+function exportedHistory(events) {
+  const histories = {};
+  for (const event of events) {
+    const issue = graphIssues.find(item => item[0] === event.bead_id);
+    const history = histories[event.bead_id] ||= {
+      bead_id: event.bead_id, title: issue?.[1] || event.bead_id,
+      status: issue?.[3] || 'open', events: [], milestones: {},
+      commits: null, cycle_time: null, last_author: '',
+    };
+    history.events.push(event);
+  }
+  return histories;
+}
+const recordedHistory = exportedHistory([
+  ...recordedEvents,
+  historyEvent('graph-root', 'updated', '', 'No invented date'),
+  historyEvent('graph-left', 'updated', 'not-a-date', 'Invalid date'),
+  historyEvent('graph-left', 'updated', '2026', 'A year is not an event timestamp'),
+  historyEvent('graph-left', 'updated', 1791277200000, 'Timestamp strings are required'),
+  historyEvent('graph-left', 'updated', '2026-02-30T09:00:00Z', 'Invalid calendar day'),
+  historyEvent('not-in-export', 'created', '2026-10-06T09:03:00Z', 'Unknown issue'),
+]);
+const allIds = issues.map(issue => issue[0]);
+const matchingIds = ['bv-open', 'bv-blocked', 'bv-progress', 'bv-closed', 'bv-description'];
+const openIds = ['bv-open', 'bv-blocked', 'bv-description'];
+const rowSelector = '[role="button"][aria-label^="View issue "]';
+const inputSelector = 'input[placeholder="Search issues..."]:visible';
+const executablePath = process.env.BVR_CHROMIUM_EXECUTABLE || process.env.CHROMIUM_PATH;
+let server;
+let origin;
+let securityExport;
+let bottleneckExport;
+let mutationExport;
+let dependencyExport;
+let standaloneExport;
+let readinessExport;
+const integrityExports = new Map();
+
+// These expectations describe the source fixture, independently of the browser
+// implementation. The fixture is exported by bvr so Rust readiness, SQLite, and
+// the displayed dashboard all have to agree on the same real issue snapshot.
+const readinessPunctuationId = 'readiness, <img src=x onerror="window.__readinessPayloads.push(\'id\')">';
+const readinessIssues = [
+  { id: 'readiness-done', title: 'Readiness completed prerequisite', status: ' CLOSED ' },
+  { id: 'readiness-gone', title: 'Readiness removed prerequisite', status: ' TOMBSTONE ' },
+  {
+    id: 'readiness-root', title: 'Readiness resolved prerequisites', priority: 0,
+    dependencies: [
+      { depends_on_id: 'readiness-done', type: ' BLOCKS ' },
+      { depends_on_id: 'readiness-gone', type: 'conditional-blocks' },
+    ],
+  },
+  { id: 'readiness-ordinary', title: 'Readiness ordinary blocking edge', dependencies: [{ depends_on_id: 'readiness-root', type: 'blocks' }] },
+  { id: 'readiness-waits', title: 'Readiness waits-for edge', dependencies: [{ depends_on_id: 'readiness-root', type: '\tWAITS-FOR\n' }] },
+  { id: 'readiness-conditional', title: 'Readiness conditional edge', dependencies: [{ depends_on_id: 'readiness-root', type: '\u00a0CONDITIONAL-BLOCKS\u2003' }] },
+  { id: 'readiness-empty', title: 'Readiness empty blocking type', dependencies: [{ depends_on_id: 'readiness-root', type: '' }] },
+  {
+    id: 'readiness-mixed', title: 'Readiness normalized and duplicate blocking edges',
+    dependencies: [
+      { depends_on_id: 'readiness-root', type: ' BlOcKs ' },
+      { depends_on_id: 'readiness-root', type: ' WAITs-FoR ' },
+    ],
+  },
+  { id: 'readiness-inherited', title: 'Readiness child of blocked parent', dependencies: [{ depends_on_id: 'readiness-conditional', type: 'parent-child' }] },
+  { id: 'readiness-grandchild', title: 'Readiness inherited grandchild', dependencies: [{ depends_on_id: 'readiness-inherited', type: 'parent-child' }] },
+  { id: 'readiness-future', title: 'Readiness future scheduling deferral', defer_until: '2999-01-01T00:00:00Z' },
+  { id: 'readiness-expired', title: 'Readiness expired scheduling deferral', defer_until: '2020-01-01T00:00:00Z' },
+  { id: 'readiness-review', title: 'Readiness parked review status', status: ' REVIEW ', priority: 0, dependencies: [{ depends_on_id: 'readiness-root', type: 'blocks' }] },
+  { id: 'readiness-deferred', title: 'Readiness parked deferred status', status: 'deferred', priority: 0 },
+  { id: 'readiness-progress', title: 'Readiness work already in progress', status: ' IN_PROGRESS ', priority: 0 },
+  { id: 'readiness-assigned', title: 'Readiness assigned work', assignee: 'Ada', priority: 0 },
+  { id: 'readiness-epic', title: 'Readiness epic container', issue_type: 'epic', priority: 0 },
+  { id: 'readiness-parent', title: 'Readiness task container with an open child', priority: 0 },
+  { id: 'readiness-child', title: 'Readiness independent child', dependencies: [{ depends_on_id: 'readiness-parent', type: 'parent-child' }] },
+  { id: 'readiness-related', title: 'Readiness nonblocking information', dependencies: [{ depends_on_id: 'readiness-root', type: 'related' }] },
+  { id: readinessPunctuationId, title: 'Readiness literal punctuation prerequisite' },
+  { id: 'readiness-punctuation-child', title: 'Readiness exact punctuation reference', dependencies: [{ depends_on_id: readinessPunctuationId, type: ' WAITs-FoR ' }] },
+];
+const readinessReadyIds = [
+  'readiness-root', 'readiness-expired', 'readiness-progress', 'readiness-assigned',
+  'readiness-epic', 'readiness-parent', 'readiness-child', 'readiness-related', readinessPunctuationId,
+].sort();
+const readinessBlockedIds = [
+  'readiness-ordinary', 'readiness-waits', 'readiness-conditional', 'readiness-empty',
+  'readiness-mixed', 'readiness-inherited', 'readiness-grandchild', 'readiness-punctuation-child', 'readiness-review',
+].sort();
+const readinessClaimableIds = [
+  'readiness-root', 'readiness-expired', 'readiness-child', 'readiness-related', readinessPunctuationId,
+].sort();
+
+const securityDescriptions = [
+  {
+    id: 'security-markdown', title: 'Ordinary Markdown',
+    description: 'A **strong** word, *emphasis*, `inline code`, and [safe link](https://example.invalid/docs?one=1&two=2).\n\n- First item\n- Second item\n\n> Quoted text',
+  },
+  { id: 'security-empty', title: 'Empty description', description: '' },
+  {
+    id: 'security-events', title: 'Event handlers and unsafe links',
+    description: 'Before <img src="__security_missing_image__" onerror="window.__viewerPayloads.push(\'image\')" alt="payload image"> after <svg onload="window.__viewerPayloads.push(\'svg\')"></svg>\n\n<a href="javascript:window.__viewerPayloads.push(\'javascript\')">unsafe link</a>',
+  },
+  {
+    id: 'security-html', title: 'Raw HTML',
+    description: 'A <strong>raw HTML</strong> paragraph & café.\n\n<script>window.__viewerPayloads.push("script")</script>',
+  },
+  {
+    id: 'security-alpine', title: 'Alpine directives',
+    // Use the long directive spelling: marked's inline HTML grammar treats
+    // @click as malformed markup and escapes the opening tag itself. Valid
+    // attributes ensure this scenario really reaches DOMPurify in all views.
+    description: '<span data-security-action="alpine" x-data="{}" x-init="window.__viewerPayloads.push(\'alpine-init\')" x-on:click="window.__viewerPayloads.push(\'alpine-click\')" x-on:mouseover="window.__viewerPayloads.push(\'alpine-hover\')" onclick="window.__viewerPayloads.push(\'click\')">Directives stay inert</span>',
+  },
+  {
+    id: 'security-alpine-shorthand', title: 'Alpine shorthand directives',
+    // Marked can treat @click as literal source in inline parsing, while its
+    // block-HTML grammar accepts this div. Both paths must remain inert.
+    description: '<div data-security-action="shorthand" @click="window.__viewerPayloads.push(\'alpine-shorthand\')">Shorthand directives stay inert</div>',
+  },
+];
+const tooltipIssue = {
+  id: 'tooltip-<img src=x onerror="window.__viewerPayloads.push(\'tooltip-id\')">',
+  title: '<svg onload="window.__viewerPayloads.push(\'tooltip-title\')">literal title</svg>',
+  description: 'A tooltip with literal imported metadata.',
+  priority: 0,
+  labels: ['<img src=x onerror="window.__viewerPayloads.push(\'tooltip-label\')">'],
+};
+
+const quotedDependencyId = 'task-"quoted"';
+const htmlDependencyId = 'task-<img src=x onerror="window.__viewerPayloads.push(\'mermaid-id\')">';
+const dependencyIssues = [
+  { id: 'dep-parent', title: 'Dependency parent', dependencies: [{ depends_on_id: 'dep-child', type: 'blocks' }] },
+  { id: 'dep-child', title: 'Dependency child', dependencies: [{ depends_on_id: 'dep-leaf', type: 'blocks' }] },
+  { id: 'dep-leaf', title: 'Dependency leaf' },
+  { id: 'task-a', title: 'Hyphenated issue', dependencies: [{ depends_on_id: 'task_a', type: 'blocks' }] },
+  { id: 'task_a', title: 'Underscored issue' },
+  { id: 'comma-root', title: 'Comma dependency root', dependencies: [{ depends_on_id: 'dep,comma', type: 'blocks' }] },
+  { id: 'dep,comma', title: 'Comma issue ID' },
+  { id: quotedDependencyId, title: 'Quoted issue ID', dependencies: [{ depends_on_id: 'dep-anchor', type: 'blocks' }] },
+  { id: htmlDependencyId, title: 'Literal HTML issue ID', dependencies: [{ depends_on_id: 'dep-anchor', type: 'blocks' }] },
+  { id: 'end', title: 'Mermaid keyword issue ID', dependencies: [{ depends_on_id: 'dep-anchor', type: 'blocks' }] },
+  { id: 'dep-anchor', title: 'Shared dependency anchor' },
+];
+
+const standaloneIssues = [
+  { id: 'done', title: 'Completed prerequisite', status: 'closed', priority: 3, labels: ['archive'] },
+  { id: 'gone', title: 'Removed prerequisite', status: ' TOMBSTONE ', priority: 3, labels: ['archive'] },
+  {
+    id: 'path-root', title: 'Ready root', priority: 0, labels: ['core'],
+    description: 'Ordinary **Markdown**, `code`, and [safe link](https://example.invalid/docs).',
+    dependencies: [
+      { depends_on_id: 'done', type: ' BLOCKS ' },
+      { depends_on_id: 'gone', type: 'conditional-blocks' },
+    ],
+  },
+  {
+    id: 'path-middle', title: 'Waiting middle', status: 'in_progress', priority: 1,
+    issue_type: 'feature', labels: ['core'],
+    dependencies: [
+      { depends_on_id: 'path-root', type: 'waits-for' },
+      { depends_on_id: 'path-root', type: 'blocks' },
+    ],
+  },
+  {
+    id: 'path-leaf', title: 'Waiting leaf', issue_type: 'bug', labels: ['ui'],
+    dependencies: [{ depends_on_id: 'path-middle', type: 'conditional-blocks' }],
+  },
+  {
+    id: 'info-only', title: 'Informational relationship', labels: ['ui'],
+    dependencies: [{ depends_on_id: 'path-root', type: 'related' }],
+  },
+  {
+    id: 'parent-only', title: 'Hierarchy relationship', priority: 3, labels: ['core'],
+    dependencies: [{ depends_on_id: 'path-root', type: 'parent-child' }],
+  },
+  { id: 'spare', title: 'Disconnected ready issue', labels: ['ui'] },
+  { id: 'parked-blocked', title: 'Manually parked issue', status: 'blocked', labels: ['parked'] },
+  { id: 'parked-deferred', title: 'Deferred issue', status: 'deferred', labels: ['parked'] },
+  {
+    id: '__proto__', title: 'Literal object-property issue ID', priority: 4, labels: ['edge'],
+    dependencies: [{ depends_on_id: 'gone', type: '' }],
+  },
+  {
+    id: 'working-resolved', title: 'Work with a completed prerequisite',
+    status: ' IN_PROGRESS ', priority: 1, labels: ['edge'],
+    dependencies: [{ depends_on_id: 'done', type: '' }],
+  },
+  {
+    id: 'unknown-ref', title: 'Reference outside the export', labels: ['edge'],
+    dependencies: [{ depends_on_id: 'missing-outside-export', type: 'blocks' }],
+  },
+  {
+    id: 'inherited-child', title: 'Child of a dependency-blocked parent', priority: 3,
+    labels: ['hierarchy'], dependencies: [{ depends_on_id: 'path-middle', type: 'parent-child' }],
+  },
+  {
+    id: 'future-deferred', title: 'Scheduled future work', priority: 4, labels: ['schedule'],
+    defer_until: '2999-01-01T00:00:00Z',
+  },
+];
+
+
+const dompurifyRelease = {
+  version: '3.4.16',
+  sha256: '2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2',
+};
+
+// Pinned upstream default-sanitize cases, not a claim that every advisory's
+// optional configuration is reachable here. See VIEWER_VENDOR_PROVENANCE.md.
+// Keep upstream alert() payloads unchanged; the browser test observes dialogs.
+function chainedTemplatePayload(links) {
+  const nesting = '<b>'.repeat(96);
+  const leaf = '<math><mtext><style><img src=x onerror=alert(1)></style></mtext></math>';
+  let dirty = '<div><?marker name="x1"></div>';
+  for (let index = 1; index <= links; index += 1) {
+    const next = index < links ? '<?marker name="x' + (index + 1) + '">' : leaf;
+    dirty += '<template for="x' + index + '">' + nesting + next + '</template>';
+  }
+  return dirty;
+}
+
+const mutationDescriptions = [
+  {
+    id: 'mutation-nesting-form-only', title: 'Upstream nesting with forms',
+    description: '<form><math><mtext></form><form><mglyph><style><img src=x onerror=alert(1)>',
+    expected: '<form><math><mtext><form></form></mtext></math></form>',
+  },
+  {
+    id: 'mutation-nesting-link', title: 'Upstream nesting with a script URL',
+    description: '<math><mtext><table><mglyph><style><math href=javascript:alert(1)>CLICKME</math>',
+    expected: '<math><mtext><table></table></mtext></math>',
+  },
+  {
+    id: 'mutation-nesting-comment', title: 'Upstream nesting with a comment',
+    description: '<math><mtext><table><mglyph><style><!--</style><img title="--&gt;&lt;img src=1 onerror=alert(1)&gt;">',
+    expected: '<math><mtext><table></table></mtext></math>',
+  },
+  {
+    id: 'mutation-nesting-form-svg', title: 'Upstream nesting with forms and SVG',
+    description: '<form><math><mtext></form><form><mglyph><svg><mtext><style><path id="</style><img onerror=alert(1) src>">',
+    expected: '<form><math><mtext><form></form></mtext></math></form>',
+  },
+  {
+    id: 'mutation-nesting-table-svg', title: 'Upstream nesting with tables and SVG',
+    description: '<math><mtext><table><mglyph><svg><mtext><style><path id="</style><img onerror=alert(1) src>">',
+    expected: ['', '<math><mtext><table></table></mtext></math>', '<math></math>'],
+  },
+  {
+    id: 'mutation-attribute-svg', title: 'Upstream SVG attribute mutation',
+    description: '<svg><foreignobject><p><style><p title="</style><iframe onload&#x3d;alert(1)<!--"></style>',
+    expected: '<svg></svg>',
+  },
+  {
+    id: 'mutation-attribute-math', title: 'Upstream MathML attribute mutation',
+    description: '<math><annotation-xml encoding="text/html"><p><style><p title="</style><iframe onload&#x3d;alert(1)<!--"></style>',
+    expected: '<math></math>',
+  },
+  {
+    id: 'mutation-removal-xmp', title: 'Upstream xmp removal mutation',
+    description: "<xmp><svg><b><style><b title='</style><img>'>",
+    expected: '',
+  },
+  {
+    id: 'mutation-removal-noembed', title: 'Upstream noembed removal mutation',
+    description: "<noembed><svg><b><style><b title='</style><img>'>",
+    expected: '',
+  },
+  {
+    id: 'mutation-namespace-svg', title: 'Upstream SVG namespace confusion',
+    description: 'a<svg><xss><desc><noscript>&lt;/noscript>&lt;/desc>&lt;s>&lt/s>&lt;style>&lt;a title="&lt;/style>&lt;img src onerror=alert(1)>">',
+    expected: 'a<svg><desc></desc></svg>',
+  },
+  {
+    id: 'mutation-namespace-math', title: 'Upstream MathML namespace confusion',
+    description: "<math><mtext><option><FAKEFAKE><option></option><mglyph><svg><mtext><style><a title=\"</style><img src='#' onerror='alert(1)'>\">",
+    expected: '<math><mtext><option><option></option></option></mtext></math>',
+  },
+  {
+    id: 'mutation-template-image', title: 'Upstream declarative template image',
+    description: '<div><?marker name="a"></div><template for="a"><img src=x onerror=alert(1)></template>',
+  },
+  {
+    id: 'mutation-template-math', title: 'Upstream template in a MathML integration point',
+    description: '<math><mtext><?marker name="f"></mtext></math><template for="f"><style><img src=x onerror=alert(1)></style></template>',
+  },
+  {
+    id: 'mutation-shadow-template', title: 'Upstream declarative shadow template',
+    description: '<section><template shadowrootmode="open"><img src=x onerror=alert(1)><a href="javascript:alert(2)">x</a></template></section>',
+    forbiddenOutput: 'shadowrootmode',
+  },
+  {
+    id: 'mutation-selectedcontent', title: 'Upstream selectedcontent content removal',
+    // This bounded, outside-select case pins the current default content-drop
+    // contract without constructing the engine's potentially unbounded mirror.
+    description: '<div><selectedcontent><img src=x onerror=alert(1)><b>copy</b></selectedcontent></div>',
+    expected: '<div></div>',
+  },
+  ...[4, 6, 8].map(links => ({
+    id: 'mutation-template-chain-' + links,
+    title: 'Upstream chained template depth ' + links,
+    description: chainedTemplatePayload(links),
+  })),
+];
+
+async function exportBrowserFixture(label, fixtureIssues, includeClosed = true) {
+  const parent = path.resolve(process.env.BVR_VIEWER_ARTIFACT_DIR || os.tmpdir());
+  await mkdir(parent, { recursive: true });
+  const artifact = await mkdtemp(path.join(parent, `bvr-viewer-${label}-`));
+  const fixture = path.join(artifact, 'issues.jsonl');
+  const rows = fixtureIssues.map(issue => ({
+    status: 'open', priority: 2, issue_type: 'task', description: '',
+    created_at: '2026-10-09T12:00:00Z', updated_at: '2026-10-09T12:00:00Z', ...issue,
+  }));
+  await writeFile(fixture, rows.map(issue => JSON.stringify(issue)).join('\n') + '\n');
+  const directory = path.join(artifact, 'pages');
+  const binary = path.resolve(process.env.BVR_BIN || path.join(root, 'target/debug/bvr'));
+  let output;
+  try {
+    output = execFileSync(binary, [
+      '--export-pages', directory, '--beads-file', fixture,
+      `--pages-include-closed=${includeClosed}`,
+    ], {
+      cwd: root, encoding: 'utf8', timeout: 60000,
+    });
+  } catch (error) {
+    throw new Error(`Exported browser tests require a working, freshly built BVR_BIN (${binary}). ` +
+      `The real --export-pages invocation failed; no synthetic export is substituted.\n${error.message}`,
+    { cause: error });
+  }
+  await writeFile(path.join(artifact, 'export-stdout.txt'), output);
+  const exportedIssues = JSON.parse(await readFile(path.join(directory, 'data/issues.json'), 'utf8'));
+  const exportedById = new Map(exportedIssues.map(issue => [issue.id, issue]));
+  for (const issue of rows) {
+    const exported = exportedById.get(issue.id);
+    assert.ok(exported, `real export contains ${issue.id}`);
+    assert.equal(exported.description, issue.description, 'the exporter preserves the fixture source');
+  }
+  // include_bytes! can silently leave a stale binary with old viewer assets.
+  // Check the entire emitted inventory against one explicit source, including
+  // when demonstrating a failure with a preserved baseline binary.
+  const assetRevision = process.env.BVR_EXPORT_ASSET_REVISION;
+  const gitFile = file => execFileSync('git', ['show', `${assetRevision}:${file}`], {
+    cwd: root, timeout: 10000, maxBuffer: 32 * 1024 * 1024,
+  });
+  const inventory = assetRevision ? gitFile('src/viewer_assets.rs').toString('utf8')
+    : await readFile(path.join(root, 'src/viewer_assets.rs'), 'utf8');
+  const inventoryPaths = [...inventory.matchAll(/^\s+path:\s*"([^"]+)"/gm)].map(match => match[1]);
+  assert.ok(inventoryPaths.length > 0, 'the exporter declares its viewer asset inventory');
+  const assetHashes = {};
+  for (const file of inventoryPaths) {
+    const actual = await readFile(path.join(directory, file));
+    const expected = assetRevision ? gitFile('viewer_assets/' + file) : await readFile(path.join(assets, file));
+    assert.deepEqual(actual, expected,
+      `rebuild BVR_BIN: exported ${file} must match ${assetRevision || 'this checkout'}`);
+    assetHashes[file] = createHash('sha256').update(actual).digest('hex');
+  }
+  await writeFile(path.join(artifact, 'export-identity.json'), JSON.stringify({
+    binary, assetRevision: assetRevision || null, issueCount: rows.length, includeClosed, assetHashes,
+  }, null, 2));
+  return directory;
+}
+
+async function exportedSecurityFixture(t) {
+  if (!securityExport) {
+    securityExport = await exportBrowserFixture('security', [...securityDescriptions, tooltipIssue]);
+  }
+  t.diagnostic(`Real --export-pages dashboard: ${securityExport}`);
+  return 'export-fixture/';
+}
+
+async function exportedDependencyFixture(t) {
+  if (!dependencyExport) {
+    dependencyExport = await exportBrowserFixture('dependencies', dependencyIssues);
+  }
+  t.diagnostic('Real dependency-diagram --export-pages dashboard: ' + dependencyExport);
+  return 'dependency-fixture/';
+}
+
+async function exportedReadinessFixture(t) {
+  if (!readinessExport) {
+    readinessExport = await exportBrowserFixture('readiness', readinessIssues, true);
+  }
+  t.diagnostic('Real readiness --export-pages dashboard: ' + readinessExport);
+  return 'readiness-fixture/';
+}
+
+async function exportedIntegrityFixture(t, kind = 'single') {
+  if (!integrityExports.has(kind)) {
+    const id = kind === 'other' ? 'integrity-evil' : 'integrity-good';
+    const directory = await exportBrowserFixture(`integrity-${kind}`, [{
+      id, title: kind === 'other' ? 'Replaced issue' : 'Expected issue',
+      // Exceed the real exporter's chunk threshold without adding an unrelated
+      // large graph workload or synthesizing a second chunking implementation.
+      description: kind === 'chunks' ? 'Chunked database payload. '.repeat(240000) : '**Verified Markdown**',
+    }]);
+    const bytes = await readFile(path.join(directory, 'beads.sqlite3'));
+    const config = JSON.parse(await readFile(path.join(directory, 'beads.sqlite3.config.json'), 'utf8'));
+    assert.equal(config.total_size, bytes.length);
+    assert.equal(config.hash, createHash('sha256').update(bytes).digest('hex'));
+    assert.equal(config.chunked, kind === 'chunks', 'the real CLI chooses the tested transfer mode');
+    if (config.chunked) {
+      assert.ok(config.chunk_count > 1, 'the real export spans multiple chunks');
+      const chunks = [];
+      for (const chunk of config.chunks) {
+        const part = await readFile(path.join(directory, chunk.path));
+        assert.equal(part.length, chunk.size);
+        assert.equal(createHash('sha256').update(part).digest('hex'), chunk.hash);
+        chunks.push(part);
+      }
+      assert.deepEqual(Buffer.concat(chunks), bytes, 'actual chunks reproduce the exact exported database');
+    }
+    integrityExports.set(kind, { directory, id, bytes, config, path: `integrity-fixture/${kind}/` });
+  }
+  const fixture = integrityExports.get(kind);
+  t.diagnostic('Real integrity --export-pages dashboard: ' + fixture.directory);
+  return fixture;
+}
+
+async function exportedStandaloneFixture(t) {
+  if (!standaloneExport) {
+    const parent = path.resolve(process.env.BVR_VIEWER_ARTIFACT_DIR || os.tmpdir());
+    await mkdir(parent, { recursive: true });
+    const directory = await mkdtemp(path.join(parent, 'bvr-viewer-standalone-'));
+    const fixture = path.join(directory, 'issues.jsonl');
+    const rows = standaloneIssues.map(issue => ({
+      status: 'open', priority: 2, issue_type: 'task', description: '',
+      created_at: '2026-10-09T12:00:00Z', updated_at: '2026-10-09T12:00:00Z', ...issue,
+    }));
+    await writeFile(fixture, rows.map(issue => JSON.stringify(issue)).join('\n') + '\n');
+    const filename = path.join(directory, 'graph.html');
+    const binary = path.resolve(process.env.BVR_BIN || path.join(root, 'target/debug/bvr'));
+    const output = execFileSync(binary, ['--export-graph', filename, '--beads-file', fixture], {
+      cwd: root, encoding: 'utf8', timeout: 60000,
+    });
+    await writeFile(path.join(directory, 'export-stdout.txt'), output);
+    const html = await readFile(filename, 'utf8');
+    const template = process.env.BVR_VIEWER_REVISION
+      ? execFileSync('git', ['show', process.env.BVR_VIEWER_REVISION + ':viewer_assets/graph_export.html'],
+        { cwd: root, encoding: 'utf8' })
+      : await readFile(path.join(assets, 'graph_export.html'), 'utf8');
+    // Every static template segment, including the complete application script
+    // after DATA, must occur in order in the actual export. No source overlay is
+    // used here, including when checking a preserved baseline binary.
+    let cursor = 0;
+    for (const segment of template.split(/\{\{[A-Z_]+\}\}/g)) {
+      const index = html.indexOf(segment, cursor);
+      assert.ok(index >= cursor, 'rebuild BVR_BIN: standalone HTML must embed the selected template');
+      cursor = index + segment.length;
+    }
+    assert.equal(cursor, html.length, 'the real export ends with the selected template');
+    const embedded = html.match(/\nconst DATA = ([^\n]+);\n/);
+    assert.ok(embedded, 'the real standalone export contains its JSON payload');
+    const data = JSON.parse(embedded[1]);
+    assert.deepEqual(data.nodes.map(node => node.id).sort(), rows.map(issue => issue.id).sort());
+    for (const issue of rows) {
+      assert.equal(data.nodes.find(node => node.id === issue.id).description, issue.description,
+        'the standalone exporter preserves fixture descriptions');
+    }
+    await writeFile(path.join(directory, 'export-identity.json'), JSON.stringify({
+      binary, revision: process.env.BVR_VIEWER_REVISION || null,
+      templateSha256: createHash('sha256').update(template).digest('hex'),
+      htmlSha256: createHash('sha256').update(html).digest('hex'),
+      nodeCount: data.nodes.length, edgeCount: data.links.length,
+    }, null, 2));
+    standaloneExport = directory;
+  }
+  t.diagnostic('Real --export-graph dashboard: ' + path.join(standaloneExport, 'graph.html'));
+  return 'standalone-fixture/graph.html';
+}
+
+
+async function exportedMutationFixture(t) {
+  if (!mutationExport) {
+    const vendor = await readFile(path.join(assets, 'vendor/dompurify.min.js'));
+    assert.equal(createHash('sha256').update(vendor).digest('hex'), dompurifyRelease.sha256,
+      'DOMPurify must retain the exact pinned upstream release bytes');
+    const fixtureIssues = [securityDescriptions[0], securityDescriptions[1], ...mutationDescriptions]
+      .map(({ id, title, description }) => ({ id, title, description }));
+    mutationExport = await exportBrowserFixture('mutations', fixtureIssues);
+  }
+  t.diagnostic('Real mutation-regression --export-pages dashboard: ' + mutationExport);
+  return 'mutation-fixture/';
+}
+
+async function exportedBottleneckFixture(t) {
+  if (!bottleneckExport) {
+    const id = index => `fixture-${String(index).padStart(5, '0')}`;
+    // Rust intentionally omits betweenness above 10,000 vertices. Disjoint
+    // three-node chains provide real nonzero bottlenecks without an unrelated
+    // quadratic transitive-cascade workload from one enormous chain.
+    const rows = Array.from({ length: 10002 }, (_, index) => ({
+      id: id(index), title: `Chain issue ${String(index).padStart(5, '0')}`,
+      dependencies: index % 3 < 2 ? [{ depends_on_id: id(index + 1), type: 'blocks' }] : [],
+    }));
+    bottleneckExport = await exportBrowserFixture('bottlenecks', rows);
+  }
+  t.diagnostic(`Real 10,002-issue --export-pages dashboard: ${bottleneckExport}`);
+  return 'bottleneck-fixture/';
+}
+
+async function fixtureDatabase(fixtureIssues = issues, fixtureDependencies = dependencies) {
+  const initSqlJs = require(path.join(assets, 'vendor/sql-wasm.js'));
+  const SQL = await initSqlJs({ locateFile: file => path.join(assets, 'vendor', file) });
+  const db = new SQL.Database();
+  // Reuse the real export schema, rather than maintain a second column contract.
+  const exporter = await readFile(path.join(root, 'src/export_sqlite.rs'), 'utf8');
+  for (const table of ['issue_overview_mv', 'dependencies', 'export_meta']) {
+    const schema = exporter.match(new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\([\\s\\S]*?\\);`));
+    assert.ok(schema, `export schema contains ${table}`);
+    db.run(schema[0]);
+  }
+  db.run('CREATE VIEW issues AS SELECT * FROM issue_overview_mv');
+  db.run("INSERT INTO export_meta VALUES ('issue_count', ?)", [String(fixtureIssues.length)]);
+  // Retain the small search/graph fixtures' explicit source semantics as the
+  // real export schema grows. Readiness regressions below use real CLI exports.
+  const readyIds = new Set([
+    'bv-open', 'bv-progress', 'bv-description', 'bv-special',
+    'graph-root', 'graph-ready', 'graph-isolated', 'graph-external',
+  ]);
+  const blockedIds = new Set([
+    'bv-blocked', 'bv-other', 'graph-left', 'graph-right', 'graph-join', 'graph-tail', 'graph-info',
+  ]);
+  const claimableIds = new Set(['bv-special', 'graph-root', 'graph-ready', 'graph-isolated', 'graph-external']);
+  for (const issue of fixtureIssues) {
+    db.run(`INSERT INTO issue_overview_mv
+      (id, title, description, status, priority, issue_type, assignee, labels,
+       blocked_by_ids, blocks_count, triage_score, created_at, updated_at,
+       is_ready, is_blocked, is_claimable)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.5, '2026-10-06T12:00:00Z', '2026-10-06T12:00:00Z', ?, ?, ?)`,
+    [...issue, Number(readyIds.has(issue[0])), Number(blockedIds.has(issue[0])), Number(claimableIds.has(issue[0]))]);
+  }
+  for (const dependency of fixtureDependencies) {
+    db.run('INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES (?, ?, ?)', dependency);
+  }
+  // Deliberately omit issues_fts: the shipped LIKE fallback must work without FTS5,
+  // as it does in the original report. No application/search/router is mocked.
+  const bytes = Buffer.from(db.export());
+  db.close();
+  return bytes;
+}
+
+function fixtureDatabaseConfig(bytes) {
+  return {
+    chunked: false, chunk_count: 0, chunk_size: 1048576,
+    total_size: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'),
+  };
+}
+
+before(async () => {
+  const database = await fixtureDatabase();
+  const graphDatabase = await fixtureDatabase(graphIssues, graphDependencies);
+  const overrides = new Map();
+  if (process.env.BVR_VIEWER_REVISION) {
+    for (const file of ['index.html', 'viewer.js', 'graph.js']) {
+      overrides.set(file, execFileSync('git', ['show', `${process.env.BVR_VIEWER_REVISION}:viewer_assets/${file}`], { cwd: root }));
+    }
+  }
+  if (process.env.BVR_DOMPURIFY_REVISION) {
+    const file = 'vendor/dompurify.min.js';
+    overrides.set(file, execFileSync('git', ['show', process.env.BVR_DOMPURIFY_REVISION + ':viewer_assets/' + file], { cwd: root }));
+  }
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm' };
+  server = http.createServer(async (request, response) => {
+    const requestedPath = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
+    const graphFixture = requestedPath.startsWith('/graph-fixture/');
+    const bottleneckFixture = requestedPath.startsWith('/bottleneck-fixture/');
+    const mutationFixture = requestedPath.startsWith('/mutation-fixture/');
+    const dependencyFixture = requestedPath.startsWith('/dependency-fixture/');
+    const standaloneFixture = requestedPath.startsWith('/standalone-fixture/');
+    const readinessFixture = requestedPath.startsWith('/readiness-fixture/');
+    const integrityName = requestedPath.match(/^\/integrity-fixture\/([^/]+)\//)?.[1];
+    const exportedFixture = integrityName || readinessFixture || standaloneFixture || dependencyFixture || mutationFixture || bottleneckFixture || requestedPath.startsWith('/export-fixture/');
+    const pathname = integrityName ? requestedPath.slice(`/integrity-fixture/${integrityName}`.length)
+      : standaloneFixture ? requestedPath.slice('/standalone-fixture'.length)
+      : readinessFixture ? requestedPath.slice('/readiness-fixture'.length)
+      : dependencyFixture ? requestedPath.slice('/dependency-fixture'.length)
+      : mutationFixture ? requestedPath.slice('/mutation-fixture'.length)
+      : bottleneckFixture ? requestedPath.slice('/bottleneck-fixture'.length)
+      : exportedFixture ? requestedPath.slice('/export-fixture'.length)
+      : graphFixture ? requestedPath.slice('/graph-fixture'.length) : requestedPath;
+    response.setHeader('Cache-Control', 'no-store');
+    // Supply the isolation headers directly, as a configured preview server can,
+    // so COI service-worker installation does not reload a test mid-interaction.
+    response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    response.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+    if (!exportedFixture && pathname === '/beads.sqlite3') {
+      response.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      response.end(graphFixture ? graphDatabase : database);
+      return;
+    }
+    if (!exportedFixture && pathname === '/beads.sqlite3.config.json') {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify(fixtureDatabaseConfig(graphFixture ? graphDatabase : database)));
+      return;
+    }
+    if (graphFixture && pathname === '/data/history.json') {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify(recordedHistory));
+      return;
+    }
+    const relative = pathname === '/' ? 'index.html' : pathname.slice(1);
+    const servingRoot = integrityName ? integrityExports.get(integrityName)?.directory
+      : readinessFixture ? readinessExport : standaloneFixture ? standaloneExport : dependencyFixture ? dependencyExport : mutationFixture ? mutationExport
+      : bottleneckFixture ? bottleneckExport : exportedFixture ? securityExport : assets;
+    if (!servingRoot) {
+      response.writeHead(404).end();
+      return;
+    }
+    const filename = path.resolve(servingRoot, relative);
+    if (!filename.startsWith(servingRoot + path.sep)) {
+      response.writeHead(403).end();
+      return;
+    }
+    try {
+      const bytes = overrides.get(relative) || await readFile(filename);
+      response.writeHead(200, { 'Content-Type': types[path.extname(filename)] || 'application/octet-stream' });
+      response.end(bytes);
+    } catch (error) {
+      response.writeHead(error.code === 'ENOENT' ? 404 : 500).end();
+    }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  origin = `http://127.0.0.1:${server.address().port}`;
+});
+
+after(async () => {
+  if (server) {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+async function searchInput(page, mobile) {
+  if (mobile && !await page.locator(inputSelector).count()) {
+    await page.locator('header button:visible').filter({ has: page.locator('svg path[d^="M21 21l-6-6"]') }).click();
+  }
+  return page.locator(inputSelector);
+}
+
+async function openViewer(t, mobile, hash = '#/', useClock = false, fixturePath = '', setupPage) {
+  // Keep browser process state and memory independent between scenarios.
+  const browser = await chromium.launch({
+    headless: true,
+    // Retain the system-browser flags used by this suite's original runner.
+    args: executablePath ? [
+      '--no-sandbox', '--disable-dev-shm-usage', '--no-zygote',
+      '--use-gl=angle', '--use-angle=swiftshader',
+    ] : [],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  let context;
+  const errors = [];
+  const consoleErrors = [];
+  const pendingRequests = new Map();
+  t.after(async () => {
+    try {
+      if (context) await context.close();
+      if (errors.length) t.diagnostic(JSON.stringify({ errors, consoleErrors }, null, 2));
+      assert.deepEqual(errors, [], 'no uncaught browser errors');
+    } finally {
+      await browser.close();
+    }
+  });
+  context = await browser.newContext({
+    viewport: mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 },
+    isMobile: mobile,
+    hasTouch: mobile,
+    reducedMotion: 'reduce',
+  });
+  const page = await context.newPage();
+  page.on('request', request => pendingRequests.set(request, request.url()));
+  page.on('requestfinished', request => pendingRequests.delete(request));
+  page.on('requestfailed', request => pendingRequests.delete(request));
+  page.setDefaultTimeout(10000);
+  page.setDefaultNavigationTimeout(30000);
+  if (useClock) await page.clock.install({ time: new Date('2026-10-07T12:00:00Z') });
+  if (hash === '#/graph') {
+    // Keep the real WASM request in flight beyond the graph view's 50ms staging
+    // delay, so both initial-route consumers encounter the same initialization.
+    await page.route('**/vendor/bv_graph_bg.wasm', async request => {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      await request.continue();
+    });
+  }
+  page.on('pageerror', error => errors.push({ name: error.name, message: error.message, stack: error.stack }));
+  page.on('console', message => {
+    if (message.type() === 'error') {
+      consoleErrors.push({ text: message.text(), location: message.location() });
+      if (consoleErrors.length > 10) consoleErrors.shift();
+    }
+  });
+  if (process.env.VIEWER_TEST_DEBUG) page.on('console', message => console.log(message.text()));
+  // Preserve non-Error rejection values (Alpine can reject a plain object) in
+  // failure diagnostics. Observe only: do not suppress browser error reporting.
+  await page.addInitScript(() => {
+    window.addEventListener('unhandledrejection', event => {
+      let reason;
+      try { reason = JSON.stringify(event.reason); }
+      catch { reason = String(event.reason); }
+      console.error('[viewer test] unhandled rejection:', reason);
+    });
+  });
+  if (setupPage) await setupPage(page);
+  try {
+    await page.goto(origin + '/' + fixturePath + hash);
+    await page.locator('[x-show="loading"]').waitFor({ state: 'hidden', timeout: 30000 });
+  } catch (error) {
+    t.diagnostic(JSON.stringify({
+      url: page.url(), errors, consoleErrors,
+      pendingRequests: [...pendingRequests.values()],
+    }, null, 2));
+    throw error;
+  }
+  await searchInput(page, mobile);
+  return page;
+}
+
+const databaseRequest = /\/beads\.sqlite3(?:\?|$)/;
+const configRequest = /\/beads\.sqlite3\.config\.json(?:\?|$)/;
+const chunkRequest = /\/chunks\/\d+\.bin(?:\?|$)/;
+
+async function cachedDatabaseIdentity(page, hash) {
+  return page.evaluate(async key => {
+    const root = await navigator.storage.getDirectory();
+    try {
+      const file = await (await root.getFileHandle(`beads-${key}.sqlite3`)).getFile();
+      const bytes = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', bytes);
+      return {
+        size: bytes.byteLength,
+        hash: Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join(''),
+      };
+    } catch (error) {
+      if (error.name === 'NotFoundError') return null;
+      throw error;
+    }
+  }, hash);
+}
+
+async function replaceCachedDatabase(page, hash, bytes) {
+  await page.evaluate(async ({ key, data }) => {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(`beads-${key}.sqlite3`, { create: true });
+    const stream = await handle.createWritable();
+    await stream.write(new Uint8Array(data));
+    await stream.close();
+  }, { key: hash, data: Array.from(bytes) });
+}
+
+async function assertIntegrityFailure(page, expected) {
+  await page.waitForFunction(() => {
+    const app = window.Alpine?.$data(document.querySelector('[x-data="beadsApp()"]'));
+    return app && !app.loading;
+  });
+  const state = await page.evaluate(selector => {
+    const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+    return {
+      databaseLoaded: Boolean(window.beadsViewer.DB_STATE.db),
+      issueIds: app.issues.map(issue => issue.id),
+      error: app.error,
+      visibleRows: [...document.querySelectorAll(selector)].filter(row => row.getClientRects().length).length,
+    };
+  }, rowSelector);
+  assert.equal(state.databaseLoaded, false, 'unverified bytes never become the active database');
+  assert.deepEqual(state.issueIds, [], 'failed verification exposes no issue records');
+  assert.equal(state.visibleRows, 0, 'failed verification renders no issue rows');
+  assert.match(state.error, expected, 'the user sees the concrete integrity failure');
+  await page.locator('[x-show="error"]').waitFor({ state: 'visible' });
+  const caches = await page.evaluate(async () => {
+    const names = [];
+    for await (const [name] of (await navigator.storage.getDirectory()).entries()) {
+      if (name.startsWith('beads-') && name.endsWith('.sqlite3')) names.push(name);
+    }
+    return names;
+  });
+  assert.deepEqual(caches, [], 'failed network/config verification does not poison the database cache');
+}
+
+for (const transfer of ['single', 'chunks']) {
+  test(`integrity: actual ${transfer} export verifies downloads and reuses the original cached bytes`, async t => {
+    const fixture = await exportedIntegrityFixture(t, transfer);
+    const page = await openViewer(t, false, '#/issues', false, fixture.path);
+    await results(page, [fixture.id], '');
+    assert.equal(await page.evaluate(() => window.beadsViewer.DB_STATE.source),
+      transfer === 'single' ? 'network' : 'chunks');
+    assert.deepEqual(await cachedDatabaseIdentity(page, fixture.config.hash), {
+      hash: fixture.config.hash, size: fixture.config.total_size,
+    }, 'OPFS stores exactly the bytes covered by the exported checksum');
+
+    let payloadRequests = 0;
+    for (const pattern of [databaseRequest, chunkRequest]) {
+      await page.route(pattern, request => { payloadRequests++; return request.abort(); });
+    }
+    await page.reload();
+    await results(page, [fixture.id], '');
+    assert.equal(await page.evaluate(() => window.beadsViewer.DB_STATE.source), 'cache');
+    assert.equal(payloadRequests, 0, 'a verified cache needs no database/chunk download');
+    assert.deepEqual(await cachedDatabaseIdentity(page, fixture.config.hash), {
+      hash: fixture.config.hash, size: fixture.config.total_size,
+    });
+  });
+}
+
+for (const corruption of ['same-size valid SQLite replacement', 'truncated download']) {
+  test(`integrity: actual export rejects a ${corruption}`, async t => {
+    const fixture = await exportedIntegrityFixture(t);
+    const replacement = await exportedIntegrityFixture(t, 'other');
+    assert.equal(replacement.bytes.length, fixture.bytes.length, 'the valid replacement defeats length-only checks');
+    assert.notEqual(replacement.config.hash, fixture.config.hash);
+    const bytes = corruption.startsWith('same-size') ? replacement.bytes : fixture.bytes.subarray(0, -1);
+    const page = await openViewer(t, false, '#/issues', false, fixture.path, async page => {
+      await page.route(databaseRequest, request => request.fulfill({
+        status: 200, contentType: 'application/octet-stream', body: bytes,
+      }));
+    });
+    await assertIntegrityFailure(page, /checksum|SHA-256|size|length/i);
+  });
+}
+
+for (const corruption of ['same-size valid SQLite replacement', 'truncated cache']) {
+  test(`integrity: actual export recovers from a ${corruption} using verified network bytes`, async t => {
+    const fixture = await exportedIntegrityFixture(t);
+    const replacement = await exportedIntegrityFixture(t, 'other');
+    const page = await openViewer(t, false, '#/issues', false, fixture.path);
+    await results(page, [fixture.id], '');
+    const bytes = corruption.startsWith('same-size') ? replacement.bytes : fixture.bytes.subarray(0, 32);
+    await replaceCachedDatabase(page, fixture.config.hash, bytes);
+    let payloadRequests = 0;
+    await page.route(databaseRequest, request => { payloadRequests++; return request.continue(); });
+    await page.reload();
+    await results(page, [fixture.id], '');
+    assert.equal(payloadRequests, 1, 'invalid cache triggers one canonical network download');
+    assert.equal(await page.evaluate(() => window.beadsViewer.DB_STATE.source), 'network');
+    assert.deepEqual(await cachedDatabaseIdentity(page, fixture.config.hash), {
+      hash: fixture.config.hash, size: fixture.config.total_size,
+    }, 'the corrupt cache is replaced with the original verified export');
+  });
+}
+
+test('integrity: invalid cache and mismatched network both fail without retaining poisoned bytes', async t => {
+  const fixture = await exportedIntegrityFixture(t);
+  const replacement = await exportedIntegrityFixture(t, 'other');
+  const page = await openViewer(t, false, '#/issues', false, fixture.path);
+  await results(page, [fixture.id], '');
+  await replaceCachedDatabase(page, fixture.config.hash, replacement.bytes);
+  await page.route(databaseRequest, request => request.fulfill({
+    status: 200, contentType: 'application/octet-stream', body: replacement.bytes,
+  }));
+  await page.reload();
+  await assertIntegrityFailure(page, /checksum|SHA-256/i);
+});
+
+for (const scenario of [
+  { name: 'missing manifest', status: 404 },
+  { name: 'malformed manifest JSON', body: '{broken' },
+  { name: 'missing checksum', mutate: config => { delete config.hash; } },
+  { name: 'invalid byte length', mutate: config => { config.total_size = -1; } },
+  { name: 'inconsistent chunk count', chunked: true, mutate: config => { config.chunk_count++; } },
+  { name: 'external chunk path', chunked: true, mutate: config => { config.chunks[0].path = 'https://example.invalid/payload.bin'; } },
+  { name: 'inconsistent chunk sizes', chunked: true, mutate: config => { config.chunks[0].size--; } },
+]) {
+  test(`integrity: actual export fails closed for ${scenario.name}`, async t => {
+    const fixture = await exportedIntegrityFixture(t, scenario.chunked ? 'chunks' : 'single');
+    const config = structuredClone(fixture.config);
+    scenario.mutate?.(config);
+    let payloadRequests = 0;
+    const page = await openViewer(t, false, '#/issues', false, fixture.path, async page => {
+      await page.route(configRequest, request => request.fulfill({
+        status: scenario.status || 200, contentType: 'application/json',
+        body: scenario.body || JSON.stringify(config),
+      }));
+      for (const pattern of [databaseRequest, chunkRequest, /example\.invalid/]) {
+        await page.route(pattern, request => { payloadRequests++; return request.abort(); });
+      }
+    });
+    await assertIntegrityFailure(page, /manifest|config|checksum|hash|size|chunk|JSON|HTTP/i);
+    assert.equal(payloadRequests, 0, 'invalid transfer metadata is rejected before payload requests');
+  });
+}
+
+for (const hashing of ['unavailable', 'rejecting']) {
+  test(`integrity: actual export fails clearly when browser hashing is ${hashing}`, async t => {
+    const fixture = await exportedIntegrityFixture(t);
+    const page = await openViewer(t, false, '#/issues', false, fixture.path, async page => {
+      await page.addInitScript(mode => {
+        if (mode === 'unavailable') {
+          Object.defineProperty(crypto, 'subtle', { configurable: true, value: undefined });
+        } else {
+          Object.defineProperty(crypto.subtle, 'digest', {
+            configurable: true, value: () => Promise.reject(new Error('SHA-256 unavailable in fixture')),
+          });
+        }
+      }, hashing);
+    });
+    await assertIntegrityFailure(page, /SHA-256|verification|secure|hash/i);
+  });
+}
+
+for (const corruption of ['corrupt chunk', 'truncated chunk', 'missing chunk', 'swapped chunks', 'wrong aggregate checksum']) {
+  test(`integrity: actual chunked export rejects ${corruption}`, async t => {
+    const fixture = await exportedIntegrityFixture(t, 'chunks');
+    const first = fixture.config.chunks[0];
+    const original = await readFile(path.join(fixture.directory, first.path));
+    let payloadRequests = 0;
+    const page = await openViewer(t, false, '#/issues', false, fixture.path, async page => {
+      if (corruption === 'wrong aggregate checksum') {
+        await page.route(configRequest, request => request.fulfill({
+          status: 200, contentType: 'application/json',
+          body: JSON.stringify({ ...fixture.config, hash: '0'.repeat(64) }),
+        }));
+      }
+      await page.route(chunkRequest, async request => {
+        payloadRequests++;
+        if (!new URL(request.request().url()).pathname.endsWith('/' + first.path)
+          || corruption === 'wrong aggregate checksum') return request.continue();
+        if (corruption === 'missing chunk') return request.fulfill({ status: 404 });
+        let bytes = Buffer.from(original);
+        if (corruption === 'corrupt chunk') bytes[bytes.length - 1] ^= 1;
+        if (corruption === 'truncated chunk') bytes = bytes.subarray(0, -1);
+        if (corruption === 'swapped chunks') {
+          bytes = await readFile(path.join(fixture.directory, fixture.config.chunks[1].path));
+          assert.equal(bytes.length, original.length, 'swap preserves chunk length');
+          assert.notEqual(createHash('sha256').update(bytes).digest('hex'), first.hash);
+        }
+        return request.fulfill({ status: 200, contentType: 'application/octet-stream', body: bytes });
+      });
+    });
+    await assertIntegrityFailure(page, /chunk|checksum|SHA-256|size|length/i);
+    assert.equal(payloadRequests, corruption === 'wrong aggregate checksum' ? fixture.config.chunk_count : 1,
+      'each chunk is checked before proceeding, and the final database hash is checked after assembly');
+  });
+}
+
+function listView(page) {
+  return page.locator('[x-show="view === \'issues\'"]');
+}
+
+function route(page) {
+  const hash = new URL(page.url()).hash;
+  return { path: hash.split('?')[0], params: new URLSearchParams(hash.split('?')[1] || '') };
+}
+
+async function viewerSearchState(page) {
+  try {
+    return await page.evaluate(({ rows, input }) => {
+      const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+      return {
+        hash: location.hash, view: app.view, searchQuery: app.searchQuery,
+        pendingSearch: app.pendingSearch !== null, loading: app.loading,
+        page: app.page, totalIssues: app.totalIssues,
+        issueIds: app.issues.map(issue => issue.id),
+        inputs: [...document.querySelectorAll(input)].filter(node => node.getClientRects().length)
+          .map(node => node.value),
+        visibleRows: [...document.querySelectorAll(rows)].filter(node => node.getClientRects().length)
+          .map(node => node.getAttribute('aria-label')),
+      };
+    }, { rows: rowSelector, input: 'input[placeholder="Search issues..."]' });
+  } catch (error) {
+    return { unavailable: error.message };
+  }
+}
+
+async function results(page, ids, query) {
+  try {
+    await listView(page).waitFor({ state: 'visible' });
+    await page.waitForFunction(({ selector, expected }) => {
+      const actual = Array.from(document.querySelectorAll(selector))
+        .filter(row => row.getClientRects().length)
+        .map(row => row.getAttribute('aria-label').match(/^View issue ([^:]+):/)[1])
+        .sort();
+      return JSON.stringify(actual) === JSON.stringify(expected);
+    }, { selector: rowSelector, expected: [...ids].sort() });
+  } catch (error) {
+    console.error('Search state after result wait failure:', JSON.stringify(await viewerSearchState(page)));
+    throw error;
+  }
+  assert.equal(await page.locator(inputSelector).inputValue(), query);
+  assert.equal(route(page).path, '#/issues');
+  assert.equal(route(page).params.get('q'), query || null);
+  assert.equal(await listView(page).locator('[x-text="totalIssues"]').first().textContent(), String(ids.length));
+}
+
+async function home(page, mobile, advanceClock = false) {
+  const link = page.getByRole('link', { name: mobile ? 'Home' : 'Dashboard', exact: true });
+  if (advanceClock) await navigateWithClock(page, () => link.click());
+  else await link.click();
+  await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+}
+
+async function navigateWithClock(page, action) {
+  // A native hash change is a browser task, not a fake timer. Wait until its
+  // listeners have run before advancing Alpine's deferred rendering callbacks.
+  const changed = page.evaluate(() => new Promise(resolve => {
+    window.addEventListener('hashchange', () => resolve(), { once: true });
+  }));
+  await Promise.all([changed, action()]);
+  await page.clock.runFor(50);
+}
+
+async function filters(page, mobile) {
+  if (mobile) await listView(page).getByRole('button', { name: /^Filters/ }).click();
+}
+
+async function insightsImpact(page, issueId, directCount, cascadeIds) {
+  await page.locator('[x-show="view === \'insights\'"]').waitFor({ state: 'visible' });
+  const picks = page.locator('[x-show="topKSet && topKSet.items?.length > 0"]');
+  await picks.waitFor({ state: 'visible' });
+  const firstPick = picks.locator('.group').first();
+  assert.equal(await firstPick.locator('[x-text="item.issueId"]').textContent(), issueId,
+    'suggested work starts with the prerequisite that unlocks its dependents');
+  assert.equal(await picks.locator('[x-text^="topKSet"]').textContent(), String(cascadeIds.length));
+  assert.match(await firstPick.locator('span.rounded-full').innerText(), new RegExp(`\\+${cascadeIds.length} unblock`));
+  assert.deepEqual((await firstPick.locator('[x-text="unblockedId"]').allTextContents()).sort(), [...cascadeIds].sort());
+  const impact = page.locator('[x-show="topImpactIssues?.length > 0"]').locator('.group').first();
+  assert.equal(await impact.locator('[x-text="item.issueId"]').textContent(), issueId);
+  assert.match(await impact.locator('span.shrink-0').innerText(), new RegExp(`^${cascadeIds.length}\\s+potential unblocks$`));
+
+  await firstPick.click();
+  const modal = page.locator('[x-show="selectedIssue"]');
+  await modal.waitFor({ state: 'visible' });
+  assert.equal(route(page).path, `#/issue/${issueId}`);
+  await modal.getByRole('button', { name: 'Simulate Close', exact: true }).click();
+  const result = modal.locator('[x-show="whatIfResult"]');
+  await result.waitFor({ state: 'visible' });
+  assert.deepEqual(await result.locator('p .font-bold').allTextContents(), [String(directCount), String(cascadeIds.length)]);
+  assert.deepEqual((await result.locator('button').allTextContents()).sort(), [...cascadeIds].sort(),
+    'the rendered cascade lists the affected issues');
+  await modal.locator('button').first().click();
+  await modal.waitFor({ state: 'hidden' });
+}
+
+async function openForceGraph(page) {
+  if (route(page).path !== '#/graph') {
+    await page.getByRole('link', { name: 'Graph', exact: true }).click();
+  }
+  await page.waitForFunction(() => {
+    const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+    return app.forceGraphReady && !app.forceGraphLoading && app.forceGraphModule?.getWasmGraph()?.nodeCount() > 0;
+  });
+  await page.locator('#graph-container canvas').first().waitFor({ state: 'visible' });
+}
+
+async function dependencyPath(page, issueId) {
+  return page.evaluate(async id => {
+    const graph = await import('./graph.js');
+    const node = graph.getGraph().graphData().nodes.find(item => item.id === id);
+    let result;
+    document.addEventListener('bv-graph:pathHighlight', event => {
+      result = { blockers: event.detail.blockerCount, dependents: event.detail.dependentCount };
+    }, { once: true });
+    graph.highlightDependencyPath(node);
+    return result;
+  }, issueId);
+}
+
+async function forceGraphImpact(page, issueId) {
+  // Invoke the same public action used by Shift-click / W, then observe the
+  // actual animation, summary event and toast. No graph algorithm is replaced.
+  return page.evaluate(async id => {
+    const graph = await import('./graph.js');
+    const node = graph.getGraph().graphData().nodes.find(item => item.id === id);
+    const completed = new Promise(resolve => {
+      document.addEventListener('bv-graph:whatIfComplete', event => resolve({
+        direct: event.detail.directUnblocks,
+        total: event.detail.transitiveUnblocks,
+        directIds: [...event.detail.unblockedIds].sort(),
+        ids: [...event.detail.cascadeIds].sort(),
+      }), { once: true });
+    });
+    const result = graph.performWhatIf(node);
+    if (!result) throw new Error(`what-if did not run for ${id}`);
+    const summary = await completed;
+    return {
+      direct: result.direct_unblocks,
+      total: result.transitive_unblocks,
+      ids: result.cascade_ids.map(index => graph.getWasmGraph().nodeId(index)).sort(),
+      summary,
+      animated: graph.getGraph().graphData().nodes
+        .filter(item => item._whatIfState === 'unblocked').map(item => item.id).sort(),
+    };
+  }, issueId);
+}
+
+async function currentGraphSnapshot(page) {
+  return page.evaluate(async () => {
+    const graph = (await import('./graph.js')).getGraph().graphData();
+    const endpoint = node => typeof node === 'object' ? node.id : node;
+    return {
+      nodes: graph.nodes.map(node => ({ id: node.id, status: node.status, title: node.title }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+      links: graph.links.map(link => [endpoint(link.source), endpoint(link.target), link.type || ''])
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    };
+  });
+}
+
+async function historyEventVisible(page, event, index, total, snapshot) {
+  const controls = page.locator('#time-travel-controls');
+  await controls.waitFor({ state: 'visible' });
+  assert.equal(await controls.locator('#tt-position').textContent(), `${index + 1} / ${total} events`);
+  assert.equal(await controls.locator('#tt-issue').textContent(), event.bead_id);
+  assert.equal((await controls.locator('#tt-kind').textContent()).toLowerCase(), event.event_type);
+  assert.equal(await controls.locator('#tt-date').getAttribute('datetime'), event.timestamp);
+  assert.ok((await controls.locator('#tt-date').textContent()).includes(event.timestamp.slice(11, 19)),
+    'recorded seconds remain visible for same-day events');
+  assert.equal(await controls.locator('#tt-message').textContent(), event.commit_message);
+  assert.equal(await controls.locator('#tt-message b').count(), 0, 'event details are literal text');
+  assert.equal(await controls.getByRole('slider', { name: 'History event', exact: true }).inputValue(), String(index));
+
+  const observed = await page.evaluate(async () => {
+    const module = await import('./graph.js');
+    const state = module.getTimeTravelState();
+    const graph = module.getGraph();
+    const draw = graph.nodeCanvasObject();
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    let fills = [];
+    const fill = ctx.fill;
+    // Observe the actual renderer on a real Canvas2D context. Calling the
+    // original fill preserves rendering; no selection/graph algorithm is mocked.
+    ctx.fill = function (...args) {
+      fills.push({ color: this.fillStyle, alpha: this.globalAlpha });
+      return fill.apply(this, args);
+    };
+    const rendered = graph.graphData().nodes.map(node => {
+      fills = [];
+      draw(node, ctx, 1);
+      const body = fills.filter(item => typeof item.color === 'string').at(-1);
+      return { id: node.id, alpha: body?.alpha };
+    });
+    const brightest = Math.max(...rendered.map(node => node.alpha));
+    return {
+      active: state.active, currentIdx: state.currentIdx, totalEvents: state.totalEvents,
+      issue: state.currentEvent?.issueId, highlighted: state.highlightedIssueIds,
+      renderedHighlight: rendered.filter(node => node.alpha === brightest).map(node => node.id),
+    };
+  });
+  assert.deepEqual(observed, {
+    active: true, currentIdx: index, totalEvents: total,
+    issue: event.bead_id, highlighted: [event.bead_id], renderedHighlight: [event.bead_id],
+  }, 'the selected recorded event highlights its actual canvas node');
+  assert.deepEqual(await currentGraphSnapshot(page), snapshot,
+    'recorded events never invent or remove historical nodes, statuses, or links');
+}
+
+async function selectHistoryEvent(page, index) {
+  await page.getByRole('slider', { name: 'History event', exact: true }).evaluate((slider, value) => {
+    slider.value = String(value);
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+  }, index);
+}
+
+async function openReadinessViewer(t, graphMode, mobile = false, hash = '#/') {
+  const fixturePath = await exportedReadinessFixture(t);
+  const page = await openViewer(t, mobile, hash, false, fixturePath, async page => {
+    await configureDependencyRendering(page);
+    await page.addInitScript(() => { window.__readinessPayloads = []; });
+    if (graphMode === 'unavailable') {
+      // Fail only the optional graph engine. SQL.js and its actual exported
+      // database remain available, as they do in the supported fallback mode.
+      await page.route('**/vendor/bv_graph_bg.wasm', request => request.abort('failed'));
+    }
+  });
+  assert.equal(await page.evaluate(() => window.beadsViewer.GRAPH_STATE.ready), graphMode === 'available',
+    'the scenario exercises the requested graph-WASM condition');
+  return page;
+}
+
+async function searchReadinessFixture(page, query) {
+  await page.locator(inputSelector).fill(query);
+  // Every fixture title contains "readiness", so the visible result set can
+  // remain unchanged while the debounced query is still waiting to commit.
+  await page.waitForFunction(expected => {
+    const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+    const params = new URLSearchParams(location.hash.split('?')[1] || '');
+    return app.pendingSearch === null && app.searchQuery === expected
+      && params.get('q') === (expected || null);
+  }, query);
+}
+
+for (const graphMode of ['available', 'unavailable']) {
+  test(`readiness: actual export filters, search and cards agree with graph WASM ${graphMode}`, async t => {
+    const mobile = graphMode === 'unavailable';
+    const page = await openReadinessViewer(t, graphMode, mobile);
+    const observed = await page.evaluate(() => {
+      const viewer = window.beadsViewer;
+      const ids = rows => rows.map(issue => issue.id).sort();
+      return {
+        stats: viewer.getStats(),
+        ready: ids(viewer.queryIssues({ hasBlockers: false }, 'id', 100)),
+        blocked: ids(viewer.queryIssues({ hasBlockers: true }, 'id', 100)),
+        readySearch: ids(viewer.searchIssues('readiness', { filters: { hasBlockers: false }, limit: 100 })),
+        blockedSearch: ids(viewer.searchIssues('readiness', { filters: { hasBlockers: true }, limit: 100 })),
+        readyCount: viewer.countIssues({ hasBlockers: false, search: 'readiness' }),
+        blockedCount: viewer.countIssues({ hasBlockers: true, search: 'readiness' }),
+        actionable: [...viewer.getActionableIssues()].sort(),
+      };
+    });
+    await writeFile(path.join(path.dirname(readinessExport), `readiness-${graphMode}.json`),
+      JSON.stringify(observed, null, 2));
+    // Assert behavior first: a preserved parent export must fail on incorrect
+    // work selection, not merely on the absence of newly added SQL columns.
+    assert.deepEqual(observed.ready, readinessReadyIds,
+      'Ready includes resolved prerequisites and in-progress work, while excluding inherited blockers, deferrals and parked statuses');
+    assert.deepEqual(observed.blocked, readinessBlockedIds,
+      'Blocked includes every blocking edge kind, inherited blockers and parked issues with open prerequisites');
+    assert.deepEqual(observed.readySearch, readinessReadyIds);
+    assert.deepEqual(observed.blockedSearch, readinessBlockedIds);
+    assert.equal(observed.readyCount, readinessReadyIds.length);
+    assert.equal(observed.blockedCount, readinessBlockedIds.length);
+    assert.deepEqual(observed.actionable, readinessReadyIds,
+      'optional WASM availability cannot change the exported actionable set');
+    assert.equal(observed.stats.total, readinessIssues.length);
+    assert.equal(observed.stats.actionable, readinessReadyIds.length);
+    assert.equal(observed.stats.blocked, readinessBlockedIds.length);
+    assert.equal(observed.stats.open_like, readinessIssues.length - 2,
+      'dependency-blocked work is not counted a second time as a separate status');
+
+    const exported = await page.evaluate(() => window.beadsViewer.execQuery(
+      'SELECT id, defer_until, is_ready, is_blocked, is_claimable FROM issue_overview_mv ORDER BY id'));
+    for (const issue of exported) {
+      assert.equal(issue.is_ready, Number(readinessReadyIds.includes(issue.id)), issue.id + ': canonical readiness');
+      assert.equal(issue.is_blocked, Number(readinessBlockedIds.includes(issue.id)), issue.id + ': canonical blocked state');
+      assert.equal(issue.is_claimable, Number(readinessClaimableIds.includes(issue.id)), issue.id + ': canonical claimability');
+    }
+    assert.match(exported.find(issue => issue.id === 'readiness-future').defer_until, /^2999-01-01T/,
+      'scheduler deferral is present in the exported database');
+    const dependencyTypes = await page.evaluate(() => window.beadsViewer.execQuery(
+      "SELECT issue_id, type FROM dependencies WHERE issue_id IN ('readiness-waits', 'readiness-conditional') ORDER BY issue_id"));
+    assert.deepEqual(dependencyTypes, [
+      { issue_id: 'readiness-conditional', type: 'conditional-blocks' },
+      { issue_id: 'readiness-waits', type: 'waits-for' },
+    ], 'the export normalizes all Rust whitespace, including tabs, newlines and Unicode spaces');
+
+    const dashboard = () => page.locator('[x-show="view === \'dashboard\'"]');
+    const cards = () => dashboard().locator(mobile ? '.stat-card-mobile' : '.card-lift.cursor-pointer');
+    assert.equal(await dashboard().locator('[x-text="stats.actionable || 0"]:visible').textContent(), String(readinessReadyIds.length));
+    assert.equal(await dashboard().locator('[x-text="stats.blocked || 0"]:visible').textContent(), String(readinessBlockedIds.length));
+    await cards().filter({ has: page.getByText('Actionable', { exact: true }) }).click();
+    await results(page, readinessReadyIds, '');
+    await searchReadinessFixture(page, 'readiness');
+    await results(page, readinessReadyIds, 'readiness');
+    await filters(page, mobile);
+    await listView(page).getByRole('button', { name: 'Blocked', exact: true }).click();
+    await results(page, readinessBlockedIds, 'readiness');
+    await listView(page).getByRole('button', { name: 'Ready', exact: true }).click();
+    await results(page, readinessReadyIds, 'readiness');
+    await home(page, mobile);
+    await cards().filter({ has: page.getByText('Blocked', { exact: true }) }).click();
+    await results(page, readinessBlockedIds, 'readiness');
+    assert.deepEqual(await page.evaluate(() => window.__readinessPayloads), [], 'literal issue IDs stay inert while filtering');
+  });
+
+  test(`readiness: actual export Quick Wins and Top Picks only offer claimable work with graph WASM ${graphMode}`, async t => {
+    const page = await openReadinessViewer(t, graphMode);
+    const observed = await page.evaluate(() => {
+      const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+      return {
+        quickWins: app.quickWins.map(issue => issue.id).sort(),
+        topPicks: app.topPicks.map(issue => issue.id).sort(),
+      };
+    });
+    await writeFile(path.join(path.dirname(readinessExport), `claimable-${graphMode}.json`),
+      JSON.stringify(observed, null, 2));
+    assert.deepEqual(observed.quickWins, readinessClaimableIds,
+      'Quick Wins excludes assigned work, in-progress work, epics, open parents, parked statuses and future deferrals');
+    assert.deepEqual(observed.topPicks, readinessClaimableIds,
+      'Top Picks uses the same claimability contract as robot recommendations');
+    const dashboard = page.locator('[x-show="view === \'dashboard\'"]');
+    const quickWins = dashboard.getByRole('heading', { name: 'Quick Wins', exact: true }).locator('..').locator('..');
+    const topPicks = dashboard.getByRole('heading', { name: 'Top Picks', exact: true }).locator('..');
+    assert.deepEqual((await quickWins.locator('[x-text="issue.id"]').allTextContents()).sort(), readinessClaimableIds);
+    assert.deepEqual((await topPicks.locator('[x-text="issue.id"]').allTextContents()).sort(), readinessClaimableIds);
+    assert.equal(await dashboard.locator('img[src="x"]').count(), 0, 'punctuation in IDs renders as text');
+    assert.deepEqual(await page.evaluate(() => window.__readinessPayloads), []);
+  });
+
+  test(`readiness: actual export dependency links, h/l and diagrams preserve direction and exact IDs with graph WASM ${graphMode}`, async t => {
+    const page = await openReadinessViewer(t, graphMode, false, '#/issues');
+    const ids = ['readiness-ordinary', 'readiness-waits', 'readiness-conditional', 'readiness-empty', 'readiness-mixed'];
+    const observed = await page.evaluate(issueIds => Object.fromEntries(issueIds.map(id => {
+      const deps = window.beadsViewer.getIssueDependencies(id);
+      return [id, {
+        blockedBy: deps.blockedBy.map(issue => issue.id),
+        blocks: deps.blocks.map(issue => issue.id),
+      }];
+    })), [...ids, 'readiness-root', 'readiness-related', 'readiness-punctuation-child', readinessPunctuationId]);
+    const completed = [];
+    try {
+      for (const id of ids) {
+        assert.deepEqual(observed[id].blockedBy, ['readiness-root'], id + ': the prerequisite is blockedBy exactly once');
+        assert.deepEqual(observed[id].blocks, [], id + ': dependent direction is not reversed');
+      }
+      assert.deepEqual(observed['readiness-root'].blockedBy, ['readiness-done', 'readiness-gone'],
+        'resolved direct relationships remain available to inspect');
+      assert.deepEqual(observed['readiness-root'].blocks, [...ids, 'readiness-review'].sort(),
+        'all normalized blocking types share one deduplicated dependent list');
+      assert.deepEqual(observed['readiness-related'], { blockedBy: [], blocks: [] }, 'informational edges do not become blocking links');
+      assert.deepEqual(observed['readiness-punctuation-child'].blockedBy, [readinessPunctuationId]);
+      assert.deepEqual(observed[readinessPunctuationId].blocks, ['readiness-punctuation-child']);
+      completed.push('dependency query contract');
+
+      const modal = page.locator('[x-show="selectedIssue"]');
+      const openIssue = async id => {
+        const issue = readinessIssues.find(item => item.id === id);
+        // This fixture exceeds the default page size. Find each target through
+        // the real search UI so navigation also covers issues beyond page one.
+        await searchReadinessFixture(page, issue.title);
+        await results(page, [id], issue.title);
+        await page.getByRole('button', { name: 'View issue ' + id + ': ' + issue.title, exact: true }).click();
+        await selectedDependencyIssue(page, id);
+      };
+      await openIssue('readiness-ordinary');
+      await modal.locator('button').first().focus();
+      await page.keyboard.press('h');
+      await selectedDependencyIssue(page, 'readiness-root');
+      await page.keyboard.press('l');
+      await selectedDependencyIssue(page, 'readiness-conditional');
+      completed.push('ordinary h/l follows prerequisite then dependent');
+      await modal.locator('button').first().click();
+
+      for (const id of ['readiness-waits', 'readiness-conditional']) {
+        await openIssue(id);
+        await openDependencyDiagram(page, [id, 'readiness-root']);
+        await modal.locator('button').first().focus();
+        await page.keyboard.press('h');
+        await selectedDependencyIssue(page, 'readiness-root');
+        completed.push(id + ' diagram and h navigation');
+        await modal.locator('button').first().click();
+      }
+
+      await openIssue('readiness-punctuation-child');
+      const blockerLinks = modal.locator('[x-show="selectedDependencies.blockedBy.length"]');
+      assert.equal(await blockerLinks.locator('button').count(), 1, 'a comma inside an ID does not split the dependency');
+      assert.equal(await blockerLinks.locator('[x-text="selectedDependencies.blockedBy.length"]').textContent(), '1');
+      await blockerLinks.getByRole('button', { name: readinessPunctuationId, exact: true }).click();
+      await selectedDependencyIssue(page, readinessPunctuationId);
+      const dependentLinks = modal.locator('[x-show="selectedDependencies.blocks.length"]');
+      assert.deepEqual(await dependentLinks.locator('button').allTextContents(), ['readiness-punctuation-child']);
+      await modal.locator('button').first().focus();
+      await page.keyboard.press('l');
+      await selectedDependencyIssue(page, 'readiness-punctuation-child');
+      await page.keyboard.press('h');
+      await selectedDependencyIssue(page, readinessPunctuationId);
+      await openDependencyDiagram(page, [readinessPunctuationId, 'readiness-punctuation-child']);
+      assert.equal(await modal.locator('img[src="x"]').count(), 0, 'dependency labels cannot introduce event-handler images');
+      assert.deepEqual(await page.evaluate(() => window.__readinessPayloads), [], 'dependency ID payload stays inert after clicks, shortcuts and SVG rendering');
+      completed.push('literal punctuation dependency links, shortcuts and diagram');
+    } finally {
+      const state = await page.evaluate(() => ({
+        selectedId: Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).selectedIssue?.id,
+        url: location.href, executed: window.__readinessPayloads, renders: window.__dependencyRenders,
+      }));
+      await writeFile(path.join(path.dirname(readinessExport), `dependency-readiness-${graphMode}.json`),
+        JSON.stringify({ observed, completed, ...state }, null, 2));
+    }
+  });
+}
+
+for (const mobile of [false, true]) {
+  const device = mobile ? 'mobile' : 'desktop';
+
+  test(`${device}: dashboard search shows matching Issues and survives navigation/history`, async t => {
+    const page = await openViewer(t, mobile);
+    await page.locator(inputSelector).fill('needle');
+    await results(page, matchingIds, 'needle');
+    await page.getByRole('link', { name: 'Issues', exact: true }).click();
+    await results(page, matchingIds, 'needle');
+    if (mobile) {
+      await home(page, mobile);
+      await page.locator('header button:visible').filter({ has: page.locator('svg path[d="M4 6h16M4 12h16M4 18h16"]') }).click();
+      const menuLink = page.locator('header').getByRole('link', { name: 'Issues', exact: true });
+      assert.equal(new URLSearchParams((await menuLink.getAttribute('href')).split('?')[1]).get('q'), 'needle');
+      await menuLink.click();
+      await results(page, matchingIds, 'needle');
+    }
+    await home(page, mobile);
+    const href = await page.getByRole('link', { name: 'Issues', exact: true }).getAttribute('href');
+    assert.equal(new URLSearchParams(href.split('?')[1]).get('q'), 'needle');
+    await page.getByRole('link', { name: 'Issues', exact: true }).click();
+    await results(page, matchingIds, 'needle');
+    await page.goBack();
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    await page.goBack();
+    await results(page, matchingIds, 'needle');
+    await page.goForward();
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    await page.goForward();
+    await results(page, matchingIds, 'needle');
+  });
+
+  test(`${device}: restored routes replace absent filters, query and sort`, async t => {
+    const page = await openViewer(t, mobile, '#/issues?q=needle');
+    await results(page, matchingIds, 'needle');
+    const dense = '#/issues?status=open&type=bug&priority=1&labels=viewer&assignee=Ada&blocked=false&blocking=true&q=needle&sort=title';
+    await page.goto(origin + '/' + dense);
+    await results(page, ['bv-open'], 'needle');
+    await page.goBack();
+    await results(page, matchingIds, 'needle');
+    assert.deepEqual([...route(page).params.keys()], ['q']);
+    assert.equal(await listView(page).locator('select[x-model="sort"]').inputValue(), 'priority');
+    await page.goForward();
+    await results(page, ['bv-open'], 'needle');
+    await page.goto(origin + '/#/issues');
+    await results(page, allIds, '');
+    assert.equal(route(page).params.size, 0);
+    // Let the clear button's finite leave animation finish before ordinary
+    // history navigation reverses it; debounce races are tested separately.
+    await page.locator('button[title="Clear search"]').nth(mobile ? 1 : 0).waitFor({ state: 'hidden' });
+    await page.goBack();
+    await results(page, ['bv-open'], 'needle');
+  });
+
+  test(`${device}: issue details close to the same search and filter`, async t => {
+    const page = await openViewer(t, mobile, '#/issues?status=open&q=needle');
+    await results(page, openIds, 'needle');
+    await page.getByRole('button', { name: 'View issue bv-open: Needle open ready', exact: true }).click();
+    const modal = page.locator('[x-show="selectedIssue"]');
+    await modal.waitFor({ state: 'visible' });
+    assert.equal(route(page).path, '#/issue/bv-open');
+    await modal.locator('button').first().click();
+    await modal.waitFor({ state: 'hidden' });
+    await results(page, openIds, 'needle');
+    assert.equal(route(page).params.get('status'), 'open');
+    await page.goBack();
+    await modal.waitFor({ state: 'visible' });
+    await page.goBack();
+    await modal.waitFor({ state: 'hidden' });
+    await results(page, openIds, 'needle');
+    if (!mobile) {
+      // The keyboard also opens a modal without changing the Issues route.
+      await page.getByRole('link', { name: 'Issues', exact: true }).focus();
+      await page.keyboard.press('o');
+      await modal.waitFor({ state: 'visible' });
+      assert.equal(route(page).path, '#/issues');
+      await page.keyboard.press('/');
+      await page.keyboard.insertText('needle');
+      await modal.waitFor({ state: 'hidden' });
+      await results(page, openIds, 'needle');
+    }
+  });
+
+  test(`${device}: status/blocked changes preserve search and clear controls retain their meaning`, async t => {
+    const page = await openViewer(t, mobile, '#/issues?q=needle');
+    await results(page, matchingIds, 'needle');
+    const historyLength = await page.evaluate(() => history.length);
+    await page.locator('select[x-model="searchMode"]:visible').selectOption('hybrid');
+    await page.locator('select[x-model="searchPreset"]:visible').selectOption('bug-hunting');
+    await results(page, matchingIds, 'needle');
+    await filters(page, mobile);
+    await listView(page).getByRole('button', { name: 'open', exact: true }).click();
+    await results(page, openIds, 'needle');
+    await listView(page).getByRole('button', { name: 'Blocked', exact: true }).click();
+    await results(page, ['bv-blocked'], 'needle');
+    await page.locator('button[title="Clear search"]:visible').click();
+    await results(page, ['bv-blocked', 'bv-other'], '');
+    assert.equal(route(page).params.get('status'), 'open');
+    assert.equal(route(page).params.get('blocked'), 'true');
+    await listView(page).getByRole('button', { name: 'Clear all', exact: true }).click();
+    await results(page, allIds, '');
+    assert.equal(route(page).params.size, 0);
+    assert.equal(await page.evaluate(() => history.length), historyLength, 'in-place filters and searches do not add history entries');
+  });
+
+  test(`${device}: dashboard status and blocked cards retain query and create history entries`, async t => {
+    const page = await openViewer(t, mobile, '#/issues?q=needle');
+    const cards = () => page.locator('[x-show="view === \'dashboard\'"]')
+      .locator(mobile ? '.stat-card-mobile' : '.card-lift.cursor-pointer');
+    await home(page, mobile);
+    await cards().filter({ has: page.getByText('Open', { exact: true }) }).click();
+    await results(page, openIds, 'needle');
+    await page.goBack();
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    assert.equal(route(page).path, '#/');
+    await page.goForward();
+    await results(page, openIds, 'needle');
+    await home(page, mobile);
+    await cards().filter({ has: page.getByText('Blocked', { exact: true }) }).click();
+    await results(page, ['bv-blocked'], 'needle');
+    assert.equal(route(page).params.get('blocked'), 'true');
+    await page.goBack();
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    await page.goForward();
+    await results(page, ['bv-blocked'], 'needle');
+  });
+
+  test(`${device}: quick navigation commits input on Issues and cancels a pending search elsewhere`, async t => {
+    const page = await openViewer(t, mobile, '#/', true);
+    await page.clock.pauseAt(new Date('2026-10-07T13:00:00Z'));
+    await page.locator(inputSelector).fill('needle');
+    await page.clock.runFor(1);
+    assert.equal(route(page).path, '#/', 'the input debounce is still pending');
+    await navigateWithClock(page, () => page.getByRole('link', { name: 'Issues', exact: true }).click());
+    await results(page, matchingIds, 'needle');
+    await home(page, mobile, true);
+    await page.locator(inputSelector).fill('unrelated');
+    await page.clock.runFor(1);
+    await navigateWithClock(page, () => page.getByRole('link', { name: 'Insights', exact: true }).click());
+    await page.locator('[x-show="view === \'insights\'"]').waitFor({ state: 'visible' });
+    // Cross the 300ms debounce deterministically; it must not pull us back.
+    await page.clock.fastForward(450);
+    assert.equal(route(page).path, '#/insights');
+    assert.equal(await page.locator(inputSelector).inputValue(), 'unrelated');
+    await navigateWithClock(page, () => page.getByRole('link', { name: 'Issues', exact: true }).click());
+    await results(page, ['bv-other'], 'unrelated');
+  });
+
+  test(`${device}: newer input survives deferred navigation`, async t => {
+    const page = await openViewer(t, mobile, '#/insights', true);
+    await page.clock.pauseAt(new Date('2026-10-07T13:00:00Z'));
+    for (const scenario of [
+      { link: 'Issues', hash: '#/issues', query: 'needle', ids: matchingIds },
+      { link: 'Insights', hash: '#/insights', query: 'unrelated', ids: ['bv-other'] },
+    ]) {
+      const observed = await page.getByRole('link', { name: scenario.link, exact: true }).evaluate((link, query) => {
+        const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+        const input = [...document.querySelectorAll('input[placeholder="Search issues..."]')]
+          .find(node => node.getClientRects().length);
+        let afterInput;
+        const delivered = new Promise(resolve => {
+          window.addEventListener('hashchange', () => resolve({
+            afterInput,
+            afterNavigation: { hash: location.hash, query: app.searchQuery, pending: app.pendingSearch !== null },
+          }), { once: true });
+        });
+        // Hash assignment queues a browser task. Deliver a later user input before
+        // that task, using the real link, input, Alpine handlers, and router.
+        link.click();
+        input.focus();
+        input.value = query;
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: query }));
+        afterInput = { hash: location.hash, query: app.searchQuery, pending: app.pendingSearch !== null };
+        return delivered;
+      }, scenario.query);
+      assert.equal(observed.afterInput.hash, scenario.hash, 'navigation was requested before the input');
+      assert.equal(observed.afterInput.query, scenario.query, 'the real input handler accepted the newer query');
+      assert.equal(observed.afterInput.pending, true, 'the newer input has an active debounce');
+      assert.equal(observed.afterNavigation.query, scenario.query, 'a deferred route event must not erase newer input');
+      assert.equal(observed.afterNavigation.pending, true, 'a deferred route event must not cancel newer input');
+      if (scenario.hash === '#/issues') await page.clock.fastForward(450);
+      else await navigateWithClock(page, () => page.clock.fastForward(450));
+      await results(page, scenario.ids, scenario.query);
+    }
+    await navigateWithClock(page, () => page.goBack());
+    await page.locator('[x-show="view === \'insights\'"]').waitFor({ state: 'visible' });
+    await navigateWithClock(page, () => page.goBack());
+    await results(page, matchingIds, 'needle');
+  });
+
+  test(`${device}: Back cancels pending input and empty dashboard searches stay put`, async t => {
+    const page = await openViewer(t, mobile, '#/', true);
+    await page.locator(inputSelector).fill('needle');
+    await results(page, matchingIds, 'needle');
+    await page.clock.pauseAt(new Date('2026-10-07T13:00:00Z'));
+    await page.locator(inputSelector).fill('unrelated');
+    await page.clock.runFor(1);
+    assert.equal(route(page).params.get('q'), 'needle', 'replacement input has not committed yet');
+    await navigateWithClock(page, () => page.goBack());
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    await page.clock.fastForward(450);
+    assert.equal(route(page).path, '#/');
+    assert.equal(await page.locator(inputSelector).inputValue(), 'unrelated');
+    await navigateWithClock(page, () => page.goForward());
+    await results(page, matchingIds, 'needle');
+    await home(page, mobile, true);
+    await page.locator('button[title="Clear search"]:visible').click();
+    await page.clock.runFor(50);
+    await page.locator('select[x-model="searchMode"]:visible').selectOption('hybrid');
+    await page.clock.runFor(50);
+    assert.equal(route(page).path, '#/');
+    assert.equal(await page.locator(inputSelector).inputValue(), '');
+    await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+  });
+
+  test(`${device}: encoded queries survive reload and empty-result clearing`, async t => {
+    const page = await openViewer(t, mobile);
+    await page.locator(inputSelector).fill(specialQuery);
+    await results(page, ['bv-special'], specialQuery);
+    await page.reload();
+    await page.locator('[x-show="loading"]').waitFor({ state: 'hidden', timeout: 30000 });
+    await searchInput(page, mobile);
+    await results(page, ['bv-special'], specialQuery);
+    await page.locator(inputSelector).fill('no-such-issue-28');
+    await results(page, [], 'no-such-issue-28');
+    await listView(page).getByRole('button', { name: 'Clear search', exact: true }).click();
+    await results(page, allIds, '');
+  });
+
+  test(`${device}: graph Insights show the real blocker and visible what-if counts`, async t => {
+    const page = await openViewer(t, mobile, '#/insights');
+    await insightsImpact(page, 'bv-open', 2, ['bv-blocked', 'bv-other']);
+    const graph = await page.evaluate(() => {
+      const viewer = window.beadsViewer;
+      const state = viewer.GRAPH_STATE;
+      const rank = state.graph.pagerankDefault();
+      return {
+        actionable: [...viewer.getActionableIssues()].sort(),
+        nodes: state.graph.nodeCount(),
+        blockerRank: rank[state.nodeMap.get('bv-open')],
+        dependentRank: rank[state.nodeMap.get('bv-blocked')],
+      };
+    });
+    assert.deepEqual(graph.actionable, ['bv-description', 'bv-open', 'bv-progress', 'bv-special'],
+      'standalone open work is actionable; closed issues and blocked dependents are not');
+    assert.equal(graph.nodes, issues.length, 'isolated issues also belong to the graph');
+    assert.ok(graph.blockerRank > graph.dependentRank, 'reference-direction PageRank still values the blocker');
+  });
+
+  test(`${device}: force graph keeps blocker paths and cascades correct after re-entry`, async t => {
+    // Cover both dashboard navigation and a fresh deep link, which initializes
+    // the viewer's and force graph's WASM consumers concurrently.
+    const page = await openViewer(t, mobile, mobile ? '#/graph' : '#/');
+    for (let visit = 0; visit < 2; visit += 1) {
+      if (!mobile && visit === 0) {
+        await page.getByRole('link', { name: 'Explore dependency graph', exact: true }).click();
+      }
+      await openForceGraph(page);
+      assert.deepEqual(await dependencyPath(page, 'bv-open'), { blockers: 0, dependents: 2 });
+      assert.deepEqual(await dependencyPath(page, 'bv-blocked'), { blockers: 1, dependents: 0 });
+      const expectedIds = ['bv-blocked', 'bv-other'];
+      assert.deepEqual(await forceGraphImpact(page, 'bv-open'), {
+        direct: 2, total: 2, ids: expectedIds,
+        summary: { direct: 2, total: 2, directIds: expectedIds, ids: expectedIds },
+        animated: expectedIds,
+      });
+      await page.getByText('Closing bv-open would unblock 2 issues directly', { exact: true }).last().waitFor({ state: 'visible' });
+      if (mobile) {
+        await page.locator('[x-show="view === \'graph\'"]').getByRole('button', { name: 'Back', exact: true }).click();
+        await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+      } else {
+        await home(page, mobile);
+      }
+      assert.equal(route(page).path, '#/', 'leaving the graph updates the route before re-entry');
+    }
+  });
+}
+
+test('desktop: graph diamond honors all blockers, resolved statuses and exported vertices', async t => {
+  const page = await openViewer(t, false, '#/insights', false, 'graph-fixture/');
+  const expectedCascade = ['graph-join', 'graph-left', 'graph-right', 'graph-tail'];
+  await insightsImpact(page, 'graph-root', 2, expectedCascade);
+  const state = await page.evaluate(() => {
+    const viewer = window.beadsViewer;
+    return {
+      actionable: [...viewer.getActionableIssues()].sort(),
+      nodes: [...viewer.GRAPH_STATE.nodeMap.keys()].sort(),
+      edges: viewer.GRAPH_STATE.graph.edgeCount(),
+      left: viewer.whatIfClose('graph-left'),
+      join: viewer.whatIfClose('graph-join'),
+    };
+  });
+  assert.deepEqual(state.actionable, ['graph-external', 'graph-isolated', 'graph-ready', 'graph-root'],
+    'the child of a dependency-blocked parent inherits the exported readiness gate');
+  assert.deepEqual(state.nodes, graphIssues.map(issue => issue[0]).sort(), 'unknown endpoints do not create phantom work');
+  assert.equal(state.edges, 7, 'blocking types participate; related/parent-child and missing endpoints do not');
+  assert.equal(state.left.direct_unblocks, 0, 'closing one branch cannot unblock a join with another open prerequisite');
+  assert.equal(state.left.transitive_unblocks, 0);
+  assert.equal(state.join.direct_unblocks, 1);
+  assert.deepEqual(state.join.cascade_issue_ids, ['graph-tail']);
+
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.getByRole('button', { name: 'View issue graph-tombstone: Tombstoned prerequisite', exact: true }).click();
+  const modal = page.locator('[x-show="selectedIssue"]');
+  await modal.waitFor({ state: 'visible' });
+  assert.equal(await modal.getByRole('button', { name: 'Simulate Close', exact: true }).isVisible(), false,
+    'resolved tombstones do not offer a close simulation');
+  await modal.locator('button').first().click();
+  await modal.waitFor({ state: 'hidden' });
+
+  await openForceGraph(page);
+  assert.deepEqual(await dependencyPath(page, 'graph-root'), { blockers: 0, dependents: 4 });
+  assert.deepEqual(await dependencyPath(page, 'graph-join'), { blockers: 3, dependents: 1 });
+  assert.deepEqual(await forceGraphImpact(page, 'graph-root'), {
+    direct: 2, total: 4, ids: expectedCascade,
+    summary: { direct: 2, total: 4, directIds: ['graph-left', 'graph-right'], ids: expectedCascade },
+    animated: expectedCascade,
+  });
+  await page.getByText('Closing graph-root would unblock 2 issues directly, 4 total in cascade', { exact: true }).waitFor({ state: 'visible' });
+});
+
+for (const mobile of [false, true]) {
+  const device = mobile ? 'mobile' : 'desktop';
+
+  test(`${device}: recorded graph history shows each event without rewriting the current graph`, async t => {
+    const page = await openViewer(t, mobile, '#/graph', false, 'graph-fixture/');
+    await openForceGraph(page);
+    const snapshot = await currentGraphSnapshot(page);
+    assert.equal(snapshot.nodes.find(node => node.id === 'graph-closed').status, 'closed');
+    const history = page.getByRole('button', { name: 'History', exact: true });
+    await history.click();
+    assert.equal(await history.getAttribute('aria-pressed'), 'true');
+    await page.getByText('Recorded issue events; details and links show the current export.', { exact: true })
+      .waitFor({ state: 'visible' });
+    const controls = page.locator('#time-travel-controls');
+    const slider = controls.getByRole('slider', { name: 'History event', exact: true });
+    assert.equal(await slider.getAttribute('min'), '0');
+    assert.equal(await slider.getAttribute('max'), String(recordedEvents.length - 1));
+    assert.equal(await slider.getAttribute('step'), '1');
+    for (let index = 0; index < recordedEvents.length; index += 1) {
+      await historyEventVisible(page, recordedEvents[index], index, recordedEvents.length, snapshot);
+      if (index + 1 < recordedEvents.length) {
+        await controls.getByRole('button', { name: 'Next event', exact: true }).click();
+      }
+    }
+    assert.equal(await controls.getByRole('button', { name: 'Next event', exact: true }).isDisabled(), true);
+    await controls.getByRole('button', { name: 'First event', exact: true }).click();
+    await historyEventVisible(page, recordedEvents[0], 0, recordedEvents.length, snapshot);
+    assert.equal(await controls.getByRole('button', { name: 'Previous event', exact: true }).isDisabled(), true);
+    await controls.getByRole('button', { name: 'Last event', exact: true }).click();
+    await controls.getByRole('button', { name: 'Previous event', exact: true }).click();
+    await historyEventVisible(page, recordedEvents[3], 3, recordedEvents.length, snapshot);
+    await controls.getByRole('button', { name: 'Close history', exact: true }).click();
+    await controls.waitFor({ state: 'hidden' });
+    assert.equal(await history.getAttribute('aria-pressed'), 'false');
+    assert.deepEqual(await currentGraphSnapshot(page), snapshot);
+    assert.deepEqual(await page.evaluate(async () => (await import('./graph.js')).getTimeTravelState().highlightedIssueIds), []);
+  });
+
+  test(`${device}: recorded history playback pauses, restarts and stops on graph exit`, async t => {
+    const page = await openViewer(t, mobile, '#/graph', true, 'graph-fixture/');
+    await openForceGraph(page);
+    await page.getByRole('button', { name: 'History', exact: true }).click();
+    await page.clock.pauseAt(new Date('2026-10-07T13:00:00Z'));
+    await page.evaluate(() => {
+      window.recordedHistorySteps = [];
+      document.addEventListener('bv-graph:timeTravelEvent', event => {
+        window.recordedHistorySteps.push(event.detail.idx);
+      });
+    });
+    const controls = page.locator('#time-travel-controls');
+    await controls.getByRole('button', { name: 'Play history', exact: true }).click();
+    await page.clock.runFor(1100);
+    assert.deepEqual(await page.evaluate(() => window.recordedHistorySteps), [1]);
+    await controls.getByRole('button', { name: 'Pause history', exact: true }).click();
+    await page.clock.runFor(2200);
+    assert.deepEqual(await page.evaluate(() => window.recordedHistorySteps), [1], 'pause cancels scheduled playback');
+    // Restart and pause within one frame, then resume: a canceled RAF must not
+    // survive and create a second playback loop when Play is pressed again.
+    await controls.getByRole('button', { name: 'Play history', exact: true }).click();
+    await controls.getByRole('button', { name: 'Pause history', exact: true }).click();
+    await controls.getByRole('button', { name: 'Play history', exact: true }).click();
+    await page.clock.runFor(1100);
+    assert.deepEqual(await page.evaluate(() => window.recordedHistorySteps), [1, 2]);
+    await controls.getByRole('button', { name: 'Close history', exact: true }).click();
+    await page.clock.runFor(2200);
+    assert.deepEqual(await page.evaluate(() => window.recordedHistorySteps), [1, 2], 'closing history cancels playback');
+    await controls.waitFor({ state: 'hidden' });
+    await page.getByRole('button', { name: 'History', exact: true }).click();
+    assert.equal(await controls.locator('#tt-position').textContent(), `1 / ${recordedEvents.length} events`);
+    await controls.getByRole('button', { name: 'Play history', exact: true }).click();
+    const beforeExit = await page.evaluate(() => [...window.recordedHistorySteps]);
+    if (mobile) {
+      await navigateWithClock(page, () => page.locator('[x-show="view === \'graph\'"]')
+        .getByRole('button', { name: 'Back', exact: true }).click());
+      await page.locator('[x-show="view === \'dashboard\'"]').waitFor({ state: 'visible' });
+    } else {
+      await home(page, false, true);
+    }
+    await page.clock.runFor(2200);
+    assert.deepEqual(await page.evaluate(() => window.recordedHistorySteps), beforeExit,
+      'leaving the graph stops playback and removes controls');
+    assert.equal(await page.locator('#time-travel-controls').count(), 0);
+    assert.deepEqual(await page.evaluate(async () => {
+      const module = await import('./graph.js');
+      const state = module.getTimeTravelState();
+      return { graph: module.getGraph(), active: state.active, playing: state.playing, events: state.totalEvents };
+    }), { graph: null, active: false, playing: false, events: 0 });
+  });
+}
+
+test('desktop: cleanup cancels a graph initialization across the real WASM promise', async t => {
+  const page = await openViewer(t, false);
+  const state = await page.evaluate(async () => {
+    const module = await import('./graph.js');
+    let readyEvents = 0;
+    const ready = () => { readyEvents += 1; };
+    document.addEventListener('bv-graph:ready', ready);
+    // Even cached WASM initialization yields at await. Cleanup in that exact
+    // window must invalidate initGraph before it creates a canvas or listeners.
+    const pending = module.initGraph('graph-container');
+    module.cleanup();
+    await pending;
+    const observed = {
+      graph: Boolean(module.getGraph()), wasm: module.isWasmReady(),
+      canvas: document.querySelectorAll('#graph-container canvas').length, readyEvents,
+    };
+    document.removeEventListener('bv-graph:ready', ready);
+    module.cleanup();
+    return observed;
+  });
+  assert.deepEqual(state, { graph: false, wasm: false, canvas: 0, readyEvents: 0 },
+    'an obsolete init cannot resurrect graph state after cleanup');
+});
+
+test('desktop: history handles single events, wrapped histories, long timelines and absent dates', async t => {
+  const single = historyEvent('graph-closed', 'closed', '2026-10-06T09:00:00Z', 'Only dated event');
+  let payload = exportedHistory([single]);
+  let status = 200;
+  const page = await openViewer(t, false, '#/graph', false, 'graph-fixture/', async page => {
+    await page.route('**/data/history.json?*', request => request.fulfill({
+      status, contentType: 'application/json', body: JSON.stringify(payload),
+    }));
+  });
+  await openForceGraph(page);
+  const history = page.getByRole('button', { name: 'History', exact: true });
+  await history.click();
+  const snapshot = await currentGraphSnapshot(page);
+  await historyEventVisible(page, single, 0, 1, snapshot);
+  const slider = page.getByRole('slider', { name: 'History event', exact: true });
+  assert.equal(await slider.getAttribute('max'), '0');
+  assert.equal(await slider.inputValue(), '0', 'one event never produces NaN or a fractional index');
+  for (const name of ['First event', 'Previous event', 'Next event', 'Last event', 'Play history']) {
+    assert.equal(await page.getByRole('button', { name, exact: true }).isDisabled(), true, `${name} has no further event`);
+  }
+
+  const events = Array.from({ length: 103 }, (_, index) => historyEvent(
+    index % 2 ? 'graph-root' : 'graph-closed', index === 0 ? 'reopened' : 'updated',
+    new Date(Date.UTC(2026, 9, 6, 10, 0, index)).toISOString(), `Recorded event ${index}`, 'shared-commit',
+  ));
+  await home(page, false);
+  payload = { histories: structuredClone(exportedHistory(events)) };
+  delete payload.histories['graph-root'].events[0].bead_id;
+  delete payload.histories['graph-closed'].bead_id;
+  delete payload.histories['graph-closed'].events[0].bead_id;
+  await openForceGraph(page);
+  await history.click();
+  const longSnapshot = await currentGraphSnapshot(page);
+  assert.equal(await slider.getAttribute('max'), '102');
+  assert.equal(await slider.getAttribute('step'), '1');
+  await historyEventVisible(page, events[0], 0, events.length, longSnapshot);
+  await selectHistoryEvent(page, 1);
+  await historyEventVisible(page, events[1], 1, events.length, longSnapshot);
+  await selectHistoryEvent(page, 101);
+  await historyEventVisible(page, events[101], 101, events.length, longSnapshot);
+  await slider.press('ArrowRight');
+  await historyEventVisible(page, events[102], 102, events.length, longSnapshot);
+  await slider.press('ArrowLeft');
+  await historyEventVisible(page, events[101], 101, events.length, longSnapshot);
+  assert.equal(longSnapshot.nodes.find(node => node.id === 'graph-closed').status, 'closed',
+    'a recorded reopening does not invent a different current status');
+
+  // The graph module's explicit commit-timeline input remains usable too.
+  // Distinct changes in one commit are separate recorded issue events.
+  const commitEvents = [
+    historyEvent('graph-root', 'modified', '2026-10-06T12:00:00Z', 'Shared commit', 'known-sha'),
+    historyEvent('graph-left', 'claimed', '2026-10-06T12:00:00Z', 'Shared commit', 'known-sha'),
+    historyEvent('graph-closed', 'reopened', '2026-10-06T12:00:00Z', 'Shared commit', 'known-sha'),
+  ];
+  await home(page, false);
+  payload = { commits: [{
+    sha: 'known-sha', date: '2026-10-06T12:00:00Z', message: 'Shared commit',
+    beads_modified: ['graph-root'], beads_claimed: ['graph-left'], beads_reopened: ['graph-closed'],
+  }] };
+  await openForceGraph(page);
+  await history.click();
+  for (let index = 0; index < commitEvents.length; index += 1) {
+    await selectHistoryEvent(page, index);
+    await historyEventVisible(page, commitEvents[index], index, commitEvents.length, longSnapshot);
+  }
+
+  for (const missing of [false, true]) {
+    await home(page, false);
+    status = missing ? 404 : 200;
+    payload = exportedHistory([
+      historyEvent('graph-root', 'created', '', 'Undated'),
+      historyEvent('graph-left', 'updated', 'not-a-date', 'Invalid'),
+      historyEvent('unknown-issue', 'created', '2026-10-06T09:00:00Z', 'Absent from export'),
+    ]);
+    await openForceGraph(page);
+    await page.waitForFunction(() => !Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).graphHistoryLoading);
+    await history.waitFor({ state: 'visible' });
+    assert.equal(await history.isDisabled(), true, missing ? '404 history is unavailable' : 'undated events do not invent a timeline');
+    assert.equal(await history.getAttribute('aria-pressed'), 'false');
+    assert.equal(await page.locator('#time-travel-controls').count(), 0);
+    assert.equal(await page.evaluate(async () => (await import('./graph.js')).getTimeTravelState().totalEvents), 0,
+      'previous history cannot leak into an export with no dated events');
+    assert.deepEqual(await currentGraphSnapshot(page), snapshot);
+  }
+});
+
+test('desktop: obsolete history response cannot overwrite a graph reopened before it arrives', async t => {
+  let releaseObsolete;
+  const obsoleteGate = new Promise(resolve => { releaseObsolete = resolve; });
+  let observedRequest;
+  const firstRequested = new Promise(resolve => { observedRequest = resolve; });
+  let obsoleteFinished;
+  const firstFinished = new Promise(resolve => { obsoleteFinished = resolve; });
+  const newerEvents = [
+    historyEvent('graph-right', 'created', '2026-10-06T11:00:00Z', 'New graph visit'),
+    historyEvent('graph-tail', 'updated', '2026-10-06T11:01:00Z', 'Newer tail event'),
+  ];
+  let requests = 0;
+  const page = await openViewer(t, false, '#/graph', false, 'graph-fixture/', async page => {
+    await page.route('**/data/history.json?*', async request => {
+      requests += 1;
+      if (requests === 1) {
+        observedRequest();
+        await obsoleteGate;
+        await request.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(recordedHistory) });
+        const response = await request.request().response();
+        if (response) await response.finished();
+        obsoleteFinished();
+      } else {
+        await request.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(exportedHistory(newerEvents)) });
+      }
+    });
+  });
+  t.after(() => releaseObsolete());
+  await firstRequested;
+  await page.locator('#graph-container canvas').first().waitFor({ state: 'visible' });
+  await home(page, false);
+  await openForceGraph(page);
+  const history = page.getByRole('button', { name: 'History', exact: true });
+  await history.click();
+  const snapshot = await currentGraphSnapshot(page);
+  await historyEventVisible(page, newerEvents[0], 0, newerEvents.length, snapshot);
+  assert.equal(requests, 2, 're-entry starts its own history request immediately');
+  releaseObsolete();
+  await firstFinished;
+  // Let native fetch/JSON continuations and the ensuing paint complete; no
+  // arbitrary sleep or mocked application state decides this response race.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await historyEventVisible(page, newerEvents[0], 0, newerEvents.length, snapshot);
+  assert.equal(await page.locator('#time-travel-controls').count(), 1);
+  assert.equal(route(page).path, '#/graph');
+});
+
+async function configureSecurityLibraries(page, mode) {
+  const missing = mode === 'missing both' ? ['marked', 'dompurify']
+    : mode === 'missing parser' ? ['marked'] : mode === 'missing sanitizer' ? ['dompurify'] : [];
+  for (const library of missing) {
+    // Model an actual failed local script request, before any x-html is evaluated.
+    await page.route(`**/vendor/${library}.min.js`, request => request.fulfill({ status: 404, body: '' }));
+  }
+  await page.addInitScript(failure => {
+    window.__viewerPayloads = [];
+    document.addEventListener('alpine:init', () => {
+      const fail = () => { throw new Error('Deliberately unavailable Markdown dependency'); };
+      if (failure === 'throwing parser') {
+        window.marked.parse = fail;
+        window.marked.parseInline = fail;
+      } else if (failure === 'throwing sanitizer') {
+        window.DOMPurify.sanitize = fail;
+      } else if (failure === 'unsupported sanitizer') {
+        window.DOMPurify.isSupported = false;
+      } else if (failure === 'incomplete parser') {
+        window.marked.parse = undefined;
+        window.marked.parseInline = undefined;
+      } else if (failure === 'incomplete sanitizer') {
+        window.DOMPurify.sanitize = null;
+      }
+      window.__securityLibraryMode = failure;
+    }, { once: true });
+  }, mode);
+}
+
+async function assertSecurityInert(page, surface, label) {
+  // Inspect actual parsed descendants, including inert template contents and
+  // open shadow roots. querySelectorAll alone misses those separate trees.
+  const observed = await surface.evaluate(async element => {
+    const descendants = () => {
+      const nodes = [...element.querySelectorAll('*')];
+      for (const node of nodes) {
+        if (node instanceof HTMLTemplateElement) nodes.push(...node.content.querySelectorAll('*'));
+        if (node.shadowRoot) nodes.push(...node.shadowRoot.querySelectorAll('*'));
+      }
+      return nodes;
+    };
+    // Inert template images do not load until insertion; waiting on them would
+    // deadlock the test. Their attributes are still inspected below.
+    await Promise.all(descendants().filter(node => node.localName === 'img' && node.isConnected)
+      .map(image => image.complete ? undefined : new Promise(resolve => {
+        image.addEventListener('load', resolve, { once: true });
+        image.addEventListener('error', resolve, { once: true });
+      })));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    for (const action of descendants().filter(node =>
+      node.isConnected && node.hasAttribute('data-security-action'))) {
+      action.dispatchEvent(new Event('click'));
+      action.dispatchEvent(new Event('mouseover'));
+    }
+    for (const link of descendants().filter(node =>
+      node.isConnected && node.localName === 'a' && node.hasAttribute('href'))) {
+      if (/^javascript:/i.test(link.getAttribute('href').replace(/[\u0000-\u0020]/g, ''))) link.click();
+    }
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    const nodes = descendants();
+    const attributes = nodes.flatMap(node => [...node.attributes]
+      .filter(attribute => /^(?:on|x-|@|:)/i.test(attribute.name) || attribute.name === 'srcdoc'
+        || /(?:^|:)href$|^src$/i.test(attribute.name)
+          && /^(?:javascript|vbscript):/i.test(attribute.value.replace(/[\u0000-\u0020]/g, '')))
+      .map(attribute => node.tagName + '.' + attribute.name + '=' + attribute.value));
+    return {
+      executed: [...window.__viewerPayloads], attributes,
+      activeTags: nodes.filter(node => ['script', 'iframe', 'object', 'embed'].includes(node.localName))
+        .map(node => node.tagName),
+    };
+  });
+  assert.deepEqual(observed.executed, [], label + ': payloads remain inert in the running dashboard');
+  assert.deepEqual(observed.attributes, [], label + ': executable attributes and URLs are absent');
+  assert.deepEqual(observed.activeTags, [], label + ': active embedded content is absent');
+}
+
+async function assertSecurityDescription(page, surface, issue, mode, kind) {
+  const label = `${mode}, ${kind}, ${issue.id}`;
+  if (!issue.description) {
+    if (kind === 'graph') {
+      assert.equal((await surface.textContent()).trim(), 'No description available', `${label}: empty state survives`);
+      assert.equal(await surface.locator('p.italic').count(), 1, `${label}: empty-state styling survives`);
+    } else {
+      assert.equal(await surface.isVisible(), false, `${label}: empty descriptions stay hidden`);
+    }
+  } else if (mode !== 'available') {
+    assert.equal(await surface.textContent(), issue.description, `${label}: original source is literal text`);
+    assert.equal(await surface.locator('*').count(), 0, `${label}: fallback creates no HTML elements`);
+  } else if (issue.id === 'security-markdown') {
+    assert.equal(await surface.locator('strong').textContent(), 'strong', `${label}: bold Markdown renders`);
+    assert.equal(await surface.locator('em').textContent(), 'emphasis');
+    assert.equal(await surface.locator('code').textContent(), 'inline code');
+    assert.equal(await surface.getByRole('link', { name: 'safe link', exact: true }).getAttribute('href'),
+      'https://example.invalid/docs?one=1&two=2');
+    if (kind !== 'excerpt') {
+      assert.deepEqual(await surface.locator('li').allTextContents(), ['First item', 'Second item']);
+      assert.equal((await surface.locator('blockquote').textContent()).trim(), 'Quoted text');
+    }
+  } else if (issue.id === 'security-html') {
+    assert.equal(await surface.locator('strong').textContent(), 'raw HTML', `${label}: safe HTML survives sanitization`);
+    assert.match(await surface.textContent(), /paragraph & café\./);
+  } else if (issue.id === 'security-events') {
+    assert.match(await surface.textContent(), /Before/);
+    assert.match(await surface.textContent(), /unsafe link/);
+  } else if (issue.id === 'security-alpine') {
+    assert.equal(await surface.locator('span[data-security-action="alpine"]').count(), 1,
+      `${label}: valid raw HTML reaches the sanitizer and its harmless marker survives`);
+    assert.equal((await surface.textContent()).trim(), 'Directives stay inert');
+  } else if (issue.id === 'security-alpine-shorthand') {
+    assert.match(await surface.textContent(), /Shorthand directives stay inert/);
+    if (kind !== 'excerpt') {
+      assert.equal(await surface.locator('div[data-security-action="shorthand"]').count(), 1,
+        'block Markdown parses shorthand-bearing HTML before sanitization');
+    }
+  }
+  await assertSecurityInert(page, surface, label);
+}
+
+async function selectSecurityGraphNode(page, id) {
+  // Invoke ForceGraph's installed click callback with its real exported node.
+  // This traverses the production selection bridge and Alpine x-html boundary,
+  // without depending on a moving force-layout node's screen coordinates.
+  await page.evaluate(issueId => {
+    const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+    // The visible graph already owns its initialized module. Reusing it avoids
+    // a redundant dynamic-import promise in the browser automation protocol.
+    if (!app.forceGraphReady || app.forceGraphLoading || !app.forceGraphModule) {
+      throw new Error('The exported force graph must be initialized before selection');
+    }
+    const graph = app.forceGraphModule.getGraph();
+    if (!graph) throw new Error('The initialized module must retain its real graph');
+    const node = graph.graphData().nodes.find(item => item.id === issueId);
+    if (!node) throw new Error(`Missing exported graph node: ${issueId}`);
+    graph.onNodeClick()(node, new MouseEvent('click'));
+  }, id);
+  const panel = page.locator('[x-show="graphDetailNode"]');
+  await panel.waitFor({ state: 'visible' });
+  await page.waitForFunction(issueId =>
+    Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).graphDetailNode?.id === issueId, id);
+  // Alpine renders the new selected node on its next tick.
+  await page.evaluate(() => Alpine.nextTick());
+  return panel.locator('[x-html]');
+}
+
+test('harness: graph inertness checks reject a disabled sanitizer', async t => {
+  const fixturePath = await exportedSecurityFixture(t);
+  const page = await openViewer(t, false, '#/graph', false, fixturePath,
+    page => configureSecurityLibraries(page, 'available'));
+  await openForceGraph(page);
+  // Deliberately inject one fault only in this test's isolated browser context.
+  // Source assets, Marked, exported issue data, and graph selection stay real.
+  await page.evaluate(() => {
+    DOMPurify.sanitize = html => html;
+  });
+  const issue = securityDescriptions.find(item => item.id === 'security-events');
+  const description = await selectSecurityGraphNode(page, issue.id);
+  let rejectedAssertion;
+  await assert.rejects(
+    () => assertSecurityDescription(page, description, issue, 'available', 'graph'),
+    error => {
+      rejectedAssertion = error.message;
+      return error.code === 'ERR_ASSERTION' && error.message.includes('payloads remain inert');
+    },
+    'the same graph checks must detect event execution when sanitization is deliberately bypassed',
+  );
+  const evidence = await page.evaluate(() => ({
+    selectedId: Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).graphDetailNode?.id,
+    executed: [...window.__viewerPayloads],
+  }));
+  assert.equal(evidence.selectedId, issue.id, 'the production bridge selected the real exported issue');
+  assert.ok(evidence.executed.includes('image'), 'the unsanitized image handler reached the actual graph DOM');
+  await writeFile(path.join(path.dirname(securityExport), 'disabled-sanitizer-negative-control.json'),
+    JSON.stringify({ deliberateTestFault: true, rejectedAssertion, ...evidence }, null, 2));
+});
+
+for (const mode of [
+  'available', 'missing parser', 'missing sanitizer', 'missing both',
+  'throwing parser', 'throwing sanitizer', 'unsupported sanitizer',
+  'incomplete parser', 'incomplete sanitizer',
+]) {
+  test(`security: exported Markdown, HTML and event payloads with ${mode}`, async t => {
+    const fixturePath = await exportedSecurityFixture(t);
+    const page = await openViewer(t, false, '#/issues', false, fixturePath,
+      page => configureSecurityLibraries(page, mode));
+    try {
+      assert.equal(await page.evaluate(() => window.__securityLibraryMode), mode,
+        'dependency fault was configured before Alpine rendered any issue');
+      const missing = await page.evaluate(() => ({
+        parser: typeof window.marked === 'undefined', sanitizer: typeof window.DOMPurify === 'undefined',
+      }));
+      assert.deepEqual(missing, {
+        parser: mode === 'missing parser' || mode === 'missing both',
+        sanitizer: mode === 'missing sanitizer' || mode === 'missing both',
+      }, 'failed script requests really remove the intended library');
+
+      for (const issue of securityDescriptions) {
+        const row = page.getByRole('button', { name: `View issue ${issue.id}: ${issue.title}`, exact: true });
+        await row.waitFor({ state: 'visible' });
+        await assertSecurityDescription(page, row.locator('[x-html]'), issue, mode, 'excerpt');
+        await row.click();
+        const modal = page.locator('[x-show="selectedIssue"]');
+        await modal.waitFor({ state: 'visible' });
+        await assertSecurityDescription(page, modal.locator('[x-html]'), issue, mode, 'issue');
+        await modal.locator('button').first().click();
+        await modal.waitFor({ state: 'hidden' });
+      }
+      await openForceGraph(page);
+      for (const issue of securityDescriptions) {
+        const description = await selectSecurityGraphNode(page, issue.id);
+        await assertSecurityDescription(page, description, issue, mode, 'graph');
+      }
+      await page.evaluate(async id => {
+        const graph = (await import('./graph.js')).getGraph();
+        const node = graph.graphData().nodes.find(item => item.id === id);
+        graph.onNodeHover()(node, null);
+      }, tooltipIssue.id);
+      const tooltip = page.locator('.bv-graph-tooltip');
+      await tooltip.waitFor({ state: 'visible' });
+      const text = await tooltip.textContent();
+      for (const value of [tooltipIssue.id, tooltipIssue.title, ...tooltipIssue.labels]) {
+        assert.ok(text.includes(value), `${mode}: tooltip shows imported metadata literally`);
+      }
+      assert.match(text, /P0/, 'zero priority remains visible');
+      assert.match(text, /Blockers: 0/, 'zero blocker count remains visible');
+      assert.match(text, /Dependents: 0/, 'zero dependent count remains visible');
+      assert.equal(await tooltip.locator('img, svg').count(), 0, 'tooltip metadata never becomes HTML');
+      await assertSecurityInert(page, tooltip, `${mode}, exported graph tooltip`);
+    } finally {
+      const evidence = await page.evaluate(() => ({ url: location.href, executed: window.__viewerPayloads }));
+      await writeFile(path.join(path.dirname(securityExport), `${mode.replaceAll(' ', '-')}.json`),
+        JSON.stringify({ mode, ...evidence }, null, 2));
+    }
+  });
+}
+
+test('security: exported DOMPurify neutralizes upstream mutation cases offline', async t => {
+  const fixturePath = await exportedMutationFixture(t);
+  const dialogs = [];
+  const externalRequests = [];
+  const completed = [];
+  let lastAttempt = 'initial dashboard load';
+  let runtimeVersion;
+  const page = await openViewer(t, false, '#/issues', false, fixturePath, async page => {
+    await configureSecurityLibraries(page, 'available');
+    page.on('dialog', async dialog => {
+      dialogs.push({ type: dialog.type(), message: dialog.message(), url: page.url() });
+      await dialog.dismiss();
+    });
+    await page.route('**/*', async request => {
+      const url = new URL(request.request().url());
+      if ((url.protocol === 'http:' || url.protocol === 'https:') && url.origin !== origin) {
+        externalRequests.push(url.href);
+        await request.abort();
+      } else {
+        await request.continue();
+      }
+    });
+  });
+  const assertNoExecution = label => {
+    assert.deepEqual(dialogs, [], label + ': upstream alert payloads never execute');
+    assert.deepEqual(externalRequests, [], label + ': the exported dashboard needs no external requests');
+  };
+  try {
+    runtimeVersion = await page.evaluate(() => DOMPurify.version);
+    t.diagnostic('DOMPurify loaded by the exported dashboard: ' + runtimeVersion);
+    assert.equal(await page.evaluate(() => DOMPurify.isSupported), true,
+      'the real browser supports the shipped sanitizer');
+    assertNoExecution(lastAttempt);
+
+    // First run the upstream string-input contract directly. This prevents a
+    // test from passing merely because Marked escaped a particular HTML shape.
+    // Reinsert into an ordinary live div, the issue/graph detail sink context.
+    for (const issue of mutationDescriptions) {
+      lastAttempt = 'default sanitize and div reparse: ' + issue.id;
+      const clean = await page.evaluate(dirty => {
+        const holder = document.createElement('div');
+        holder.id = 'dompurify-mutation-probe';
+        const sanitized = DOMPurify.sanitize(dirty);
+        holder.innerHTML = sanitized;
+        document.body.append(holder);
+        return sanitized;
+      }, issue.description);
+      const probe = page.locator('#dompurify-mutation-probe');
+      try {
+        await assertSecurityInert(page, probe, lastAttempt);
+        assertNoExecution(lastAttempt);
+        if (issue.expected !== undefined) {
+          const accepted = Array.isArray(issue.expected) ? issue.expected : [issue.expected];
+          assert.ok(accepted.includes(clean),
+            lastAttempt + ': default output matches the pinned upstream fixture; got ' + JSON.stringify(clean));
+        }
+        if (issue.forbiddenOutput) {
+          assert.equal(clean.includes(issue.forbiddenOutput), false,
+            lastAttempt + ': default sanitization removes ' + issue.forbiddenOutput);
+        }
+        completed.push({ id: issue.id, surface: 'default-div' });
+      } finally {
+        await probe.evaluate(element => element.remove());
+      }
+    }
+
+    const fixtureIssues = [securityDescriptions[0], securityDescriptions[1], ...mutationDescriptions];
+    for (const issue of fixtureIssues) {
+      // Search through the normal UI so pagination cannot hide a corpus case.
+      await page.locator(inputSelector).fill(issue.id);
+      await results(page, [issue.id], issue.id);
+      const row = page.getByRole('button', { name: 'View issue ' + issue.id + ': ' + issue.title, exact: true });
+      lastAttempt = 'exported excerpt: ' + issue.id;
+      await assertSecurityDescription(page, row.locator('[x-html]'), issue, 'available', 'excerpt');
+      assertNoExecution(lastAttempt);
+      completed.push({ id: issue.id, surface: 'excerpt' });
+      // The title opens the issue without accidentally following a safe link
+      // rendered in its description.
+      await row.getByRole('heading', { name: issue.title, exact: true }).click();
+      const modal = page.locator('[x-show="selectedIssue"]');
+      await modal.waitFor({ state: 'visible' });
+      lastAttempt = 'exported issue detail: ' + issue.id;
+      await assertSecurityDescription(page, modal.locator('[x-html]'), issue, 'available', 'issue');
+      assertNoExecution(lastAttempt);
+      completed.push({ id: issue.id, surface: 'issue' });
+      await modal.locator('button').first().click();
+      await modal.waitFor({ state: 'hidden' });
+    }
+    await page.locator(inputSelector).fill('');
+    await page.waitForFunction(() => !new URLSearchParams(location.hash.split('?')[1] || '').has('q'));
+    await openForceGraph(page);
+    for (const issue of fixtureIssues) {
+      lastAttempt = 'exported graph detail: ' + issue.id;
+      const description = await selectSecurityGraphNode(page, issue.id);
+      await assertSecurityDescription(page, description, issue, 'available', 'graph');
+      assertNoExecution(lastAttempt);
+      completed.push({ id: issue.id, surface: 'graph' });
+    }
+    lastAttempt = 'complete';
+  } finally {
+    let browserState;
+    try {
+      browserState = await page.evaluate(() => ({
+        url: location.href, executed: window.__viewerPayloads,
+      }));
+    } catch (error) {
+      browserState = { unavailable: error.message };
+    }
+    await writeFile(path.join(path.dirname(mutationExport), 'mutation-regressions.json'),
+      JSON.stringify({
+        release: dompurifyRelease, runtimeVersion,
+        libraryRevision: process.env.BVR_DOMPURIFY_REVISION || null,
+        applicationRevision: process.env.BVR_VIEWER_REVISION || null,
+        lastAttempt, completed, dialogs, externalRequests, ...browserState,
+      }, null, 2));
+  }
+});
+
+test('security: graph tooltip escapes untyped metadata and preserves zero metrics', async t => {
+  const fixturePath = await exportedSecurityFixture(t);
+  const page = await openViewer(t, false, '#/graph', false, fixturePath,
+    page => configureSecurityLibraries(page, 'available'));
+  await openForceGraph(page);
+  const payload = '<img src=x onerror="window.__viewerPayloads.push(\'tooltip-metadata\')">';
+  await page.evaluate(async ({ id, value }) => {
+    const graph = (await import('./graph.js')).getGraph();
+    const node = graph.graphData().nodes.find(item => item.id === id);
+    // These fields are typed or computed in the Rust exporter. Exercise the
+    // additional JS boundary directly, without claiming a JSONL export can
+    // put arbitrary HTML into numeric Rust fields or validated status values.
+    Object.assign(node, {
+      status: value, priority: value, blockerCount: value, dependentCount: value,
+      criticalDepth: value, kcore: 0,
+    });
+    graph.onNodeHover()(node, null);
+  }, { id: 'security-markdown', value: payload });
+  const tooltip = page.locator('.bv-graph-tooltip');
+  await tooltip.waitFor({ state: 'visible' });
+  const text = await tooltip.textContent();
+  assert.equal(text.split(payload).length - 1, 5, 'every untyped interpolated value is literal text');
+  assert.match(text, /K-core: 0/, 'zero is a metric, not missing content');
+  assert.equal(await tooltip.locator('img').count(), 0);
+  await assertSecurityInert(page, tooltip, 'untyped graph tooltip metadata');
+});
+
+async function configureDependencyRendering(page) {
+  await configureSecurityLibraries(page, 'available');
+  await page.addInitScript(() => {
+    window.__dependencyRenders = [];
+    document.addEventListener('alpine:init', () => {
+      // Observe the real Mermaid parser/renderer. Do not replace its output,
+      // security configuration, binding functions, or application callbacks.
+      const render = window.mermaid.render.bind(window.mermaid);
+      window.mermaid.render = async (...args) => {
+        const attempt = { id: args[0], source: args[1], state: 'pending' };
+        window.__dependencyRenders.push(attempt);
+        try {
+          const output = await render(...args);
+          attempt.state = 'fulfilled';
+          return output;
+        } catch (error) {
+          attempt.state = 'rejected';
+          attempt.error = String(error);
+          throw error;
+        }
+      };
+    }, { once: true });
+  });
+}
+
+async function openDependencyDiagram(page, expectedIds) {
+  const modal = page.locator('[x-show="selectedIssue"]');
+  const diagram = modal.locator('[x-ref="depGraph"]');
+  const previous = await page.evaluate(() => window.__dependencyRenders.length);
+  await modal.getByRole('button', { name: 'Show Graph', exact: true }).click();
+  // Give the real Alpine watcher and its scheduled rendering tick a chance to
+  // run. A deleted watcher must fail explicitly instead of reusing stale SVG.
+  await page.evaluate(async () => {
+    await Alpine.nextTick();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+  assert.ok(await page.evaluate(count => window.__dependencyRenders.length > count, previous),
+    'Show Graph starts a new Mermaid render, including after issue navigation');
+  await page.waitForFunction(count =>
+    window.__dependencyRenders.slice(count).every(attempt => attempt.state !== 'pending'), previous);
+  const attempts = await page.evaluate(count => window.__dependencyRenders.slice(count), previous);
+  assert.deepEqual(attempts.map(attempt => attempt.state), attempts.map(() => 'fulfilled'),
+    'the actual Mermaid parser accepts supported issue IDs: ' + JSON.stringify(attempts));
+  await diagram.locator('svg').waitFor({ state: 'visible' });
+  const labels = (await diagram.locator('svg g.node').allTextContents()).map(text => text.trim());
+  assert.deepEqual(labels.sort(), [...expectedIds].sort(),
+    'every distinct issue appears once with its complete literal ID');
+  assert.equal(await page.evaluate(() => mermaid.mermaidAPI.getConfig().securityLevel), 'strict',
+    'dependency diagrams retain Mermaid strict security');
+  assert.equal(await diagram.locator('img, image').count(), 0, 'HTML-like IDs cannot introduce images');
+  await assertSecurityInert(page, diagram, 'exported Mermaid dependency diagram');
+  return diagram;
+}
+
+async function selectedDependencyIssue(page, id) {
+  await page.waitForFunction(expected =>
+    Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).selectedIssue?.id === expected, id);
+  assert.equal(route(page).path, '#/issue/' + encodeURIComponent(id),
+    'diagram navigation preserves the exact original issue ID');
+}
+
+for (const scenario of [
+  {
+    name: 'reopens after ordinary issue navigation', id: 'dep-parent',
+    initialIds: ['dep-parent', 'dep-child'], target: 'dep-child',
+    targetIds: ['dep-parent', 'dep-child', 'dep-leaf'], useDependencyList: true, key: 'Enter',
+  },
+  {
+    name: 'preserves distinct issue IDs', id: 'task-a',
+    initialIds: ['task-a', 'task_a'], target: 'task_a',
+    targetIds: ['task-a', 'task_a'], key: 'Enter',
+  },
+  {
+    name: 'preserves comma-containing dependency IDs', id: 'comma-root',
+    initialIds: ['comma-root', 'dep,comma'], target: 'dep,comma',
+    targetIds: ['comma-root', 'dep,comma'], key: 'Space',
+  },
+  {
+    name: 'renders quoted issue IDs literally', id: quotedDependencyId,
+    initialIds: [quotedDependencyId, 'dep-anchor'], target: 'dep-anchor',
+    targetIds: [quotedDependencyId, htmlDependencyId, 'end', 'dep-anchor'], key: 'Enter',
+  },
+  {
+    name: 'renders HTML-like issue IDs literally', id: htmlDependencyId,
+    initialIds: [htmlDependencyId, 'dep-anchor'], target: 'dep-anchor',
+    targetIds: [quotedDependencyId, htmlDependencyId, 'end', 'dep-anchor'], key: 'Space',
+  },
+]) {
+  test('security: exported dependency diagram ' + scenario.name, async t => {
+    const fixturePath = await exportedDependencyFixture(t);
+    const dialogs = [];
+    const page = await openViewer(t, false, '#/issues', false, fixturePath, async page => {
+      await configureDependencyRendering(page);
+      page.on('dialog', async dialog => {
+        dialogs.push({ type: dialog.type(), message: dialog.message() });
+        await dialog.dismiss();
+      });
+    });
+    const completed = [];
+    try {
+      const issue = dependencyIssues.find(item => item.id === scenario.id);
+      const row = page.getByRole('button', { name: 'View issue ' + issue.id + ': ' + issue.title, exact: true });
+      await row.getByRole('heading', { name: issue.title, exact: true }).click();
+      await selectedDependencyIssue(page, issue.id);
+      let diagram = await openDependencyDiagram(page, scenario.initialIds);
+      completed.push('initial diagram');
+      if (scenario.useDependencyList) {
+        // Isolate the watcher lifecycle from the independently broken Mermaid
+        // node callbacks in the old renderer, using an ordinary dependency link.
+        await page.locator('[x-show="selectedIssue"]').getByRole('button', {
+          name: scenario.target, exact: true,
+        }).click();
+      } else {
+        await diagram.getByRole('link', { name: 'Open issue ' + scenario.target, exact: true }).click();
+      }
+      await selectedDependencyIssue(page, scenario.target);
+      completed.push('pointer navigation');
+      diagram = await openDependencyDiagram(page, scenario.targetIds);
+      completed.push('reopened diagram');
+      const originalNode = diagram.getByRole('link', { name: 'Open issue ' + scenario.id, exact: true });
+      await originalNode.focus();
+      await originalNode.press(scenario.key);
+      await selectedDependencyIssue(page, scenario.id);
+      completed.push('keyboard navigation: ' + scenario.key);
+      await openDependencyDiagram(page, scenario.initialIds);
+      completed.push('second reopened diagram');
+      assert.deepEqual(dialogs, [], 'dependency IDs cannot execute dialog payloads');
+    } finally {
+      const evidence = await page.evaluate(() => ({
+        url: location.href,
+        selectedId: Alpine.$data(document.querySelector('[x-data="beadsApp()"]')).selectedIssue?.id,
+        executed: window.__viewerPayloads,
+        renders: window.__dependencyRenders,
+        diagram: document.querySelector('[x-ref="depGraph"]')?.innerHTML,
+      }));
+      await writeFile(path.join(path.dirname(dependencyExport), scenario.name.replaceAll(' ', '-') + '.json'),
+        JSON.stringify({ scenario: scenario.name, completed, dialogs, ...evidence }, null, 2));
+    }
+  });
+}
+
+test('bottlenecks: real WASM bounds fallback work at 500/501 nodes and omits zero rankings', async t => {
+  const page = await openViewer(t, false, '#/insights');
+  await page.waitForFunction(() => window.beadsViewer.GRAPH_STATE.ready);
+  const cases = [
+    { count: 500, shape: 'chains', mode: 'available', exact: 1, samples: [], positive: true },
+    { count: 501, shape: 'chains', mode: 'available', exact: 0, samples: [100], positive: true },
+    { count: 501, shape: 'empty', mode: 'available', exact: 0, samples: [], positive: false },
+    { count: 500, shape: 'pairs', mode: 'available', exact: 1, samples: [], positive: false },
+    { count: 501, shape: 'pairs', mode: 'available', exact: 0, samples: [100], positive: false },
+    { count: 501, shape: 'chains', mode: 'missing', exact: 0, samples: [], positive: false },
+    { count: 501, shape: 'chains', mode: 'throwing', exact: 0, samples: [100], positive: false },
+    { count: 501, shape: 'chains', mode: 'precomputed', exact: 0, samples: [], positive: true },
+  ];
+  for (const scenario of cases) {
+    const observed = await page.evaluate(({ count, shape, mode }) => {
+      const viewer = window.beadsViewer;
+      const graph = new window.bvGraphWasm.DiGraph();
+      const previous = viewer.GRAPH_STATE.graph;
+      const db = viewer.DB_STATE.db;
+      const calls = { exact: 0, samples: [] };
+      db.run('SAVEPOINT bottleneck_fixture');
+      try {
+        for (let index = 0; index < count; index += 1) {
+          const id = `boundary-${String(index).padStart(5, '0')}`;
+          graph.addNode(id);
+          db.run(`INSERT INTO issue_overview_mv
+            (id, title, description, status, priority, issue_type, labels, betweenness)
+            VALUES (?, ?, '', 'open', 2, 'task', '[]', 0)`, [id, `Boundary issue ${index}`]);
+        }
+        const stride = shape === 'chains' ? 3 : 2;
+        if (shape !== 'empty') {
+          for (let index = 0; index + stride - 1 < count; index += stride) {
+            graph.addEdge(index, index + 1);
+            if (shape === 'chains') graph.addEdge(index + 1, index + 2);
+          }
+        }
+        const exact = graph.betweenness.bind(graph);
+        const approximate = graph.betweennessApprox.bind(graph);
+        graph.betweenness = () => {
+          calls.exact += 1;
+          if (count > 500) throw new Error('Unbounded exact betweenness attempted');
+          return exact();
+        };
+        graph.betweennessApprox = mode === 'missing' ? undefined : samples => {
+          calls.samples.push(samples);
+          if (mode === 'throwing') throw new Error('Deliberately unavailable approximate betweenness');
+          return approximate(samples);
+        };
+        if (mode === 'precomputed') {
+          db.run("UPDATE issue_overview_mv SET betweenness = 0.125 WHERE id = 'boundary-00000'");
+        }
+        // The algorithm and SQL engine are real. Wrappers only observe calls or
+        // inject the explicitly named missing/failing optional-library cases.
+        viewer.GRAPH_STATE.graph = graph;
+        const top = viewer.getTopByBetweenness(10).map(issue => ({ id: issue.id, value: issue.betweenness }));
+        return { ...calls, top };
+      } finally {
+        viewer.GRAPH_STATE.graph = previous;
+        graph.free();
+        db.run('ROLLBACK TO bottleneck_fixture');
+        db.run('RELEASE bottleneck_fixture');
+      }
+    }, scenario);
+    const label = `${scenario.count} nodes, ${scenario.shape}, ${scenario.mode}`;
+    assert.equal(observed.exact, scenario.exact, `${label}: exact-call count`);
+    assert.deepEqual(observed.samples, scenario.samples, `${label}: bounded sampling`);
+    if (scenario.positive) {
+      assert.ok(observed.top.length > 0 && observed.top.length <= 10, `${label}: real positive bottlenecks are returned`);
+      assert.ok(observed.top.every(issue => Number.isFinite(issue.value) && issue.value > 0),
+        `${label}: returned scores are finite and strictly positive`);
+      if (scenario.mode === 'precomputed') {
+        assert.deepEqual(observed.top, [{ id: 'boundary-00000', value: 0.125 }], 'exported SQL scores retain precedence');
+      } else {
+        assert.ok(observed.top.every(issue => Number(issue.id.slice('boundary-'.length)) % 3 === 1),
+          `${label}: only internal chain vertices are bottlenecks`);
+      }
+    } else {
+      assert.deepEqual(observed.top, [], `${label}: zero or unavailable metrics do not invent rankings`);
+    }
+  }
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await results(page, allIds, '');
+});
+
+for (const mode of ['available', 'missing', 'throwing']) {
+  test(`bottlenecks: actual 10002-issue export loads with ${mode} approximation`, async t => {
+    const fixturePath = await exportedBottleneckFixture(t);
+    const page = await openViewer(t, false, '#/insights', false, fixturePath, async page => {
+      await page.addInitScript(failure => {
+        window.__bottleneckCalls = { exact: 0, samples: [] };
+        document.addEventListener('alpine:init', () => {
+          const state = window.beadsViewer.GRAPH_STATE;
+          let current = state.graph;
+          Object.defineProperty(state, 'graph', {
+            configurable: true,
+            get: () => current,
+            set(graph) {
+              current = graph;
+              if (!graph) return;
+              const exact = graph.betweenness.bind(graph);
+              const approximate = graph.betweennessApprox.bind(graph);
+              graph.betweenness = () => {
+                window.__bottleneckCalls.exact += 1;
+                // A broken threshold fails promptly instead of hanging a test
+                // with the very unbounded computation this regression prevents.
+                if (graph.nodeCount() > 500) throw new Error('Unbounded exact betweenness attempted');
+                return exact();
+              };
+              graph.betweennessApprox = failure === 'missing' ? undefined : samples => {
+                window.__bottleneckCalls.samples.push(samples);
+                if (failure === 'throwing') throw new Error('Deliberately unavailable approximate betweenness');
+                return approximate(samples);
+              };
+            },
+          });
+        }, { once: true });
+      }, mode);
+    });
+    let observed;
+    try {
+      observed = await page.evaluate(() => {
+        const viewer = window.beadsViewer;
+        const app = Alpine.$data(document.querySelector('[x-data="beadsApp()"]'));
+        return {
+          calls: window.__bottleneckCalls,
+          sql: viewer.execQuery(`SELECT COUNT(*) AS total,
+            SUM(CASE WHEN betweenness > 0 THEN 1 ELSE 0 END) AS positive
+            FROM issue_overview_mv`)[0],
+          nodes: viewer.GRAPH_STATE.graph.nodeCount(),
+          edges: viewer.GRAPH_STATE.graph.edgeCount(),
+          loading: app.loading,
+          rankings: app.topByBetweenness.map(issue => ({ id: issue.id, value: issue.betweenness })),
+        };
+      });
+      assert.deepEqual(observed.sql, { total: 10002, positive: 0 },
+        'real export exceeds the Rust skip threshold and supplies no positive SQL metric');
+      assert.equal(observed.nodes, 10002, 'the real WASM graph contains every exported vertex');
+      assert.equal(observed.edges, 6668, 'the real graph contains the exported three-node chains');
+      assert.equal(observed.loading, false, 'the complete dashboard finishes initialization');
+      assert.equal(observed.calls.exact, 0, 'large exports never attempt main-thread exact betweenness');
+      const panel = page.locator('.metric-panel-premium').filter({ has: page.getByRole('heading', { name: 'Bottlenecks', exact: true }) });
+      if (mode === 'available') {
+        assert.ok(observed.calls.samples.length > 0 && observed.calls.samples.every(samples => samples === 100),
+          'initialization invokes the real approximate algorithm with a bounded sample count');
+        assert.ok(observed.rankings.length > 0 && observed.rankings.length <= 10,
+          'skipped exporter metrics are filled by actual positive sampled scores');
+        assert.ok(observed.rankings.every(issue => Number.isFinite(issue.value) && issue.value > 0
+          && Number(issue.id.slice('fixture-'.length)) % 3 === 1),
+        'only internal chain vertices receive positive bottleneck rankings');
+        assert.equal(await panel.locator('.metric-item').count(), Math.min(5, observed.rankings.length));
+        const first = observed.rankings[0];
+        await panel.getByText(`Chain issue ${first.id.slice('fixture-'.length)}`, { exact: true }).waitFor({ state: 'visible' });
+      } else {
+        assert.deepEqual(observed.rankings, [], 'optional metric failure does not fabricate bottlenecks');
+        if (mode === 'missing') assert.deepEqual(observed.calls.samples, []);
+        else assert.ok(observed.calls.samples.length > 0 && observed.calls.samples.every(samples => samples === 100));
+        await panel.getByText('No betweenness data available', { exact: true }).waitFor({ state: 'visible' });
+      }
+      await page.getByRole('link', { name: 'Issues', exact: true }).click();
+      await page.locator(inputSelector).fill('09999');
+      await results(page, ['fixture-09999'], '09999');
+    } finally {
+      const search = await viewerSearchState(page);
+      await writeFile(path.join(path.dirname(bottleneckExport), `approximation-${mode}.json`),
+        JSON.stringify({ mode, ...observed, search }, null, 2));
+    }
+  });
+}
+
+async function standaloneGraphState(page) {
+  return page.evaluate(() => {
+    const graph = Graph.graphData();
+    const endpoint = value => typeof value === 'object' ? value.id : value;
+    const visibility = Graph.nodeVisibility();
+    const visible = typeof visibility === 'function' ? visibility : () => visibility;
+    const linkVisibility = Graph.linkVisibility();
+    const visibleLink = typeof linkVisibility === 'function' ? linkVisibility : () => linkVisibility;
+    const color = Graph.linkColor();
+    return {
+      summary: Object.fromEntries(['nodes', 'edges', 'actionable', 'blocked']
+        .map(key => [key, Number(document.getElementById('stat-' + key).textContent)])),
+      blockers: graph.nodes.map(node => [node.id, node.open_blocker_count]).sort((a, b) => a[0].localeCompare(b[0])),
+      actionableIds: graph.nodes.filter(node => node.is_actionable).map(node => node.id).sort(),
+      dependencyBlockedIds: graph.nodes.filter(node => node.is_dependency_blocked).map(node => node.id).sort(),
+      links: graph.links.map(link => [endpoint(link.source), endpoint(link.target), link.type]),
+      visibleIds: graph.nodes.filter(visible).map(node => node.id).sort(),
+      visibleLinks: graph.links.filter(visibleLink).map(link => [endpoint(link.source), endpoint(link.target), link.type]),
+      visibleText: document.getElementById('stat-visible').textContent.trim(),
+      filters: Object.fromEntries(['status', 'type', 'priority', 'label']
+        .map(key => [key, document.getElementById('filter-' + key).value])),
+      path: {
+        active: document.getElementById('btn-path').classList.contains('active'),
+        pressed: document.getElementById('btn-path').getAttribute('aria-pressed'),
+        banner: document.getElementById('pathfinder-banner').classList.contains('visible'),
+        start: pathStartNode?.id || null,
+        selected: selectedNode?.id || null,
+        highlights: [...highlightedNodes].sort(),
+        highlightedLinks: graph.links
+          .filter(link => typeof color === 'function' && color(link) === '#fbbf24aa')
+          .map(link => [endpoint(link.source), endpoint(link.target)]),
+      },
+      toast: document.getElementById('toast').textContent,
+    };
+  });
+}
+
+async function openStandaloneGraph(t) {
+  const fixturePath = await exportedStandaloneFixture(t);
+  const browser = await chromium.launch({
+    headless: true,
+    args: executablePath ? [
+      '--no-sandbox', '--disable-dev-shm-usage', '--no-zygote',
+      '--use-gl=angle', '--use-angle=swiftshader',
+    ] : [],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  let context;
+  let page;
+  const errors = [];
+  const dialogs = [];
+  const externalRequests = [];
+  t.after(async () => {
+    try {
+      let state;
+      try { state = page && !page.isClosed() ? await standaloneGraphState(page) : null; }
+      catch (error) { state = { error: error.message }; }
+      await writeFile(path.join(standaloneExport, t.name.replace(/[^a-z0-9]+/gi, '-') + '.json'),
+        JSON.stringify({ state, errors, dialogs, externalRequests }, null, 2));
+      assert.deepEqual(errors, [], 'standalone dashboard has no uncaught browser errors');
+      assert.deepEqual(dialogs, [], 'standalone dashboard opens no unexpected dialogs');
+      assert.deepEqual(externalRequests, [], 'standalone dashboard runs without external resources');
+    } finally {
+      if (context) await context.close();
+      await browser.close();
+    }
+  });
+  context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
+  page = await context.newPage();
+  page.setDefaultTimeout(10000);
+  page.setDefaultNavigationTimeout(30000);
+  page.on('pageerror', error => errors.push({ name: error.name, message: error.message }));
+  page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.dismiss(); });
+  await page.route('**/*', request => {
+    if (new URL(request.request().url()).origin !== origin) {
+      externalRequests.push(request.request().url());
+      return request.abort();
+    }
+    return request.continue();
+  });
+  await page.goto(origin + '/' + fixturePath);
+  await page.waitForFunction(count => typeof Graph !== 'undefined'
+    && Graph.graphData().nodes.length === count
+    && document.querySelector('#stat-visible .stat-value')?.textContent === String(count),
+  standaloneIssues.length);
+  return page;
+}
+
+async function clickStandaloneNode(page, id, contextMenu = false) {
+  await page.evaluate(({ issueId, rightClick }) => {
+    const node = Graph.graphData().nodes.find(item => item.id === issueId);
+    if (!node) throw new Error('Exported graph is missing node ' + issueId);
+    if (rightClick) {
+      const bounds = document.getElementById('graph-container').getBoundingClientRect();
+      Graph.onNodeRightClick()(node, new MouseEvent('contextmenu', {
+        clientX: bounds.left + 100, clientY: bounds.top + 100, cancelable: true,
+      }));
+    } else {
+      // Drive the installed canvas callback with its real exported node. Tests
+      // never call findPath/setPathFinder directly or supply a fake graph.
+      Graph.onNodeClick()(node, new MouseEvent('click'));
+    }
+  }, { issueId: id, rightClick: contextMenu });
+}
+
+async function assertStandalonePath(page, expected) {
+  const state = await standaloneGraphState(page);
+  assert.deepEqual(state.path.highlights, [...expected].sort(), 'the actual renderer highlights the shortest path');
+  assert.equal(state.toast, 'Path: ' + expected.length + ' nodes');
+  assert.equal(state.path.active, false, 'completed path selection exits toolbar mode');
+  assert.equal(state.path.banner, false, 'completed path selection hides the prompt');
+  assert.equal(state.path.pressed, 'false');
+  assert.equal(state.path.start, null, 'completed path selection clears the pending endpoint');
+  for (let index = 1; index < expected.length; index++) {
+    const first = expected[index - 1];
+    const second = expected[index];
+    assert.ok(state.path.highlightedLinks.some(([source, target]) =>
+      source === first && target === second || source === second && target === first),
+    'the actual link-color callback highlights each path connection');
+  }
+}
+
+test('standalone: actual graph export counts unresolved blockers and actionable statuses', async t => {
+  const page = await openStandaloneGraph(t);
+  const state = await standaloneGraphState(page);
+  assert.deepEqual(state.summary, { nodes: 15, edges: 10, actionable: 7, blocked: 3 },
+    'core readiness includes inherited blockers and future deferrals while retaining every visual relationship');
+  assert.deepEqual(state.actionableIds,
+    ['__proto__', 'info-only', 'parent-only', 'path-root', 'spare', 'unknown-ref', 'working-resolved'],
+    'exported core readiness excludes both inherited-child and future-deferred');
+  assert.deepEqual(state.dependencyBlockedIds, ['inherited-child', 'path-leaf', 'path-middle'],
+    'inherited blockers count as dependency-blocked; scheduled deferral alone does not');
+  const expectedBlockers = standaloneIssues.map(issue => [issue.id,
+    ['path-middle', 'path-leaf'].includes(issue.id) ? 1 : 0]).sort((a, b) => a[0].localeCompare(b[0]));
+  assert.deepEqual(state.blockers, expectedBlockers, 'one prerequisite counts once across blocking relationship types');
+  assert.ok(state.links.some(link => link[0] === 'info-only' && link[2] === 'related'),
+    'nonblocking relationships remain in the displayed graph');
+  assert.ok(state.links.some(link => link[0] === 'parent-only' && link[2] === 'parent-child'),
+    'hierarchy relationships remain in the displayed graph');
+  assert.equal(state.links.filter(link => link[0] === 'path-middle' && link[1] === 'path-root').length, 2,
+    'readiness deduplication preserves distinct visual relationship types');
+  await clickStandaloneNode(page, 'path-root');
+  const description = page.locator('#docked-description-content');
+  await description.waitFor({ state: 'visible' });
+  assert.equal(await description.locator('strong').textContent(), 'Markdown');
+  assert.equal(await description.locator('code').textContent(), 'code');
+  assert.equal(await description.locator('a').getAttribute('href'), 'https://example.invalid/docs');
+});
+
+test('standalone: toolbar path finder uses selected nodes and retains the rendered path', async t => {
+  const page = await openStandaloneGraph(t);
+  await clickStandaloneNode(page, 'path-root');
+  await page.locator('#btn-path').click();
+  await clickStandaloneNode(page, 'path-leaf');
+  await assertStandalonePath(page, ['path-root', 'path-middle', 'path-leaf']);
+  await page.evaluate(() => Graph.onNodeHover()(null));
+  await assertStandalonePath(page, ['path-root', 'path-middle', 'path-leaf']);
+
+  await clickStandaloneNode(page, 'path-root');
+  await page.locator('#btn-path').click();
+  await clickStandaloneNode(page, '__proto__');
+  await assertStandalonePath(page, ['path-root', 'gone', '__proto__']);
+
+  await clickStandaloneNode(page, 'path-root');
+  await page.locator('#btn-path').click();
+  await clickStandaloneNode(page, 'path-root');
+  await assertStandalonePath(page, ['path-root']);
+
+  await clickStandaloneNode(page, 'path-root');
+  await page.locator('#btn-path').click();
+  await page.locator('#search-input').fill('Disconnected');
+  await page.locator('.search-result-item[data-id="spare"]').click();
+  let state = await standaloneGraphState(page);
+  assert.equal(state.path.selected, 'spare', 'search selects its actual result');
+  assert.equal(state.path.active, false, 'ordinary selection cancels the pending canvas path');
+  assert.equal(state.path.start, null);
+  await clickStandaloneNode(page, 'path-leaf');
+  state = await standaloneGraphState(page);
+  assert.equal(state.path.selected, 'path-leaf', 'the next canvas click does not complete a stale path');
+  assert.equal(state.path.active, false);
+});
+
+test('standalone: keyboard path finder selects both endpoints and handles cancellation and disconnection', async t => {
+  const page = await openStandaloneGraph(t);
+  await page.keyboard.press('p');
+  await clickStandaloneNode(page, 'path-root');
+  await clickStandaloneNode(page, 'path-leaf');
+  await assertStandalonePath(page, ['path-root', 'path-middle', 'path-leaf']);
+
+  await page.locator('#btn-reset').click();
+  await page.keyboard.press('p');
+  await clickStandaloneNode(page, 'path-root');
+  await page.keyboard.press('Escape');
+  await clickStandaloneNode(page, 'spare');
+  let state = await standaloneGraphState(page);
+  assert.equal(state.path.selected, 'spare', 'Escape returns subsequent clicks to ordinary selection');
+  assert.equal(state.path.active, false);
+  assert.equal(state.path.start, null);
+
+  await clickStandaloneNode(page, 'path-root');
+  await page.keyboard.press('p');
+  await clickStandaloneNode(page, 'spare');
+  state = await standaloneGraphState(page);
+  assert.equal(state.toast, 'No path found');
+  assert.deepEqual(state.path.highlights, [], 'disconnected endpoints leave no misleading path highlight');
+  assert.equal(state.path.active, false);
+  assert.equal(state.path.start, null);
+
+  await page.keyboard.press('p');
+  await page.keyboard.press('p');
+  assert.equal((await standaloneGraphState(page)).path.active, false, 'P toggles the same mode off');
+});
+
+test('standalone: context-menu paths share cancellation and completion with the toolbar', async t => {
+  const page = await openStandaloneGraph(t);
+  await clickStandaloneNode(page, 'path-root', true);
+  await page.locator('#ctx-path').click();
+  await page.keyboard.press('Escape');
+  await clickStandaloneNode(page, 'spare');
+  assert.equal((await standaloneGraphState(page)).path.selected, 'spare',
+    'Escape cancels a context-menu path before the next node is selected');
+
+  await clickStandaloneNode(page, 'path-root', true);
+  await page.locator('#ctx-path').click();
+  await clickStandaloneNode(page, 'path-leaf');
+  await assertStandalonePath(page, ['path-root', 'path-middle', 'path-leaf']);
+
+  await clickStandaloneNode(page, 'path-root', true);
+  await page.locator('#ctx-path').click();
+  await page.locator('#btn-path').click();
+  await clickStandaloneNode(page, 'spare');
+  const state = await standaloneGraphState(page);
+  assert.equal(state.path.selected, 'spare', 'toolbar toggle cancels the context-menu path');
+  assert.equal(state.path.active, false);
+  assert.equal(state.path.start, null);
+});
+
+test('standalone: composed filters report visible nodes and reset clears every pending control', async t => {
+  const page = await openStandaloneGraph(t);
+  const expectVisible = async ids => {
+    const state = await standaloneGraphState(page);
+    assert.deepEqual(state.visibleIds, [...ids].sort(), 'the actual graph visibility predicate matches the controls');
+    assert.equal(state.visibleText, ids.length + ' visible', 'displayed count matches the visible graph');
+    const visibleIds = new Set(ids);
+    assert.deepEqual(state.visibleLinks,
+      state.links.filter(([source, target]) => visibleIds.has(source) && visibleIds.has(target)),
+      'the installed link visibility predicate hides links and arrows to filtered-out nodes');
+  };
+  await clickStandaloneNode(page, 'path-root');
+  await page.locator('#btn-path').click();
+  await page.locator('#filter-label').selectOption('core');
+  await expectVisible(['path-root', 'path-middle', 'parent-only']);
+  await page.locator('#filter-priority').selectOption('1');
+  await expectVisible(['path-middle']);
+  await page.locator('#filter-status').selectOption('open');
+  await expectVisible([]);
+  await page.locator('#filter-status').selectOption('');
+  await page.locator('#filter-type').selectOption('bug');
+  await expectVisible([]);
+  await page.locator('#search-input').fill('Waiting');
+  await page.locator('#search-results').waitFor({ state: 'visible' });
+  await page.locator('#btn-reset').click();
+  await expectVisible(standaloneIssues.map(issue => issue.id));
+  const reset = await standaloneGraphState(page);
+  assert.deepEqual(reset.filters, { status: '', type: '', priority: '', label: '' });
+  assert.equal(reset.path.active, false);
+  assert.equal(reset.path.start, null);
+  assert.equal(reset.path.selected, null);
+  assert.equal(await page.locator('#search-input').inputValue(), '');
+  assert.equal(await page.locator('#search-results').isVisible(), false);
+
+  await page.locator('#filter-priority').selectOption('2');
+  await expectVisible(['path-leaf', 'info-only', 'spare', 'parked-blocked', 'parked-deferred', 'unknown-ref']);
+  await page.locator('#filter-status').selectOption('open');
+  await expectVisible(['path-leaf', 'info-only', 'spare', 'unknown-ref']);
+  await page.locator('#filter-label').selectOption('ui');
+  await expectVisible(['path-leaf', 'info-only', 'spare']);
+  await page.locator('#filter-type').selectOption('bug');
+  await expectVisible(['path-leaf']);
+});

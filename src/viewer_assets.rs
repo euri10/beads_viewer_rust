@@ -339,12 +339,15 @@ mod tests {
         for prefix in ["src=\"", "href=\""] {
             let mut search_from = 0;
             while let Some(start) = html[search_from..].find(prefix) {
-                let abs_start = search_from + start + prefix.len();
+                let attr_start = search_from + start;
+                let abs_start = attr_start + prefix.len();
                 if let Some(end) = html[abs_start..].find('"') {
                     let path = &html[abs_start..abs_start + end];
                     search_from = abs_start + end + 1;
-                    // Skip fragment, data:, blob:, empty, or JS expression refs
+                    // Skip fragment, data:, blob:, empty, or JS expression refs,
+                    // including bound attributes (`:href="issuesHref"`).
                     if path.is_empty()
+                        || (attr_start > 0 && html.as_bytes()[attr_start - 1] == b':')
                         || path.starts_with('#')
                         || path.starts_with("data:")
                         || path.starts_with("blob:")
@@ -684,12 +687,16 @@ mod tests {
         let js = std::str::from_utf8(viewer.bytes).expect("valid utf8");
 
         assert!(
-            js.contains("const mermaidBackdropView = JSON.stringify(this.view);"),
+            js.contains("const backdropView = this.view;"),
             "viewer runtime must capture the current backdrop view when wiring Mermaid issue links"
         );
         assert!(
-            js.contains("diagram += `  click ${nodeId} call window.beadsViewer.navigateToIssue(\"${id}\", ${mermaidBackdropView})\\n`;"),
+            js.contains("navigateToIssue(id, backdropView);"),
             "viewer runtime must preserve backdrop context for Mermaid issue-to-issue navigation"
+        );
+        assert!(
+            !js.contains("call window.beadsViewer.navigateToIssue("),
+            "viewer runtime must not interpolate issue IDs into Mermaid callback source"
         );
     }
 

@@ -133,8 +133,10 @@ const DB_STATE = {
 // Graph engine state (WASM)
 const GRAPH_STATE = {
   wasm: null,         // WASM module (bv_graph.js)
-  graph: null,        // DiGraph instance
+  graph: null,        // Dependency graph: dependent -> blocker (metrics)
+  planningGraph: null, // Completion graph: blocker -> dependent (unblocks)
   nodeMap: null,      // Map<string, number> - issue ID to node index
+  initPromise: null,  // Share one WASM initialization across concurrent callers
   ready: false,       // true when graph is loaded
 };
 
@@ -288,18 +290,19 @@ function cleanupWasm() {
   }
   WASM_ALLOCATIONS.subgraphs = [];
 
-  // Free the main graph
-  if (GRAPH_STATE.graph && typeof GRAPH_STATE.graph.free === 'function') {
-    try {
-      GRAPH_STATE.graph.free();
-      console.log('[WASM Memory] Main graph freed');
-    } catch (e) {
-      console.warn('[WASM Memory] Error freeing main graph:', e);
+  // Both graphs own WASM allocations, including after a failed initialization.
+  for (const key of ['graph', 'planningGraph']) {
+    if (GRAPH_STATE[key] && typeof GRAPH_STATE[key].free === 'function') {
+      try {
+        GRAPH_STATE[key].free();
+      } catch (e) {
+        console.warn(`[WASM Memory] Error freeing ${key}:`, e);
+      }
+      GRAPH_STATE[key] = null;
     }
-    GRAPH_STATE.graph = null;
-    GRAPH_STATE.ready = false;
-    GRAPH_STATE.nodeMap = null;
   }
+  GRAPH_STATE.ready = false;
+  GRAPH_STATE.nodeMap = null;
 
   console.log(`[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`);
 }
@@ -401,7 +404,6 @@ async function loadFromOPFS(cacheKey) {
     const file = await handle.getFile();
     const buffer = await file.arrayBuffer();
     DIAGNOSTICS.opfs = true;
-    DIAGNOSTICS.dbSizeBytes = buffer.byteLength;
     console.log(`[OPFS] Loaded ${buffer.byteLength} bytes from cache`);
     return new Uint8Array(buffer);
   } catch (err) {
@@ -440,6 +442,21 @@ async function cacheToOPFS(data, cacheKey) {
 }
 
 /**
+ * Discard only the current cache entry when it cannot be verified or opened.
+ */
+async function discardOPFSCache(cacheKey) {
+  if (!('storage' in navigator) || !navigator.storage.getDirectory) return;
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(`beads-${cacheKey}.sqlite3`);
+  } catch (err) {
+    if (err.name !== 'NotFoundError') {
+      console.warn('[OPFS] Could not discard invalid cache:', err.message);
+    }
+  }
+}
+
+/**
  * Remove stale OPFS cache entries (old hashes and the legacy "default" key).
  * Runs in the background after a successful cache hit to free storage.
  */
@@ -465,41 +482,126 @@ async function cleanStaleOPFS(currentCacheKey) {
 }
 
 /**
- * Fetch JSON file
+ * Validate the manifest emitted by the SQLite exporter before loading bytes.
+ * Chunk paths are canonical export paths, never arbitrary URLs from the manifest.
  */
-async function fetchJSON(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+function validateDatabaseConfig(config) {
+  const fail = message => {
+    throw new Error(`Invalid database manifest: ${message}`);
+  };
+  const validHash = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+  const positiveSize = value => Number.isSafeInteger(value) && value > 0;
+
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    fail('expected an object');
+  }
+  if (!validHash(config.hash)) fail('hash must be a SHA-256 digest');
+  if (!positiveSize(config.total_size)) fail('total_size must be a positive safe integer');
+  if (!positiveSize(config.chunk_size)) fail('chunk_size must be a positive safe integer');
+  if (typeof config.chunked !== 'boolean') fail('chunked must be a boolean');
+  if (!Number.isSafeInteger(config.chunk_count) || config.chunk_count < 0) {
+    fail('chunk_count must be a nonnegative safe integer');
+  }
+  if (config.chunks !== undefined && !Array.isArray(config.chunks)) {
+    fail('chunks must be an array');
+  }
+
+  const chunks = config.chunks || [];
+  if (chunks.length !== config.chunk_count) fail('chunk_count does not match chunks');
+  if (!config.chunked) {
+    if (config.chunk_count !== 0) fail('a single-file database cannot declare chunks');
+    return config;
+  }
+  if (config.chunk_count === 0) fail('a chunked database must declare its chunks');
+
+  let totalSize = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) {
+      fail(`chunk ${i} must be an object`);
+    }
+    if (chunk.path !== `chunks/${String(i).padStart(5, '0')}.bin`) {
+      fail(`chunk ${i} has an invalid export path`);
+    }
+    if (!validHash(chunk.hash)) fail(`chunk ${i} must have a SHA-256 digest`);
+    if (!positiveSize(chunk.size) || chunk.size > config.chunk_size) {
+      fail(`chunk ${i} has an invalid size`);
+    }
+    totalSize += chunk.size;
+    if (!Number.isSafeInteger(totalSize) || totalSize > config.total_size) {
+      fail('chunk sizes exceed total_size');
+    }
+  }
+  if (totalSize !== config.total_size) fail('chunk sizes do not match total_size');
+  return config;
 }
 
 /**
- * Load database chunks and reassemble
+ * Require working Web Crypto; verification must never become an optional check.
  */
-async function loadChunks(config) {
+function databaseDigest() {
+  let subtle;
+  try {
+    subtle = globalThis.crypto?.subtle;
+    if (!subtle || typeof subtle.digest !== 'function') throw new Error('Web Crypto unavailable');
+  } catch {
+    throw new Error('SHA-256 database verification requires Web Crypto. Open this dashboard using HTTPS or localhost.');
+  }
+  return async data => {
+    let digest;
+    try {
+      // Hash the view, including its byte offset and length, not its backing buffer.
+      digest = await subtle.digest('SHA-256', data);
+    } catch (err) {
+      throw new Error(`SHA-256 database verification could not run: ${err?.message || String(err)}. Open this dashboard using HTTPS or localhost with Web Crypto enabled.`);
+    }
+    if (!(digest instanceof ArrayBuffer) || digest.byteLength !== 32) {
+      throw new Error('SHA-256 database verification returned an invalid digest.');
+    }
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  };
+}
+
+class DatabaseIntegrityError extends Error {}
+
+/**
+ * Verify original export bytes before opening SQLite or writing the OPFS cache.
+ */
+async function verifyDatabaseBytes(data, size, hash, label, digest) {
+  if (data.byteLength !== size) {
+    throw new DatabaseIntegrityError(`${label} size mismatch: expected ${size} bytes, received ${data.byteLength}.`);
+  }
+  if (await digest(data) !== hash) {
+    throw new DatabaseIntegrityError(`${label} SHA-256 mismatch: the bytes do not match the exported manifest.`);
+  }
+}
+
+/**
+ * Verify individual database chunks and reassemble them in manifest order.
+ */
+async function loadChunks(config, digest = databaseDigest()) {
+  validateDatabaseConfig(config);
   const chunks = [];
-  const totalChunks = config.chunk_count;
   // Use same cache-buster for all chunks to ensure consistency
   const cacheBuster = `?_t=${Date.now()}`;
 
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkPath = `./chunks/${String(i).padStart(5, '0')}.bin${cacheBuster}`;
-    const response = await fetch(chunkPath);
-    if (!response.ok) throw new Error(`Failed to load chunk ${i}`);
-    const buffer = await response.arrayBuffer();
-    chunks.push(new Uint8Array(buffer));
+  for (const chunk of config.chunks) {
+    const response = await fetch(`./${chunk.path}${cacheBuster}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Failed to load ${chunk.path}: HTTP ${response.status}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    await verifyDatabaseBytes(bytes, chunk.size, chunk.hash, chunk.path, digest);
+    chunks.push(bytes);
   }
 
-  // Concatenate all chunks
-  const totalSize = chunks.reduce((sum, c) => sum + c.length, 0);
-  const combined = new Uint8Array(totalSize);
+  const combined = new Uint8Array(config.total_size);
   let offset = 0;
   for (const chunk of chunks) {
     combined.set(chunk, offset);
     offset += chunk.length;
   }
 
-  console.log(`[Chunks] Reassembled ${totalChunks} chunks, ${totalSize} bytes`);
+  await verifyDatabaseBytes(combined, config.total_size, config.hash, 'Assembled database', digest);
+  console.log(`[Chunks] Verified ${config.chunk_count} chunks, ${combined.byteLength} bytes`);
   return combined;
 }
 
@@ -510,76 +612,89 @@ async function loadDatabase(updateStatus) {
   const SQL = await initSqlJs();
 
   updateStatus?.('Checking cache...');
+  DB_STATE.cacheKey = null;
+  DB_STATE.source = 'unknown';
+  DIAGNOSTICS.dbSource = 'unknown';
+  DIAGNOSTICS.dbSizeBytes = 0;
 
-  // Load config to get cache key
-  // Use cache-busting query param to ensure we always get the latest config
-  // This prevents CDN caching issues on GitHub Pages where stale config
-  // could cause OPFS to serve an outdated database
-  let config = null;
-  try {
-    const cacheBuster = `?_t=${Date.now()}`;
-    config = await fetchJSON('./beads.sqlite3.config.json' + cacheBuster);
-    DB_STATE.cacheKey = config.hash || null;
-  } catch {
-    // Config file may not exist for small DBs
-  }
-
-  // Try OPFS cache first
-  if (DB_STATE.cacheKey) {
-    const cached = await loadFromOPFS(DB_STATE.cacheKey);
-    if (cached) {
-      DB_STATE.db = new SQL.Database(cached);
-      DB_STATE.source = 'cache';
-      DIAGNOSTICS.dbSource = 'cache';
-      // Clean up stale cache entries in the background
-      cleanStaleOPFS(DB_STATE.cacheKey).catch(() => {});
-      return DB_STATE.db;
-    }
-  }
-
-  updateStatus?.('Loading database...');
-
-  // Check if database is chunked
+  let config;
   let dbData;
+  let source;
   try {
-    if (config?.chunked) {
-      updateStatus?.(`Loading ${config.chunk_count} chunks...`);
-      dbData = await loadChunks(config);
-      DB_STATE.source = 'chunks';
-      DIAGNOSTICS.dbSource = 'chunks';
-    } else {
-      // Load single file - try multiple paths
-      // Add cache-busting to avoid CDN serving stale database
-      const cacheBuster = `?_t=${Date.now()}`;
-      const paths = ['./beads.sqlite3' + cacheBuster, './data/beads.sqlite3' + cacheBuster];
-      let loaded = false;
+    // Every export includes this manifest. Missing or malformed config must
+    // not silently turn a verified load into an unverified fallback.
+    const cacheBuster = `?_t=${Date.now()}`;
+    const response = await fetch('./beads.sqlite3.config.json' + cacheBuster, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Could not load database manifest: HTTP ${response.status}`);
+    try {
+      config = validateDatabaseConfig(await response.json());
+    } catch (err) {
+      throw new Error(`Could not read database manifest: ${err.message || err}`);
+    }
+    const digest = databaseDigest();
+    DB_STATE.cacheKey = config.hash;
 
+    let cached = await loadFromOPFS(config.hash);
+    if (cached) {
+      try {
+        await verifyDatabaseBytes(cached, config.total_size, config.hash, 'Cached database', digest);
+      } catch (err) {
+        // Digest support failures are fatal; they do not establish a bad cache.
+        if (!(err instanceof DatabaseIntegrityError)) throw err;
+        console.warn('[OPFS] Discarding invalid database:', err.message);
+        await discardOPFSCache(config.hash);
+        cached = null;
+      }
+      if (cached) {
+        let database;
+        try {
+          database = new SQL.Database(cached);
+        } catch (err) {
+          console.warn('[OPFS] Cached database could not be opened:', err.message);
+          await discardOPFSCache(config.hash);
+        }
+        if (database) {
+          DB_STATE.db = database;
+          DB_STATE.source = 'cache';
+          DIAGNOSTICS.dbSource = 'cache';
+          DIAGNOSTICS.dbSizeBytes = cached.byteLength;
+          cleanStaleOPFS(config.hash).catch(() => {});
+          return database;
+        }
+      }
+    }
+
+    updateStatus?.('Loading database...');
+    if (config.chunked) {
+      updateStatus?.(`Loading ${config.chunk_count} chunks...`);
+      dbData = await loadChunks(config, digest);
+      source = 'chunks';
+    } else {
+      // Both known paths must satisfy the same manifest. A successful response
+      // with mismatched bytes is an integrity failure, not a fallback signal.
+      const paths = ['./beads.sqlite3' + cacheBuster, './data/beads.sqlite3' + cacheBuster];
       for (const path of paths) {
         try {
-          const response = await fetch(path);
+          const response = await fetch(path, { cache: 'no-store' });
           if (response.ok) {
-            const buffer = await response.arrayBuffer();
-            dbData = new Uint8Array(buffer);
-            DIAGNOSTICS.dbSizeBytes = buffer.byteLength;
-            DB_STATE.source = 'network';
-            DIAGNOSTICS.dbSource = 'network';
-            loaded = true;
+            dbData = new Uint8Array(await response.arrayBuffer());
             break;
           }
         } catch {
-          // Try next path
+          // A failed request may use the other known path, still verified below.
         }
       }
-
-      if (!loaded) {
-        throw new Error('Database not found at any known path');
-      }
+      if (!dbData) throw new Error('Database not found at any known path');
+      updateStatus?.('Verifying database...');
+      await verifyDatabaseBytes(dbData, config.total_size, config.hash, 'Downloaded database', digest);
+      source = 'network';
     }
   } catch (err) {
+    DB_STATE.db = null;
     showError({
-      title: 'Database Not Found',
-      message: 'Could not load the issues database.',
-      details: `${err.message}\n\nThe beads.sqlite3 file may be missing or corrupted.`,
+      title: 'Database Verification Failed',
+      message: 'The issues database could not be loaded safely.',
+      details: `${err.message}\n\nReload the page after the complete export has been published.`,
       actions: [
         { label: 'Reload Page', action: () => location.reload() },
       ],
@@ -591,6 +706,7 @@ async function loadDatabase(updateStatus) {
   try {
     DB_STATE.db = new SQL.Database(dbData);
   } catch (err) {
+    DB_STATE.db = null;
     showError({
       title: 'Database Corrupted',
       message: 'The database file could not be opened.',
@@ -603,12 +719,15 @@ async function loadDatabase(updateStatus) {
     throw err;
   }
 
-  // Cache for next time and clean up stale entries (e.g., legacy "default" key)
-  if (DB_STATE.cacheKey) {
-    updateStatus?.('Caching for offline...');
-    await cacheToOPFS(DB_STATE.db.export(), DB_STATE.cacheKey);
-    cleanStaleOPFS(DB_STATE.cacheKey).catch(() => {});
-  }
+  DB_STATE.source = source;
+  DIAGNOSTICS.dbSource = source;
+  DIAGNOSTICS.dbSizeBytes = dbData.byteLength;
+
+  // Keep the exact verified export bytes. SQLite reserialization can change
+  // the file representation and would no longer match the manifest digest.
+  updateStatus?.('Caching for offline...');
+  await cacheToOPFS(dbData, config.hash);
+  cleanStaleOPFS(config.hash).catch(() => {});
 
   return DB_STATE.db;
 }
@@ -650,11 +769,24 @@ function execScalar(sql, params = []) {
 // WASM Graph Engine - Live graph calculations
 // ============================================================================
 
+function isClosedStatus(status) {
+  return ['closed', 'tombstone'].includes(String(status || '').trim().toLowerCase());
+}
+
 /**
  * Initialize the WASM graph engine
  */
 async function initGraphEngine() {
   if (GRAPH_STATE.ready) return true;
+  if (!GRAPH_STATE.initPromise) {
+    GRAPH_STATE.initPromise = initializeGraphEngine().finally(() => {
+      GRAPH_STATE.initPromise = null;
+    });
+  }
+  return GRAPH_STATE.initPromise;
+}
+
+async function initializeGraphEngine() {
 
   // Check if we're already in fallback mode
   if (WASM_STATUS.fallbackMode) {
@@ -678,38 +810,43 @@ async function initGraphEngine() {
     window.bvGraphWasm = wasmModule;
 
     GRAPH_STATE.wasm = wasmModule;
-    GRAPH_STATE.graph = new wasmModule.DiGraph();
-    GRAPH_STATE.nodeMap = new Map();
-
     // Load graph data from SQLite
     if (!DB_STATE.db) {
       console.warn('[Graph] Database not loaded yet');
       return false;
     }
 
+    GRAPH_STATE.graph = new wasmModule.DiGraph();
+    GRAPH_STATE.planningGraph = new wasmModule.DiGraph();
+    GRAPH_STATE.nodeMap = new Map();
+
+    // Isolated issues are still vertices, and unknown dependency endpoints must
+    // never become phantom issues. Both graphs use the same node indices.
+    for (const { id } of execQuery('SELECT id FROM issues ORDER BY id')) {
+      const idx = GRAPH_STATE.graph.addNode(id);
+      GRAPH_STATE.planningGraph.addNode(id);
+      GRAPH_STATE.nodeMap.set(id, idx);
+    }
+
     const deps = execQuery(`
       SELECT issue_id, depends_on_id
       FROM dependencies
-      WHERE type = 'blocks'
+      WHERE LOWER(TRIM(type)) IN ('', 'blocks', 'waits-for', 'conditional-blocks')
     `);
 
+    const seen = new Set();
     for (const row of deps) {
-      const from = row.issue_id;
-      const to = row.depends_on_id;
+      const dependent = GRAPH_STATE.nodeMap.get(row.issue_id);
+      const blocker = GRAPH_STATE.nodeMap.get(row.depends_on_id);
+      if (dependent === undefined || blocker === undefined) continue;
+      const edge = `${dependent}:${blocker}`;
+      if (seen.has(edge)) continue;
+      seen.add(edge);
 
-      if (!GRAPH_STATE.nodeMap.has(from)) {
-        const idx = GRAPH_STATE.graph.addNode(from);
-        GRAPH_STATE.nodeMap.set(from, idx);
-      }
-      if (!GRAPH_STATE.nodeMap.has(to)) {
-        const idx = GRAPH_STATE.graph.addNode(to);
-        GRAPH_STATE.nodeMap.set(to, idx);
-      }
-
-      GRAPH_STATE.graph.addEdge(
-        GRAPH_STATE.nodeMap.get(from),
-        GRAPH_STATE.nodeMap.get(to)
-      );
+      // Rust's metric graph and rendered arrows follow dependency references.
+      // The bundled WASM readiness/cascade APIs instead follow completion flow.
+      GRAPH_STATE.graph.addEdge(dependent, blocker);
+      GRAPH_STATE.planningGraph.addEdge(blocker, dependent);
     }
 
     GRAPH_STATE.ready = true;
@@ -724,6 +861,7 @@ async function initGraphEngine() {
     return true;
   } catch (err) {
     console.warn('[Graph] WASM init failed:', err.message);
+    cleanupWasm();
     enableFallbackMode(`WASM load failed: ${err.message}`);
     return false;
   }
@@ -736,11 +874,11 @@ async function initGraphEngine() {
 function buildClosedSet() {
   if (!GRAPH_STATE.ready) return null;
 
-  const n = GRAPH_STATE.graph.nodeCount();
+  const n = GRAPH_STATE.planningGraph.nodeCount();
   const closed = new Uint8Array(n);
 
   const closedIssues = execQuery(`
-    SELECT id FROM issues WHERE status = 'closed'
+    SELECT id FROM issues WHERE LOWER(TRIM(status)) IN ('closed', 'tombstone')
   `);
 
   for (const row of closedIssues) {
@@ -792,13 +930,15 @@ function whatIfClose(issueId) {
   if (idx === undefined) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.whatIfClose(idx, closedSet);
+  if (closedSet[idx]) return null;
+  const result = GRAPH_STATE.planningGraph.whatIfClose(idx, closedSet);
 
   // Convert node indices back to issue IDs
-  if (result && result.cascade_ids) {
-    result.cascade_issue_ids = result.cascade_ids
-      .map(i => GRAPH_STATE.graph.nodeId(i))
-      .filter(Boolean);
+  if (result) {
+    result.unblocked_issue_ids = (result.unblocked_ids || [])
+      .map(i => GRAPH_STATE.planningGraph.nodeId(i)).filter(Boolean);
+    result.cascade_issue_ids = (result.cascade_ids || [])
+      .map(i => GRAPH_STATE.planningGraph.nodeId(i)).filter(Boolean);
   }
 
   return result;
@@ -811,28 +951,24 @@ function topWhatIf(limit = 10) {
   if (!GRAPH_STATE.ready) return [];
 
   const closedSet = buildClosedSet();
-  const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit);
+  const results = GRAPH_STATE.planningGraph.topWhatIf(closedSet, limit);
 
   // Enrich with issue IDs
   return (results || []).map(item => ({
     ...item,
-    issueId: GRAPH_STATE.graph.nodeId(item.node),
+    issueId: GRAPH_STATE.planningGraph.nodeId(item.node),
     result: item.result,
-  }));
+  })).filter(item => item.issueId);
 }
 
 /**
- * Get actionable issues (all blockers closed)
+ * Get work that the core analyzer marked ready in this exported snapshot.
+ * This also works when the optional browser graph engine is unavailable.
  */
 function getActionableIssues() {
-  if (!GRAPH_STATE.ready) return [];
-
-  const closedSet = buildClosedSet();
-  const indices = GRAPH_STATE.graph.actionableNodes(closedSet);
-
-  return (indices || [])
-    .map(idx => GRAPH_STATE.graph.nodeId(idx))
-    .filter(Boolean);
+  return execQuery(`
+    SELECT id FROM issue_overview_mv WHERE is_ready = 1 ORDER BY id
+  `).map(issue => issue.id);
 }
 
 /**
@@ -852,17 +988,17 @@ function getTopKSet(k = 5) {
   if (!GRAPH_STATE.ready) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.topkSet(closedSet, k);
+  const result = GRAPH_STATE.planningGraph.topkSet(closedSet, k);
 
   // Enrich with issue IDs
   if (result && result.items) {
     result.items = result.items.map(item => ({
       ...item,
-      issueId: GRAPH_STATE.graph.nodeId(item.node),
+      issueId: GRAPH_STATE.planningGraph.nodeId(item.node),
       unblocked_issue_ids: (item.unblocked_ids || [])
-        .map(i => GRAPH_STATE.graph.nodeId(i))
+        .map(i => GRAPH_STATE.planningGraph.nodeId(i))
         .filter(Boolean),
-    }));
+    })).filter(item => item.issueId);
   }
 
   return result;
@@ -924,11 +1060,12 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     params.push(filters.assignee);
   }
 
-	  // Blocked filter
-	  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
-    clauses.push(`(${col('blocked_by_ids')} IS NOT NULL AND ${col('blocked_by_ids')} <> '')`);
+  // Readiness comes from the core graph, including inherited blockers and
+  // scheduler deferrals. Direct relationship lists also contain closed issues.
+  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
+    clauses.push(`${col('is_blocked')} = 1`);
   } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
-    clauses.push(`(${col('blocked_by_ids')} IS NULL OR ${col('blocked_by_ids')} = '')`);
+    clauses.push(`${col('is_ready')} = 1`);
   }
 
   // Blocking filter (has items depending on it)
@@ -1068,7 +1205,7 @@ function getGraphViewData() {
   const dependencies = execQuery(`
     SELECT issue_id, depends_on_id, type
     FROM dependencies
-    WHERE type = 'blocks'
+    WHERE LOWER(TRIM(type)) IN ('', 'blocks', 'waits-for', 'conditional-blocks')
   `);
 
   return { issues, dependencies };
@@ -1157,6 +1294,11 @@ function searchIssues(term, options = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
 
+  // Decide the execution path before choosing SQL pagination. Without the
+  // optional hybrid libraries, SQL must apply the caller's offset itself.
+  const useHybrid = mode === 'hybrid'
+    && typeof HybridScorer !== 'undefined' && typeof HYBRID_PRESETS !== 'undefined';
+
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
   const baseSQL = `
       SELECT i.*,
@@ -1174,12 +1316,12 @@ function searchIssues(term, options = {}) {
   }
 
   let fetchLimit = limit;
-  if (mode === 'hybrid') {
+  if (useHybrid) {
     const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
     fetchLimit = Math.max(limit * 2, offset + limit, minCandidates);
   }
-  const fetchOffset = mode === 'hybrid' ? 0 : offset;
-  sql += ` ORDER BY ${BM25_EXPR} LIMIT ? OFFSET ?`;
+  const fetchOffset = useHybrid ? 0 : offset;
+  sql += ` ORDER BY ${BM25_EXPR}, i.id COLLATE BINARY LIMIT ? OFFSET ?`;
   queryParams.push(fetchLimit, fetchOffset);
 
   let rows = [];
@@ -1192,14 +1334,19 @@ function searchIssues(term, options = {}) {
     rows = promoteExactID(term, rows);
   }
 
-  if (mode !== 'hybrid' || typeof HybridScorer === 'undefined' || typeof HYBRID_PRESETS === 'undefined') {
+  if (!useHybrid) {
     return rows.slice(0, limit);
   }
 
-  const maxBM25 = Math.max(...rows.map(r => Math.abs(r.bm25_score ?? 0)), 0);
+  // FTS5 negates BM25: more negative means more relevant. Convert to a
+  // positive strength before weighting; subtracting from one reverses rank.
+  // Do not reward missing/invalid scores or spread an unbounded candidate set
+  // into Math.max (large result sets can exceed the engine's argument limit).
+  const bm25Strength = score => Number.isFinite(score) && score < 0 ? -score : 0;
+  const maxBM25 = rows.reduce((max, r) => Math.max(max, bm25Strength(r.bm25_score)), 0);
   const normalized = rows.map(r => ({
     ...r,
-    textScore: maxBM25 > 0 ? (1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1)) : 0.5,
+    textScore: maxBM25 > 0 ? bm25Strength(r.bm25_score) / maxBM25 : 0.5,
     blockerCount: r.blocker_count ?? r.blocked_by_count ?? 0,
     updatedAt: r.updated_at,
     pagerank: r.pagerank,
@@ -1262,9 +1409,9 @@ function getStats() {
   try {
     // Count by status
     const statusCounts = execQuery(`
-      SELECT status, COUNT(*) as count
+      SELECT LOWER(TRIM(status)) AS status, COUNT(*) as count
       FROM issue_overview_mv
-      GROUP BY status
+      GROUP BY LOWER(TRIM(status))
     `);
     console.log('[Stats] Status counts:', statusCounts);
     statusCounts.forEach(row => {
@@ -1275,19 +1422,21 @@ function getStats() {
     console.error('[Stats] Error loading status counts:', err);
   }
 
-  // Count blocked (has blocked_by_ids and status is open/in_progress)
+  // Use the same snapshot decisions as the Ready/Blocked filters.
   stats.blocked = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE blocked_by_ids IS NOT NULL
-    AND blocked_by_ids <> ''
-    AND status IN ('open', 'in_progress')
+    WHERE is_blocked = 1
   `) || 0;
 
-  // Count actionable (open/in_progress with NO open blockers)
   stats.actionable = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
+    WHERE is_ready = 1
+  `) || 0;
+
+  // Blocked is a subset of non-closed work, not an additional status bucket.
+  stats.open_like = execScalar(`
+    SELECT COUNT(*) FROM issue_overview_mv
+    WHERE LOWER(TRIM(status)) NOT IN ('closed', 'tombstone')
   `) || 0;
 
   // Total
@@ -1297,14 +1446,13 @@ function getStats() {
 }
 
 /**
- * Get quick wins - actionable issues that unblock the most items
+ * Get quick wins - claimable issues that unblock the most items
  */
 function getQuickWins(limit = 5) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
-    ORDER BY blocks_count DESC, triage_score DESC
+    WHERE is_claimable = 1
+    ORDER BY blocks_count DESC, triage_score DESC, id
     LIMIT ?
   `, [limit]);
 }
@@ -1354,8 +1502,8 @@ function getDistributionByPriority() {
 function getTopPicks(limit = 5) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    ORDER BY triage_score DESC
+    WHERE is_claimable = 1
+    ORDER BY triage_score DESC, id
     LIMIT ?
   `, [limit]);
 }
@@ -1424,23 +1572,36 @@ function getTopByBetweenness(limit = 10) {
     // Column may not exist
   }
 
-  // Fallback: use WASM if available
-  if (GRAPH_STATE.ready) {
-    const betweenness = GRAPH_STATE.graph.betweenness();
-    if (betweenness && betweenness.length > 0) {
-      // Get top N by betweenness value
-      const indexed = Array.from(betweenness).map((val, idx) => ({ idx, val }));
-      indexed.sort((a, b) => b.val - a.val);
-      const topNodes = indexed.slice(0, limit);
+  // The exporter can omit this metric for large graphs, and a computed metric
+  // can legitimately be all zero. Neither case warrants an unbounded exact
+  // calculation on the main thread. Match graph.js's sampling threshold.
+  if (GRAPH_STATE.ready && GRAPH_STATE.graph) {
+    try {
+      const graph = GRAPH_STATE.graph;
+      const nodeCount = graph.nodeCount();
+      if (nodeCount === 0 || graph.edgeCount() === 0) return [];
 
-      return topNodes.map(node => {
-        const id = GRAPH_STATE.graph.nodeId(node.idx);
-        const issue = getIssue(id);
-        if (issue) {
-          issue.betweenness = node.val;
-        }
-        return issue;
-      }).filter(Boolean);
+      const betweenness = nodeCount > 500
+        ? (typeof graph.betweennessApprox === 'function' ? graph.betweennessApprox(100) : null)
+        : graph.betweenness();
+      if (betweenness && betweenness.length > 0) {
+        const indexed = Array.from(betweenness, (val, idx) => ({ idx, val }))
+          .filter(node => Number.isFinite(node.val) && node.val > 0);
+        indexed.sort((a, b) => b.val - a.val);
+        const topNodes = indexed.slice(0, limit);
+
+        return topNodes.map(node => {
+          const id = graph.nodeId(node.idx);
+          const issue = getIssue(id);
+          if (issue) {
+            issue.betweenness = node.val;
+          }
+          return issue;
+        }).filter(Boolean);
+      }
+    } catch (err) {
+      // Optional rankings must not prevent the rest of the dashboard loading.
+      console.warn('[Insights] Betweenness calculation unavailable:', err);
     }
   }
 
@@ -1735,15 +1896,19 @@ function getMeta() {
  */
 function getIssueDependencies(id) {
   const blocks = execQuery(`
-    SELECT i.* FROM issue_overview_mv i
-    JOIN dependencies d ON i.id = d.depends_on_id
-    WHERE d.issue_id = ? AND d.type = 'blocks'
+    SELECT DISTINCT i.* FROM issue_overview_mv i
+    JOIN dependencies d ON i.id = d.issue_id
+    WHERE d.depends_on_id = ?
+      AND LOWER(TRIM(d.type)) IN ('', 'blocks', 'waits-for', 'conditional-blocks')
+    ORDER BY i.id
   `, [id]);
 
   const blockedBy = execQuery(`
-    SELECT i.* FROM issue_overview_mv i
-    JOIN dependencies d ON i.id = d.issue_id
-    WHERE d.depends_on_id = ? AND d.type = 'blocks'
+    SELECT DISTINCT i.* FROM issue_overview_mv i
+    JOIN dependencies d ON i.id = d.depends_on_id
+    WHERE d.issue_id = ?
+      AND LOWER(TRIM(d.type)) IN ('', 'blocks', 'waits-for', 'conditional-blocks')
+    ORDER BY i.id
   `, [id]);
 
   return { blocks, blockedBy };
@@ -1752,6 +1917,21 @@ function getIssueDependencies(id) {
 // ============================================================================
 // URL State Sync - Shareable filtered views
 // ============================================================================
+
+/**
+ * Fresh defaults for an issue-list state, including filters absent from a URL.
+ */
+function defaultIssueFilters() {
+  return {
+    status: [],
+    type: [],
+    priority: [],
+    labels: [],
+    assignee: '',
+    hasBlockers: null,
+    isBlocking: null,
+  };
+}
 
 /**
  * Serialize filters to URL search params
@@ -1816,11 +1996,10 @@ function filtersToURL(filters, sort, searchQuery) {
 function filtersFromURL() {
   const hash = window.location.hash;
   const queryIndex = hash.indexOf('?');
-  if (queryIndex === -1) return { filters: {}, sort: 'priority', searchQuery: '' };
+  const filters = defaultIssueFilters();
+  if (queryIndex === -1) return { filters, sort: 'priority', searchQuery: '' };
 
   const params = new URLSearchParams(hash.slice(queryIndex + 1));
-
-  const filters = {};
 
   const statusParam = params.get('status');
   if (statusParam) {
@@ -2149,16 +2328,28 @@ function formatJsonWithHighlight(obj) {
 }
 
 /**
- * Render markdown safely
+ * Render markdown safely. If either library is unavailable or fails, show the
+ * original source as text; never pass unsanitized HTML to an x-html binding.
  */
-function renderMarkdown(text) {
+function renderMarkdown(text, inline = false) {
   if (!text) return '';
+  const source = String(text);
   try {
-    const html = marked.parse(text);
-    return DOMPurify.sanitize(html);
+    const parser = typeof marked !== 'undefined' ? marked : null;
+    const sanitizer = typeof DOMPurify !== 'undefined' ? DOMPurify : null;
+    const method = inline ? 'parseInline' : 'parse';
+    if (typeof parser?.[method] === 'function' &&
+        typeof sanitizer?.sanitize === 'function' &&
+        sanitizer.isSupported !== false) {
+      return sanitizer.sanitize(parser[method](source));
+    }
   } catch {
-    return DOMPurify.sanitize(text);
+    // A failed parser or sanitizer must take the same safe path as a missing one.
   }
+
+  const escaped = document.createElement('span');
+  escaped.textContent = source;
+  return escaped.innerHTML;
 }
 
 /**
@@ -2166,14 +2357,8 @@ function renderMarkdown(text) {
  * Converts markdown to HTML but wraps in a span to work with line-clamp
  */
 function renderMarkdownInline(text) {
-  if (!text) return '';
-  try {
-    // Use marked's parseInline to avoid block elements like <p>
-    const html = marked.parseInline(text);
-    return DOMPurify.sanitize(html);
-  } catch {
-    return DOMPurify.sanitize(text);
-  }
+  // Use marked's parseInline to avoid block elements like <p>.
+  return renderMarkdown(text, true);
 }
 
 /**
@@ -2256,19 +2441,19 @@ function beadsApp() {
     },
 
     // Filters (supports multi-select arrays)
-    filters: {
-      status: [],      // Array for multi-select
-      type: [],        // Array for multi-select
-      priority: [],    // Array for multi-select
-      labels: [],      // Array for multi-select
-      assignee: '',    // Single select
-      hasBlockers: null, // true/false/null
-      isBlocking: null,  // true/false/null
-    },
+    filters: defaultIssueFilters(),
     sort: 'priority',
     searchQuery: '',
     searchMode: 'text',
     searchPreset: 'default',
+    pendingSearch: null,
+    pendingSearchHash: null,
+
+    // Keep navigation links current even before the input debounce has fired.
+    get issuesHref() {
+      const params = filtersToURL(this.filters, this.sort, this.searchQuery);
+      return `#/issues${params ? '?' + params : ''}`;
+    },
 
     // Dashboard data
     topPicks: [],
@@ -2283,7 +2468,9 @@ function beadsApp() {
 
     // Selected issue
     selectedIssue: null,
+    selectedDependencies: { blocks: [], blockedBy: [] },
     showDepGraph: false,
+    depGraphGeneration: 0,
     issueNavList: [], // List of issue IDs for j/k navigation
     showKeyboardHelp: false, // Keyboard shortcuts help modal
 
@@ -2298,6 +2485,11 @@ function beadsApp() {
     forceGraphLoading: false,
     forceGraphError: null,
     forceGraphModule: null,
+    forceGraphGeneration: 0,
+    graphHistoryAbort: null,
+    graphHistoryReady: false,
+    graphHistoryActive: false,
+    graphHistoryLoading: false,
     graphDetailNode: null, // Currently selected node for detail pane
 
     // Graph loading stages: 'init' | 'loading-data' | 'computing-metrics' | 'simulating' | null
@@ -2625,8 +2817,12 @@ function beadsApp() {
      * Handle hash change (browser back/forward navigation)
      */
     handleHashChange() {
-      const urlState = filtersFromURL();
       const hash = window.location.hash;
+      // Hash delivery is asynchronous. Input accepted after the URL changed
+      // belongs to the destination; only an older route's debounce is stale.
+      const inputAfterNavigation = this.pendingSearch !== null && this.pendingSearchHash === hash;
+      if (!inputAfterNavigation) this.cancelPendingSearch();
+      const urlState = filtersFromURL();
       const previousView = this.view;
 
       // Parse route
@@ -2649,6 +2845,9 @@ function beadsApp() {
             this.showDepGraph = false;
             this.whatIfResult = null;
             this.selectedIssue = getIssue(route.params.id);
+            this.selectedDependencies = this.selectedIssue
+              ? getIssueDependencies(this.selectedIssue.id)
+              : { blocks: [], blockedBy: [] };
             this.issueNavList = issueNavListForView(this.view, this.issues);
           }
           break;
@@ -2659,11 +2858,13 @@ function beadsApp() {
           this.graphDetailNode = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
-          this.filters = { ...this.filters, ...urlState.filters };
+          this.filters = urlState.filters;
           this.sort = urlState.sort;
-          this.searchQuery = urlState.searchQuery;
           this.page = 1;
-          this.loadIssues();
+          if (!inputAfterNavigation) {
+            this.searchQuery = urlState.searchQuery;
+            this.loadIssues();
+          }
           break;
 
         case 'insights':
@@ -2692,8 +2893,18 @@ function beadsApp() {
      * This is invoked when navigating to #/graph.
      */
     async initForceGraphView() {
-      if (this.forceGraphLoading) return;
+      if (this.view !== 'graph' || this.forceGraphLoading) return;
 
+      const generation = ++this.forceGraphGeneration;
+      const isCurrent = () => this.view === 'graph'
+        && parseRoute(window.location.hash).view === 'graph'
+        && generation === this.forceGraphGeneration;
+      this.graphHistoryAbort?.abort();
+      this.graphHistoryAbort = null;
+      this.graphHistoryReady = false;
+      this.graphHistoryActive = false;
+      this.graphHistoryLoading = false;
+      this.forceGraphModule?.stopTimeTravel();
       this.forceGraphLoading = true;
       this.forceGraphError = null;
 
@@ -2716,6 +2927,7 @@ function beadsApp() {
 
         // Small delay to ensure container is visible after x-show transition
         await new Promise(resolve => setTimeout(resolve, 50));
+        if (!isCurrent()) return;
 
         // Stage 1: Loading data from database
         this.graphLoadingStage = 'loading-data';
@@ -2744,12 +2956,16 @@ function beadsApp() {
 
         // Best-effort: ensure the graph WASM module is available for graph.js.
         if (typeof window.bvGraphWasm === 'undefined') {
-          this.graphReady = await initGraphEngine();
+          const ready = await initGraphEngine();
+          if (!isCurrent()) return;
+          this.graphReady = ready;
           DIAGNOSTICS.graphWasm = this.graphReady;
         }
 
         if (!this.forceGraphModule) {
-          this.forceGraphModule = await import('./graph.js');
+          const module = await import('./graph.js');
+          if (!isCurrent()) return;
+          this.forceGraphModule = module;
         }
 
         // Always use dynamic force simulation - it produces much better layouts
@@ -2761,7 +2977,8 @@ function beadsApp() {
         this.graphLoadingStage = 'init';
 
         if (!this.forceGraphReady) {
-          await this.forceGraphModule.initGraph('graph-container');
+          const graph = await this.forceGraphModule.initGraph('graph-container');
+          if (!isCurrent() || !graph) return;
           this.forceGraphReady = true;
         }
 
@@ -2771,41 +2988,57 @@ function beadsApp() {
           // Register viewer-side graph bridge listeners once.
           // Events are dispatched on document, so listen there.
           document.addEventListener('bv-graph:nodeClick', (e) => {
+            if (this.view !== 'graph') return;
             const node = e.detail?.node;
             if (node) {
               this.graphDetailNode = node;
               console.log('[Viewer] Node selected for detail:', node.id);
               // Resize graph after detail pane opens (wait for transition)
-              setTimeout(() => this.resizeForceGraph(), 350);
+              this.scheduleGraphUpdate(() => this.resizeForceGraph(), 350);
             }
           });
           document.addEventListener('bv-graph:backgroundClick', () => {
+            if (this.view !== 'graph') return;
             this.graphDetailNode = null;
             // Resize graph after detail pane closes
-            setTimeout(() => this.resizeForceGraph(), 250);
+            this.scheduleGraphUpdate(() => this.resizeForceGraph(), 250);
           });
 
           // Sync heatmap state when toggled via keyboard shortcut
           document.addEventListener('bv-graph:heatmapToggle', (e) => {
+            if (this.view !== 'graph') return;
             this.graphHeatmapActive = e.detail?.active ?? false;
           });
 
           // Sync metric state when changed
           document.addEventListener('bv-graph:metricChange', (e) => {
+            if (this.view !== 'graph') return;
             this.graphSizeMetric = e.detail?.metric ?? 'pagerank';
           });
 
           // Track simulation progress for loading indicator
           document.addEventListener('bv-graph:simulationProgress', (e) => {
+            if (this.view !== 'graph') return;
             this.graphSimulationProgress = e.detail?.progress ?? 0;
             this.graphSimulationDone = e.detail?.done ?? false;
             if (e.detail?.done) {
               // Clear progress and stage after a short delay
-              setTimeout(() => {
+              this.scheduleGraphUpdate(() => {
                 this.graphSimulationProgress = null;
                 this.graphLoadingStage = null;
               }, 500);
             }
+          });
+
+          document.addEventListener('bv-graph:timeTravelReady', (e) => {
+            if (this.view !== 'graph') return;
+            this.graphHistoryReady = (e.detail?.eventCount || 0) > 0;
+          });
+          document.addEventListener('bv-graph:timeTravelStart', () => {
+            if (this.view === 'graph') this.graphHistoryActive = true;
+          });
+          document.addEventListener('bv-graph:timeTravelStop', () => {
+            this.graphHistoryActive = false;
           });
         }
 
@@ -2817,21 +3050,7 @@ function beadsApp() {
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
 
-        // Try to load history data for time-travel feature (bv-z38b)
-        // Use cache-busting to avoid stale data from CDN
-        try {
-          const historyResp = await fetch(`./data/history.json?_t=${Date.now()}`);
-          if (historyResp.ok) {
-            const historyData = await historyResp.json();
-            if (this.forceGraphModule.initTimeTravel) {
-              this.forceGraphModule.initTimeTravel(historyData);
-              console.log('[Viewer] Time-travel history loaded');
-            }
-          }
-        } catch (histErr) {
-          // history.json is optional, silently ignore if not found
-          console.log('[Viewer] No history.json found (optional for time-travel)');
-        }
+        this.forceGraphModule.initTimeTravel(null);
 
         // Match canvas size to container for crisp rendering.
         // (reuse container from earlier in this scope)
@@ -2840,7 +3059,12 @@ function beadsApp() {
           graph.width(container.clientWidth);
           graph.height(container.clientHeight);
         }
+
+        // Optional history must not delay use of the graph itself.
+        this.loadGraphHistory(generation);
       } catch (err) {
+        if (!isCurrent()) return;
+        this.forceGraphModule?.cleanup();
         console.error('[ForceGraph] init failed:', err);
         this.forceGraphError = err?.message || String(err);
         this.forceGraphReady = false;
@@ -2851,8 +3075,57 @@ function beadsApp() {
           container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center py-8">Graph failed to load.</p>';
         }
       } finally {
-        this.forceGraphLoading = false;
+        if (isCurrent()) this.forceGraphLoading = false;
       }
+    },
+
+    async loadGraphHistory(generation) {
+      const isCurrent = () => this.view === 'graph'
+        && parseRoute(window.location.hash).view === 'graph'
+        && generation === this.forceGraphGeneration;
+      if (!isCurrent()) return;
+
+      const controller = new AbortController();
+      this.graphHistoryAbort = controller;
+      this.graphHistoryLoading = true;
+      try {
+        const response = await fetch(`./data/history.json?_t=${Date.now()}`, {
+          signal: controller.signal,
+        });
+        if (!isCurrent()) return;
+        const history = response.ok ? await response.json() : null;
+        if (!isCurrent()) return;
+        this.graphHistoryReady = this.forceGraphModule.initTimeTravel(history);
+      } catch (error) {
+        if (!isCurrent() || controller.signal.aborted) return;
+        this.graphHistoryReady = false;
+        this.forceGraphModule.initTimeTravel(null);
+        console.warn('[Viewer] Recorded history could not be loaded:', error.message);
+      } finally {
+        if (isCurrent() && this.graphHistoryAbort === controller) {
+          this.graphHistoryAbort = null;
+          this.graphHistoryLoading = false;
+        }
+      }
+    },
+
+    toggleGraphHistory() {
+      if (this.view !== 'graph' || !this.graphHistoryReady) return;
+      if (this.forceGraphModule.isTimeTravelActive()) {
+        this.forceGraphModule.stopTimeTravel();
+      } else {
+        this.forceGraphModule.startTimeTravel();
+      }
+      this.graphHistoryActive = this.forceGraphModule.isTimeTravelActive();
+    },
+
+    scheduleGraphUpdate(callback, delay) {
+      const generation = this.forceGraphGeneration;
+      setTimeout(() => {
+        if (this.view === 'graph' && generation === this.forceGraphGeneration) {
+          callback();
+        }
+      }, delay);
     },
 
     teardownForceGraph() {
@@ -2860,6 +3133,13 @@ function beadsApp() {
         this.forceGraphModule.cleanup();
       }
       this.forceGraphReady = false;
+      this.forceGraphGeneration++;
+      this.graphHistoryAbort?.abort();
+      this.graphHistoryAbort = null;
+      this.graphHistoryReady = false;
+      this.graphHistoryActive = false;
+      this.graphHistoryLoading = false;
+      this.forceGraphLoading = false;
       this.graphDetailNode = null;
       this.graphLoadingStage = null;
       this.graphSimulationProgress = null;
@@ -2976,9 +3256,29 @@ function beadsApp() {
         this.totalIssues = countIssues(filters);
       }
 
-      // Sync URL state (only on issues view)
-      if (this.view === 'issues') {
+      // An issue detail route can also have an Issues backdrop. Never replace it.
+      if (this.view === 'issues' && parseRoute(window.location.hash).view === 'issues') {
         syncFiltersToURL('issues', this.filters, this.sort, this.searchQuery);
+      }
+    },
+
+    /**
+     * Show results, preserving the origin in history when entering Issues.
+     */
+    openIssues() {
+      this.cancelPendingSearch();
+      this.page = 1;
+      if (parseRoute(window.location.hash).view === 'issues') {
+        // Keyboard selection can open a modal without changing the list route.
+        this.view = 'issues';
+        this.selectedIssue = null;
+        this.graphDetailNode = null;
+        this.showDepGraph = false;
+        this.whatIfResult = null;
+        this.loadIssues();
+      } else {
+        // The route handler restores this state and loads the visible list.
+        navigateToIssues(this.filters, this.sort, this.searchQuery);
       }
     },
 
@@ -2986,8 +3286,7 @@ function beadsApp() {
      * Apply filter and reload (resets to page 1)
      */
     applyFilter() {
-      this.page = 1;
-      this.loadIssues();
+      this.openIssues();
     },
 
     /**
@@ -3001,19 +3300,10 @@ function beadsApp() {
      * Clear all filters
      */
     clearFilters() {
-      this.filters = {
-        status: [],
-        type: [],
-        priority: [],
-        labels: [],
-        assignee: '',
-        hasBlockers: null,
-        isBlocking: null,
-      };
+      this.filters = defaultIssueFilters();
       this.searchQuery = '';
       this.sort = 'priority';
-      this.page = 1;
-      this.loadIssues();
+      this.applyFilter();
     },
 
     /**
@@ -3055,11 +3345,34 @@ function beadsApp() {
     },
 
     /**
-     * Search issues
+     * Debounce both search inputs with a timer that navigation can cancel.
+     */
+    queueSearch() {
+      this.cancelPendingSearch();
+      this.pendingSearchHash = window.location.hash;
+      this.pendingSearch = setTimeout(() => {
+        this.pendingSearch = null;
+        this.search();
+      }, 300);
+    },
+
+    cancelPendingSearch() {
+      clearTimeout(this.pendingSearch);
+      this.pendingSearch = null;
+      this.pendingSearchHash = null;
+    },
+
+    /**
+     * Search issues without navigating for an empty query on another view.
      */
     search() {
-      this.page = 1;
-      this.loadIssues();
+      this.cancelPendingSearch();
+      if (this.searchQuery || parseRoute(window.location.hash).view === 'issues') {
+        this.openIssues();
+      } else {
+        this.page = 1;
+        this.loadIssues();
+      }
     },
 
     /**
@@ -3094,6 +3407,7 @@ function beadsApp() {
       this.showDepGraph = false;
       this.whatIfResult = null;
       this.selectedIssue = issue;
+      this.selectedDependencies = getIssueDependencies(issue.id);
       this.issueNavList = issueNavListForView(this.view, this.issues);
     },
 
@@ -3110,6 +3424,7 @@ function beadsApp() {
     closeIssue() {
       // Reset issue detail state
       this.selectedIssue = null;
+      this.selectedDependencies = { blocks: [], blockedBy: [] };
       this.showDepGraph = false;
       this.whatIfResult = null;
 
@@ -3184,56 +3499,89 @@ function beadsApp() {
       if (!this.selectedIssue || !this.$refs.depGraph) return;
 
       const issue = this.selectedIssue;
-      const blockedBy = (issue.blocked_by_ids || '').split(',').filter(Boolean).map(s => s.trim());
-      const blocks = (issue.blocks_ids || '').split(',').filter(Boolean).map(s => s.trim());
+      const container = this.$refs.depGraph;
+      const generation = ++this.depGraphGeneration;
+      const backdropView = this.view;
+      const isCurrent = () => generation === this.depGraphGeneration
+        && this.selectedIssue === issue
+        && this.showDepGraph
+        && container.isConnected
+        && this.$refs.depGraph === container;
+
+      // Query exact IDs: comma-separated overview fields cannot preserve IDs
+      // that themselves contain commas or leading/trailing whitespace.
+      const dependencies = getIssueDependencies(issue.id);
+      const blockedBy = dependencies.blockedBy.map(row => row.id);
+      const blocks = dependencies.blocks.map(row => row.id);
 
       if (blockedBy.length === 0 && blocks.length === 0) {
-        this.$refs.depGraph.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center">No dependencies</p>';
+        container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center">No dependencies</p>';
         return;
       }
 
-      // Build Mermaid flowchart
+      // Keep issue IDs out of Mermaid identifiers and callback syntax. Each
+      // distinct ID gets a generated key; label punctuation uses Mermaid's
+      // decimal entity syntax so quotes, HTML and directives remain text.
+      const allIds = [...new Set([issue.id, ...blockedBy, ...blocks])];
+      const nodeIds = new Map(allIds.map((id, index) => [id, `n${index}`]));
+      const escapeLabel = id => Array.from(String(id), char =>
+        /^[a-zA-Z0-9 _-]$/.test(char) ? char : `#${char.codePointAt(0)};`
+      ).join('');
       let diagram = 'flowchart TB\n';
-
-      // Sanitize ID for mermaid (replace special chars)
-      const sanitizeId = (id) => id.replace(/[^a-zA-Z0-9]/g, '_');
-      const currentId = sanitizeId(issue.id);
+      for (const [id, nodeId] of nodeIds) {
+        diagram += `  ${nodeId}["${escapeLabel(id)}"]\n`;
+        diagram += `  class ${nodeId} bv-dep-${nodeId}\n`;
+      }
+      const currentId = nodeIds.get(issue.id);
 
       // Style for current node
-      diagram += `  ${currentId}["${issue.id}"]\n`;
       diagram += `  style ${currentId} fill:#0ea5e9,stroke:#0284c7,color:#fff\n`;
 
       // Add blocked-by nodes (upstream)
       for (const depId of blockedBy) {
-        const nodeId = sanitizeId(depId);
-        diagram += `  ${nodeId}["${depId}"]\n`;
+        const nodeId = nodeIds.get(depId);
         diagram += `  ${nodeId} --> ${currentId}\n`;
         diagram += `  style ${nodeId} fill:#fef3c7,stroke:#f59e0b\n`;
       }
 
       // Add blocks nodes (downstream)
       for (const depId of blocks) {
-        const nodeId = sanitizeId(depId);
-        diagram += `  ${nodeId}["${depId}"]\n`;
+        const nodeId = nodeIds.get(depId);
         diagram += `  ${currentId} --> ${nodeId}\n`;
         diagram += `  style ${nodeId} fill:#fee2e2,stroke:#ef4444\n`;
       }
 
-      // Add click handlers
-      const allIds = [issue.id, ...blockedBy, ...blocks];
-      const mermaidBackdropView = JSON.stringify(this.view);
-      for (const id of allIds) {
-        const nodeId = sanitizeId(id);
-        diagram += `  click ${nodeId} call window.beadsViewer.navigateToIssue("${id}", ${mermaidBackdropView})\n`;
-      }
-
       try {
-        // Render the diagram
-        const { svg } = await mermaid.render('dep-graph-' + Date.now(), diagram);
-        this.$refs.depGraph.innerHTML = svg;
+        const { svg } = await mermaid.render(`dep-graph-${Date.now()}-${generation}`, diagram);
+        if (!isCurrent()) return;
+        container.innerHTML = svg;
+
+        // Mermaid's strict mode disables diagram callbacks. Bind navigation
+        // through DOM APIs, retaining exact IDs without generating code.
+        for (const [id, nodeId] of nodeIds) {
+          const node = container.querySelector(`.bv-dep-${nodeId}`);
+          if (!node) throw new Error('Dependency graph node was not rendered');
+          node.setAttribute('data-issue-id', id);
+          node.setAttribute('role', 'link');
+          node.setAttribute('tabindex', '0');
+          node.setAttribute('aria-label', `Open issue ${id}`);
+          node.style.cursor = 'pointer';
+          const openIssue = () => {
+            if (isCurrent()) navigateToIssue(id, backdropView);
+          };
+          node.addEventListener('click', openIssue);
+          node.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              event.stopPropagation();
+              openIssue();
+            }
+          });
+        }
       } catch (err) {
+        if (!isCurrent()) return;
         console.warn('Mermaid render failed:', err);
-        this.$refs.depGraph.innerHTML = '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
+        container.innerHTML = '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
       }
     },
 

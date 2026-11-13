@@ -3,7 +3,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::Write;
 use std::fs;
@@ -13,9 +13,9 @@ use std::process::{Command, ExitCode};
 
 use bvr::analysis::alerts::AlertOptions;
 use bvr::analysis::git_history::{
-    HistoryBeadCompat, HistoryEventCompat, HistoryMilestonesCompat, HistoryStatsCompat,
-    build_workspace_id_aliases, compute_history_stats, correlate_histories_with_git_aliases,
-    finalize_history_entries, load_git_commits,
+    GitHistoryScan, HistoryBeadCompat, HistoryEventCompat, HistoryMilestonesCompat,
+    HistoryStatsCompat, build_workspace_id_aliases, compute_history_stats,
+    finalize_history_entries,
 };
 use bvr::analysis::graph::AnalysisConfig;
 use bvr::analysis::suggest::{SuggestOptions, SuggestionType};
@@ -25,7 +25,7 @@ use bvr::cli::{BvrCommand, Cli, GraphFormat, GraphPreset, GraphStyle};
 use bvr::loader;
 use bvr::robot::{
     compute_data_hash, default_field_descriptions, emit_with_stats, envelope, envelope_empty,
-    generate_robot_docs, generate_robot_schemas,
+    generate_robot_capabilities, generate_robot_docs, generate_robot_schemas,
 };
 use chrono::{DateTime, Duration, Local, Utc};
 use clap::Parser;
@@ -109,6 +109,10 @@ where
 fn validate_orphaned_modifier_flags(cli: &Cli) -> Option<String> {
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
 
+    if cli.export_template.is_some() && cli.export.is_none() && cli.export_md.is_none() {
+        return Some("error: --export-template requires --export or --export-md".to_string());
+    }
+
     let insights_flags = ["--robot-full-stats", "--insight-limit"];
     if !cli.robot_insights
         && insights_flags
@@ -128,11 +132,27 @@ fn validate_orphaned_modifier_flags(cli: &Cli) -> Option<String> {
         "--graph-style",
         "--graph-title",
     ];
+    // --graph-root also scopes triage/next to an epic's work tree.
+    let triage_scoped = cli.robot_triage
+        || cli.robot_next
+        || cli.robot_triage_by_track
+        || cli.robot_triage_by_label;
+    // --robot-history-timeout-ms bounds legacy bv's git-history prologue of
+    // robot triage. bvr's triage has no such prologue (it never shells out
+    // to git), so the budget is accepted for agent compatibility and never
+    // consumed — but, as in legacy bv, only alongside a triage command.
+    if !triage_scoped && arg_flag_was_explicit_in_args(&raw_args, "--robot-history-timeout-ms") {
+        return Some(
+            "error: --robot-history-timeout-ms requires --robot-triage, --robot-triage-by-track, --robot-triage-by-label, or --robot-next"
+                .to_string(),
+        );
+    }
     if !cli.robot_graph
         && cli.export_graph.is_none()
-        && graph_flags
-            .iter()
-            .any(|flag| arg_flag_was_explicit_in_args(&raw_args, flag))
+        && graph_flags.iter().any(|flag| {
+            !(triage_scoped && *flag == "--graph-root")
+                && arg_flag_was_explicit_in_args(&raw_args, flag)
+        })
     {
         return Some(
             "error: graph modifiers require --robot-graph or --export-graph <path>".to_string(),
@@ -144,6 +164,7 @@ fn validate_orphaned_modifier_flags(cli: &Cli) -> Option<String> {
         "--search-mode",
         "--search-preset",
         "--search-weights",
+        "--search-min-score",
     ];
     if !cli.robot_search
         && search_flags
@@ -157,15 +178,25 @@ fn validate_orphaned_modifier_flags(cli: &Cli) -> Option<String> {
         return Some("error: --search <query> requires --robot-search".to_string());
     }
 
-    let history_flags = ["--history-limit", "--history-since", "--min-confidence"];
+    let history_flags = ["--history-limit", "--history-since"];
     if !cli.robot_history
         && cli.bead_history.is_none()
+        && cli.export_pages.is_none()
+        && !cli.pages
         && history_flags
             .iter()
             .any(|flag| arg_flag_was_explicit_in_args(&raw_args, flag))
     {
         return Some(
-            "error: history modifiers require --robot-history or --bead-history <id>".to_string(),
+            "error: history modifiers require --robot-history or --bead-history <id>, or a Pages export (--export-pages <dir> / --pages)".to_string(),
+        );
+    }
+    if !cli.robot_history
+        && cli.bead_history.is_none()
+        && arg_flag_was_explicit_in_args(&raw_args, "--min-confidence")
+    {
+        return Some(
+            "error: --min-confidence requires --robot-history or --bead-history <id>".to_string(),
         );
     }
 
@@ -446,7 +477,7 @@ fn main() -> ExitCode {
         eprintln!("warning: tracing init failed: {error}");
     }
 
-    let mut cli = Cli::parse();
+    let mut cli = Cli::parse_from(agent_intent_argv());
 
     cli.format = match cli.resolve_output_format() {
         Ok(format) => format,
@@ -470,7 +501,8 @@ fn main() -> ExitCode {
 
     // --no-cache: silently accepted for Go CLI compatibility (Rust port has no disk cache layer).
 
-    // --db: legacy compatibility alias for --beads-file.
+    // --db: a beads database file, JSONL file, or `.beads` directory (loaded
+    // through `loader::load_issues_from_path`).
     if let Some(ref db_path) = cli.db {
         if cli.beads_file.is_none() {
             let resolved = if db_path.is_absolute() {
@@ -487,6 +519,30 @@ fn main() -> ExitCode {
     if cli.version {
         print_version();
         return ExitCode::SUCCESS;
+    }
+
+    if let Some(theme) = cli.theme.as_deref()
+        && let Err(error) = bvr::tui::set_theme_preference(theme)
+    {
+        eprintln!("error: {error}");
+        return ExitCode::from(2);
+    }
+
+    // Register custom bead ID patterns (--id-pattern) before any
+    // correlation work runs, so commit matching and orphan detection
+    // recognize non-default ID formats.
+    if !cli.id_pattern.is_empty() {
+        let mut compiled = Vec::with_capacity(cli.id_pattern.len());
+        for pattern in &cli.id_pattern {
+            match regex::Regex::new(pattern) {
+                Ok(regex) => compiled.push(regex),
+                Err(error) => {
+                    eprintln!("Invalid --id-pattern {pattern:?}: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        bvr::analysis::git_history::set_custom_id_patterns(compiled);
     }
 
     if cli.background_mode && cli.no_background_mode {
@@ -530,6 +586,15 @@ fn main() -> ExitCode {
         }
 
         if let Err(error) = emit_with_stats(cli.format, &schemas, cli.stats) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if cli.robot_capabilities {
+        let capabilities = generate_robot_capabilities();
+        if let Err(error) = emit_with_stats(cli.format, &capabilities, cli.stats) {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
@@ -664,13 +729,14 @@ fn main() -> ExitCode {
                     .output_path
                     .as_deref()
                     .unwrap_or(Path::new("./bv-pages"));
-                let issues = load_issues(&cli)?;
                 let options = bvr::export_pages::ExportPagesOptions {
                     title: config.title.clone(),
                     subtitle: config.subtitle.clone(),
                     include_closed: config.include_closed,
                     include_history: config.include_history,
                 };
+                let (issues, history_context) =
+                    load_issues_for_pages(&cli, options.include_history)?;
                 let count = count_pages_export_issues(&issues, &options);
                 let hook_project_dir = project_dir_for_export_hooks(&cli)?;
                 bvr::export_md::run_export_with_hooks(
@@ -680,7 +746,13 @@ fn main() -> ExitCode {
                     no_hooks,
                     Some(hook_project_dir.as_path()),
                     |resolved_output| {
-                        bvr::export_pages::export_pages_bundle(&issues, resolved_output, &options)
+                        export_pages_for_cli(
+                            &cli,
+                            &issues,
+                            resolved_output,
+                            &options,
+                            &history_context,
+                        )
                     },
                 )?;
                 Ok(())
@@ -757,9 +829,38 @@ fn main() -> ExitCode {
         }
     }
 
+    // File tokens must predate the snapshot used by the initial export. A
+    // write during analysis or an export hook must remain visible to the
+    // first watch poll instead of becoming the baseline for stale output.
+    let initial_watch_tokens = if cli.watch_export {
+        match capture_initial_watch_export_tokens(&cli) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let initial_watch_history_revisions = if cli.watch_export {
+        match capture_pages_history_revisions(&cli) {
+            Ok(revisions) => revisions,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
+
     let load_start = std::time::Instant::now();
-    let mut issues = match load_issues(&cli) {
-        Ok(issues) => issues,
+    let (mut issues, pages_history_context) = match load_issues_for_pages(
+        &cli,
+        cli.export_pages.is_some() && cli.pages_include_history,
+    ) {
+        Ok(loaded) => loaded,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(1);
@@ -792,6 +893,40 @@ fn main() -> ExitCode {
             eprintln!("warning: no issues found with label {label:?}");
         }
         analyzer = Analyzer::new_with_config(subgraph, &analysis_config);
+    }
+
+    // --graph-root scopes triage/next to the root and everything that
+    // (transitively) depends on it — an epic's whole work tree — matching the
+    // legacy RootIssueID triage option. --robot-graph applies its own
+    // depth-limited root scoping, so it is left alone here.
+    let mut graph_root_blocked: HashSet<String> = HashSet::new();
+    if let Some(root) = cli
+        .graph_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        && (cli.robot_triage
+            || cli.robot_next
+            || cli.robot_triage_by_track
+            || cli.robot_triage_by_label)
+    {
+        let scoped = descendant_subgraph(&analyzer.issues, root.trim());
+        if scoped.is_empty() {
+            eprintln!("error: --graph-root {root:?} does not match any issue");
+            return ExitCode::from(2);
+        }
+        // The subtree graph drops blockers outside the subtree, so take each
+        // member's blocked state from the full graph.
+        let unblocked: HashSet<String> = analyzer
+            .graph
+            .dependency_unblocked_ids()
+            .into_iter()
+            .collect();
+        graph_root_blocked = scoped
+            .iter()
+            .filter(|issue| issue.is_open_like() && !unblocked.contains(&issue.id))
+            .map(|issue| issue.id.clone())
+            .collect();
+        analyzer = Analyzer::new_with_config(scoped, &analysis_config);
     }
 
     let issues = &analyzer.issues;
@@ -845,7 +980,8 @@ fn main() -> ExitCode {
                 weight_adjustments: feedback_weight_adjustments.clone(),
                 ..TriageScoringOptions::default()
             },
-            ..TriageOptions::default()
+            not_ready_labels: resolve_not_ready_labels(&cli),
+            extra_blocked: graph_root_blocked.clone(),
         });
 
         if cli.robot_next {
@@ -860,8 +996,8 @@ fn main() -> ExitCode {
                     score: Some(top.score),
                     reasons: top.reasons.clone(),
                     unblocks: Some(top.unblocks),
-                    claim_command: Some(format!("br update {} --status=in_progress", top.id)),
-                    show_command: Some(format!("br show {}", top.id)),
+                    claim_command: Some(bvr::model::claim_command_for(&issues, &top.id)),
+                    show_command: Some(bvr::model::show_command_for(&issues, &top.id)),
                     message: None,
                 }
             } else {
@@ -889,6 +1025,20 @@ fn main() -> ExitCode {
 
         if cli.robot_overview {
             let output = build_robot_overview_output(&issues, &analyzer, &triage.result);
+            if let Err(error) = emit_with_stats(cli.format, &output, cli.stats) {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+            return ExitCode::SUCCESS;
+        }
+
+        if cli.brief {
+            let output = build_triage_brief_output(
+                envelope(&issues),
+                as_of.clone(),
+                as_of_commit.clone(),
+                triage.result,
+            );
             if let Err(error) = emit_with_stats(cli.format, &output, cli.stats) {
                 eprintln!("error: {error}");
                 return ExitCode::from(1);
@@ -1211,6 +1361,40 @@ fn main() -> ExitCode {
                     eprintln!("error: {error}");
                     return ExitCode::from(1);
                 }
+            }
+            GraphExportTarget::Interactive => {
+                let triage = analyzer.triage(TriageOptions {
+                    max_recommendations: 20,
+                    not_ready_labels: resolve_not_ready_labels(&cli),
+                    ..TriageOptions::default()
+                });
+                let html = match render_interactive_graph_html(
+                    &issues,
+                    &analyzer.graph,
+                    &analyzer.metrics,
+                    &triage.result,
+                    cli.graph_title.as_deref(),
+                ) {
+                    Ok(html) => html,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let written = export_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map_or(Ok(()), fs::create_dir_all)
+                    .and_then(|()| fs::write(export_path, html));
+                if let Err(error) = written {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
+                }
+                println!(
+                    "Interactive graph written to {} ({} nodes)",
+                    export_path.display(),
+                    issues.len()
+                );
             }
         }
 
@@ -2095,6 +2279,15 @@ fn main() -> ExitCode {
             bvr::analysis::search::get_preset(preset_name)
         };
 
+        let min_score = match cli.search_min_score.as_deref().map(parse_search_min_score) {
+            None => None,
+            Some(Ok(score)) => Some(score),
+            Some(Err(message)) => {
+                eprintln!("Error: {message}");
+                return ExitCode::from(2);
+            }
+        };
+
         let results = bvr::analysis::search::execute_search(
             query,
             &issues,
@@ -2102,6 +2295,7 @@ fn main() -> ExitCode {
             mode,
             &weights,
             cli.search_limit,
+            min_score,
         );
 
         let preset_field = if mode == bvr::analysis::search::SearchMode::Hybrid {
@@ -2122,6 +2316,7 @@ fn main() -> ExitCode {
             mode: mode.as_str().to_string(),
             preset: preset_field,
             weights: weights_field,
+            min_score,
             results,
             usage_hints: vec![
                 "jq '.results[] | {id: .issue_id, score: .score, title: .title}' - extract ranked results"
@@ -2146,7 +2341,8 @@ fn main() -> ExitCode {
                 weight_adjustments: feedback_weight_adjustments.clone(),
                 ..TriageScoringOptions::default()
             },
-            ..TriageOptions::default()
+            not_ready_labels: resolve_not_ready_labels(&cli),
+            extra_blocked: HashSet::new(),
         });
 
         let mut recommendations = triage.result.recommendations;
@@ -2321,7 +2517,13 @@ fn main() -> ExitCode {
             cli.no_hooks,
             Some(hook_project_dir.as_path()),
             |resolved_export_path| {
-                bvr::export_pages::export_pages_bundle(&issues, resolved_export_path, &options)
+                export_pages_for_cli(
+                    &cli,
+                    &issues,
+                    resolved_export_path,
+                    &options,
+                    &pages_history_context,
+                )
             },
         ) {
             Ok(summary) => {
@@ -2337,24 +2539,15 @@ fn main() -> ExitCode {
         }
 
         if cli.watch_export {
-            let initial_watched_paths = match resolve_watch_export_paths(&cli) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return ExitCode::from(1);
+            let mut watched_mtimes = initial_watch_tokens;
+            let mut watched_history_revisions = initial_watch_history_revisions;
+            for (path, token) in &mut watched_mtimes {
+                if path.is_dir() {
+                    // The initial load populated the live Dolt cache. Use
+                    // that snapshot even if export outlasted its cache TTL.
+                    *token = cached_dolt_watch_token(path);
                 }
-            };
-            let initial_watched_tokens = initial_watched_paths
-                .iter()
-                .map(|path| watch_export_token_for_path(path).map(|token| (path.clone(), token)))
-                .collect::<bvr::Result<Vec<_>>>();
-            let mut watched_mtimes = match initial_watched_tokens {
-                Ok(entries) => entries,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return ExitCode::from(1);
-                }
-            };
+            }
 
             let mut max_loops = std::env::var("BVR_WATCH_MAX_LOOPS")
                 .ok()
@@ -2384,8 +2577,16 @@ fn main() -> ExitCode {
             let mut cycle_count: u64 = 0;
             let mut last_outcome = "initial export";
             let mut last_change_at: Option<std::time::Instant> = None;
+            let mut regeneration_pending = false;
 
             loop {
+                if let Some(remaining) = max_loops.as_mut() {
+                    if *remaining == 0 {
+                        eprintln!("watch: max loops reached, exiting (last: {last_outcome})");
+                        break;
+                    }
+                    *remaining = remaining.saturating_sub(1);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(watch_interval_ms));
 
                 let path_set_changed = match reconcile_watch_export_paths(&cli, &mut watched_mtimes)
@@ -2397,6 +2598,17 @@ fn main() -> ExitCode {
                     }
                 };
                 let mut changed_files: Vec<String> = Vec::new();
+                match capture_pages_history_revisions(&cli) {
+                    Ok(revisions) if revisions != watched_history_revisions => {
+                        watched_history_revisions = revisions;
+                        changed_files.push("Git history revision changed".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("warning: cannot refresh Git history revisions: {error}");
+                        regeneration_pending = true;
+                    }
+                }
                 for (path, last_token) in &mut watched_mtimes {
                     let current_token = match file_watch_token(path) {
                         Ok(value) => value,
@@ -2421,16 +2633,15 @@ fn main() -> ExitCode {
                     }
                 }
 
+                if changed_files.is_empty() && regeneration_pending {
+                    changed_files.push("retry pending regeneration".to_string());
+                }
                 if changed_files.is_empty() {
-                    if let Some(remaining) = max_loops.as_mut() {
-                        *remaining = remaining.saturating_sub(1);
-                        if *remaining == 0 {
-                            eprintln!("watch: max loops reached, exiting (last: {last_outcome})");
-                            break;
-                        }
-                    }
                     continue;
                 }
+                // Observed tokens can advance before a load or bundle write
+                // fails. Retain that work until a complete export succeeds.
+                regeneration_pending = true;
 
                 // Debounce: if we detected a change, wait the debounce period
                 // then re-check to coalesce rapid successive writes.
@@ -2443,6 +2654,18 @@ fn main() -> ExitCode {
                 }
                 // Wait the debounce period, then re-scan to capture any trailing writes.
                 std::thread::sleep(std::time::Duration::from_millis(debounce_ms));
+                match capture_pages_history_revisions(&cli) {
+                    Ok(revisions) => {
+                        if revisions != watched_history_revisions {
+                            watched_history_revisions = revisions;
+                            changed_files
+                                .push("Git history revision changed during debounce".to_string());
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("warning: cannot refresh Git history revisions: {error}");
+                    }
+                }
                 for (path, last_token) in &mut watched_mtimes {
                     if let Ok(current_token) = file_watch_token(path) {
                         if current_token != *last_token {
@@ -2466,18 +2689,24 @@ fn main() -> ExitCode {
                 }
 
                 let reload_start = std::time::Instant::now();
-                let refreshed_issues = match load_issues(&cli) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        last_outcome = "reload failed";
-                        eprintln!(
-                            "warning: reload failed: {error} (last good export still served)"
-                        );
-                        continue;
-                    }
-                };
+                let (refreshed_issues, refreshed_history_context) =
+                    match load_issues_for_pages(&cli, options.include_history) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            last_outcome = "reload failed";
+                            eprintln!(
+                                "warning: reload failed: {error} (last good export still served)"
+                            );
+                            continue;
+                        }
+                    };
                 let refreshed_issues = if let Some(repo_filter) = cli.repo.as_deref() {
                     filter_by_repo(refreshed_issues, repo_filter)
+                } else {
+                    refreshed_issues
+                };
+                let refreshed_issues = if let Some(label) = cli.label.as_deref() {
+                    bvr::analysis::label_intel::compute_label_subgraph(&refreshed_issues, label)
                 } else {
                     refreshed_issues
                 };
@@ -2496,17 +2725,27 @@ fn main() -> ExitCode {
                     cli.no_hooks,
                     Some(hook_project_dir.as_path()),
                     |resolved_export_path| {
-                        bvr::export_pages::export_pages_bundle(
+                        export_pages_for_cli(
+                            &cli,
                             &refreshed_issues,
                             resolved_export_path,
                             &options,
+                            &refreshed_history_context,
                         )
                     },
                 ) {
                     Ok(summary) => {
                         let elapsed = reload_start.elapsed();
                         last_outcome = "success";
+                        regeneration_pending = false;
                         issue_count = refreshed_issue_count;
+                        for (path, token) in &mut watched_mtimes {
+                            if path.is_dir() {
+                                // Loading a slow workspace may refresh a
+                                // snapshot again after the earlier poll.
+                                *token = cached_dolt_watch_token(path);
+                            }
+                        }
                         eprintln!(
                             "watch: regenerated in {elapsed:.1?} (path: {}, issues: {}, history: {})",
                             summary.export_path, summary.issue_count, summary.include_history,
@@ -2514,22 +2753,78 @@ fn main() -> ExitCode {
                     }
                     Err(error) => {
                         last_outcome = "export failed";
-                        eprintln!(
-                            "warning: export failed: {error} (last good export still served)"
-                        );
-                    }
-                }
-
-                if let Some(remaining) = max_loops.as_mut() {
-                    *remaining = remaining.saturating_sub(1);
-                    if *remaining == 0 {
-                        eprintln!("watch: max loops reached after {cycle_count} cycle(s), exiting");
-                        break;
+                        eprintln!("warning: export failed: {error}");
                     }
                 }
             }
         }
 
+        return ExitCode::SUCCESS;
+    }
+
+    let export_template = cli
+        .export_template
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    if let Some(export_path) = cli.export.as_deref() {
+        if cli.export_md.is_some() {
+            eprintln!("error: --export and --export-md specify conflicting output paths");
+            return ExitCode::from(2);
+        }
+        let format = cli
+            .export_format
+            .as_deref()
+            .unwrap_or("markdown")
+            .trim()
+            .to_ascii_lowercase();
+        let include_graph = cli.export_include_graph.unwrap_or(format != "csv");
+        let rendered = match export_template {
+            Some(_) if format != "markdown" => {
+                Err("custom templates require markdown export".to_string())
+            }
+            Some(template) => render_report_template(&issues, Path::new(template), include_graph),
+            None => render_export_report(&issues, &format, include_graph),
+        };
+        let content = match rendered {
+            Ok(content) => content,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let hook_project_dir = match project_dir_for_export_hooks(&cli) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        println!(
+            "Exporting {} issues to {}...",
+            issues.len(),
+            export_path.display()
+        );
+        let result = bvr::export_md::run_export_with_hooks(
+            export_path,
+            &format,
+            issues.len(),
+            cli.no_hooks,
+            Some(hook_project_dir.as_path()),
+            |resolved| {
+                if let Some(parent) = resolved.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(resolved, content.as_bytes())?;
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -2541,12 +2836,41 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        if let Err(error) = bvr::export_md::export_markdown_with_hooks(
-            &issues,
-            export_path,
-            cli.no_hooks,
-            Some(hook_project_dir.as_path()),
-        ) {
+        let result = if let Some(template) = export_template {
+            let include_graph = cli.export_include_graph.unwrap_or(true);
+            let content = match render_report_template(&issues, Path::new(template), include_graph)
+            {
+                Ok(content) => content,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            bvr::export_md::run_export_with_hooks(
+                export_path,
+                "markdown",
+                issues.len(),
+                cli.no_hooks,
+                Some(hook_project_dir.as_path()),
+                |resolved| {
+                    if let Some(parent) = resolved.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(resolved, content.as_bytes())?;
+                    Ok(())
+                },
+            )
+        } else {
+            bvr::export_md::export_markdown_with_hooks(
+                &issues,
+                export_path,
+                cli.no_hooks,
+                Some(hook_project_dir.as_path()),
+            )
+        };
+        if let Err(error) = result {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
@@ -2775,10 +3099,42 @@ fn upgrade_cargo_args(latest: &str) -> Vec<String> {
     ]
 }
 
+/// Ask immediately before running the installer. The streams and terminal
+/// status are explicit so denial, EOF, and I/O failures can be tested without
+/// a real terminal or an installer. Piped input never counts as confirmation.
+fn confirm_upgrade(
+    command: &str,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<bool, String> {
+    if !interactive {
+        return Err(
+            "Upgrade requires confirmation from an interactive terminal.\n\
+             Use `bvr upgrade --yes` to confirm installation, or `bvr upgrade --dry-run` to inspect the command."
+                .to_string(),
+        );
+    }
+
+    write!(
+        output,
+        "Install the latest bvr release with:\n  {command}\nContinue? [y/N] "
+    )
+    .and_then(|()| output.flush())
+    .map_err(|error| format!("Could not display upgrade confirmation: {error}"))?;
+
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .map_err(|error| format!("Could not read upgrade confirmation: {error}"))?;
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
 /// `bvr upgrade` (issue #23): check the latest release and install it through
 /// the supported distribution mechanism. `--check-update` remains the
 /// non-mutating counterpart.
-fn run_upgrade(dry_run: bool) -> EarlyCommandOutcome {
+fn run_upgrade(dry_run: bool, yes: bool) -> EarlyCommandOutcome {
     let current = env!("CARGO_PKG_VERSION");
     let latest = match fetch_latest_version() {
         Ok(latest) => latest,
@@ -2812,6 +3168,36 @@ fn run_upgrade(dry_run: bool) -> EarlyCommandOutcome {
                     exit_code: ExitCode::SUCCESS,
                     to_stderr: false,
                 };
+            }
+
+            if !yes {
+                let stdin = std::io::stdin();
+                let stderr = std::io::stderr();
+                let interactive = stdin.is_terminal() && stderr.is_terminal();
+                let confirmation = confirm_upgrade(
+                    &rendered,
+                    interactive,
+                    &mut stdin.lock(),
+                    &mut stderr.lock(),
+                );
+                match confirmation {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return EarlyCommandOutcome {
+                            message: "Upgrade cancelled; no installation was attempted."
+                                .to_string(),
+                            exit_code: ExitCode::from(1),
+                            to_stderr: true,
+                        };
+                    }
+                    Err(message) => {
+                        return EarlyCommandOutcome {
+                            message,
+                            exit_code: ExitCode::from(1),
+                            to_stderr: true,
+                        };
+                    }
+                }
             }
 
             println!("Upgrading bvr v{current} -> v{latest}");
@@ -3075,28 +3461,19 @@ fn load_background_mode_from_user_config() -> Option<bool> {
 
 fn handle_operational_commands(cli: &Cli) -> EarlyCommandOutcome {
     if let Some(BvrCommand::Upgrade { dry_run }) = &cli.command {
-        return run_upgrade(*dry_run);
+        return run_upgrade(*dry_run, cli.yes);
+    }
+
+    if cli.rollback {
+        return EarlyCommandOutcome {
+            message: "bvr has no rollback backup: it installs through cargo, which replaces the binary in place.\n  Reinstall a specific release: cargo install beads_viewer_rust --version <x.y.z> --locked\n  Latest release: bvr upgrade".to_string(),
+            exit_code: ExitCode::from(2),
+            to_stderr: true,
+        };
     }
 
     if cli.check_update {
-        let current = env!("CARGO_PKG_VERSION");
-        let message = match fetch_latest_version() {
-            Ok(latest) => match compare_versions(current, &latest) {
-                Ordering::Less => format!(
-                    "Newer version available: v{latest} (you have v{current})\n  Update: bvr upgrade   (or: cargo install beads_viewer_rust --locked)"
-                ),
-                Ordering::Equal | Ordering::Greater => format!("Up to date (v{current})"),
-            },
-            Err(_) => format!(
-                "Could not check for updates (network unavailable).\nCurrent version: bvr v{current}"
-            ),
-        };
-
-        return EarlyCommandOutcome {
-            message,
-            exit_code: ExitCode::SUCCESS,
-            to_stderr: false,
-        };
+        return check_update_outcome(env!("CARGO_PKG_VERSION"), fetch_latest_version());
     }
 
     EarlyCommandOutcome {
@@ -3108,17 +3485,109 @@ fn handle_operational_commands(cli: &Cli) -> EarlyCommandOutcome {
     }
 }
 
+fn check_update_outcome(current: &str, latest: Result<String, String>) -> EarlyCommandOutcome {
+    let message = match latest {
+        Ok(latest) => match compare_versions(current, &latest) {
+            Ordering::Less => format!(
+                "Newer version available: v{latest} (you have v{current})\n  Update: bvr upgrade   (or: cargo install beads_viewer_rust --locked)"
+            ),
+            Ordering::Equal | Ordering::Greater => format!("Up to date (v{current})"),
+        },
+        Err(_) => format!(
+            "Could not check for updates (network unavailable).\nCurrent version: bvr v{current}"
+        ),
+    };
+
+    EarlyCommandOutcome {
+        message,
+        exit_code: ExitCode::SUCCESS,
+        to_stderr: false,
+    }
+}
+
 fn load_issues(cli: &Cli) -> bvr::Result<Vec<bvr::model::Issue>> {
     if let Some(ref_name) = &cli.as_of {
         return load_issues_at_revision(cli, ref_name);
     }
 
     match resolve_issue_load_target(cli)? {
-        IssueLoadTarget::BeadsFile(path) => loader::load_issues_from_file(&path),
+        IssueLoadTarget::BeadsFile(path) => loader::load_issues_from_path(&path),
         IssueLoadTarget::WorkspaceConfig(path) => loader::load_workspace_issues(&path),
         IssueLoadTarget::RepoPath(repo_path) => loader::load_issues(repo_path.as_deref())
             .map_err(|error| with_workspace_discovery_guidance(cli, error)),
     }
+}
+
+#[derive(Debug)]
+struct PagesHistorySnapshot {
+    repo_root: PathBuf,
+    relative_path: PathBuf,
+    revision: String,
+    workspace_prefix: Option<String>,
+}
+
+fn load_issues_for_pages(
+    cli: &Cli,
+    include_history: bool,
+) -> bvr::Result<(Vec<bvr::model::Issue>, Vec<PagesHistorySnapshot>)> {
+    if !include_history {
+        return load_issues(cli).map(|issues| (issues, Vec::new()));
+    }
+    let Some(revision) = cli.as_of.as_deref() else {
+        let issues = load_issues(cli)?;
+        let mut scan = GitHistoryScan::default();
+        let mut revisions = BTreeMap::<PathBuf, Option<String>>::new();
+        let mut snapshots = Vec::new();
+        // Pin both source identity and its commit before hooks can rewrite
+        // the same file, advance HEAD, or change the selected source.
+        for source in resolve_pages_history_sources(cli, Some(&issues))? {
+            let Some((repo, relative)) = pages_history_repository(&mut scan, &source)? else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) = revisions.entry(repo.clone())
+            {
+                entry.insert(scan.head_sha(&repo)?);
+            }
+            let Some(revision) = revisions.get(&repo).and_then(Option::as_ref) else {
+                continue;
+            };
+            snapshots.push(PagesHistorySnapshot {
+                repo_root: repo,
+                relative_path: relative,
+                revision: revision.clone(),
+                workspace_prefix: source.workspace_prefix,
+            });
+        }
+        return Ok((issues, snapshots));
+    };
+    // Carry the exact commit and selected path out of the historical load.
+    // A before-export hook may advance HEAD or change the source metadata.
+    let loaded = match resolve_issue_load_target(cli)? {
+        IssueLoadTarget::BeadsFile(path) => {
+            let (issues, snapshot) =
+                load_issues_from_history_file_path_with_snapshot(&path, revision)?;
+            (issues, vec![snapshot])
+        }
+        IssueLoadTarget::WorkspaceConfig(path) => {
+            load_workspace_issues_at_revision_with_snapshots(&path, revision)?
+        }
+        IssueLoadTarget::RepoPath(repo_path) => {
+            let beads_dir = loader::get_beads_dir(repo_path.as_deref())
+                .map_err(|error| with_workspace_discovery_guidance(cli, error))?;
+            let (issues, snapshot) = load_issues_from_history_beads_dir_with_snapshot(
+                &beads_dir, revision,
+            )?
+            .ok_or_else(|| {
+                bvr::BvrError::InvalidArgument(format!(
+                    "could not resolve historical beads JSONL inside {} at revision {revision}",
+                    beads_dir.display()
+                ))
+            })?;
+            (issues, vec![snapshot])
+        }
+    };
+    eprintln!("Loaded {} issues (as-of: {revision})", loaded.0.len());
+    Ok(loaded)
 }
 
 fn count_pages_export_issues(
@@ -3132,9 +3601,261 @@ fn count_pages_export_issues(
     }
 }
 
+#[derive(Debug)]
+enum PagesHistoryPath {
+    Jsonl(PathBuf),
+    HistoricalDirectory(PathBuf),
+}
+
+impl PagesHistoryPath {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Jsonl(path) | Self::HistoricalDirectory(path) => path,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PagesHistorySource {
+    path: PagesHistoryPath,
+    workspace_prefix: Option<String>,
+}
+
+fn resolve_pages_history_sources(
+    cli: &Cli,
+    issues: Option<&[bvr::model::Issue]>,
+) -> bvr::Result<Vec<PagesHistorySource>> {
+    let historical = cli.as_of.is_some();
+    let single = |path| PagesHistorySource {
+        path,
+        workspace_prefix: None,
+    };
+    match resolve_issue_load_target(cli)? {
+        IssueLoadTarget::BeadsFile(path) => {
+            let source = if historical && path.is_dir() {
+                Some(PagesHistoryPath::HistoricalDirectory(
+                    loader::resolve_beads_redirect(&path)?,
+                ))
+            } else if historical {
+                Some(PagesHistoryPath::Jsonl(path))
+            } else {
+                loader::issue_path_history_jsonl(&path)?.map(PagesHistoryPath::Jsonl)
+            };
+            Ok(source.into_iter().map(single).collect())
+        }
+        IssueLoadTarget::RepoPath(repo_path) => {
+            let source = if historical {
+                Some(PagesHistoryPath::HistoricalDirectory(
+                    loader::get_beads_dir(repo_path.as_deref())?,
+                ))
+            } else {
+                loader::issue_history_jsonl(repo_path.as_deref())?.map(PagesHistoryPath::Jsonl)
+            };
+            Ok(source.into_iter().map(single).collect())
+        }
+        IssueLoadTarget::WorkspaceConfig(config_path) => {
+            let config = loader::load_workspace_config(&config_path)?;
+            let workspace_root = loader::resolve_workspace_root(&config_path);
+            let mut sources = Vec::new();
+            for repo in config
+                .repos
+                .iter()
+                .filter(|repo| repo.enabled.unwrap_or(true))
+            {
+                let prefix = repo.effective_prefix();
+                if issues.is_some_and(|issues| {
+                    !issues
+                        .iter()
+                        .any(|issue| issue.workspace_prefix.as_deref() == Some(prefix.as_str()))
+                }) {
+                    continue;
+                }
+                let configured_path = Path::new(repo.path.trim());
+                let repo_path = if configured_path.is_absolute() {
+                    configured_path.to_path_buf()
+                } else {
+                    workspace_root.join(configured_path)
+                };
+                let beads_dir = repo_path.join(repo.effective_beads_path(Some(&config.defaults)));
+                let path = if historical {
+                    Some(PagesHistoryPath::HistoricalDirectory(
+                        loader::resolve_beads_redirect(&beads_dir)?,
+                    ))
+                } else if beads_dir.is_dir() {
+                    match loader::issue_path_history_jsonl(&beads_dir) {
+                        Ok(path) => path.map(PagesHistoryPath::Jsonl),
+                        // Automatic workspace discovery can include an
+                        // uninitialized repository with no issue source.
+                        Err(bvr::BvrError::MissingBeadsFile(_)) => None,
+                        Err(error) if issues.is_none() => {
+                            // Watch discovery runs before issue loading. An
+                            // unavailable optional repository must not make
+                            // a partially readable workspace unexportable;
+                            // the loader still enforces explicit source modes.
+                            eprintln!(
+                                "warning: workspace history source {} unavailable: {error}",
+                                beads_dir.display()
+                            );
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                if let Some(path) = path {
+                    sources.push(PagesHistorySource {
+                        path,
+                        workspace_prefix: Some(prefix),
+                    });
+                }
+            }
+            Ok(sources)
+        }
+    }
+}
+
+fn pages_history_repository(
+    scan: &mut GitHistoryScan,
+    source: &PagesHistorySource,
+) -> bvr::Result<Option<(PathBuf, PathBuf)>> {
+    let absolute = absolute_from_current_dir(source.path.path());
+    let path = match fs::canonicalize(&absolute) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A selected historical file or directory may have been removed
+            // from the working tree. Resolve its existing ancestor instead.
+            let ancestor = absolute
+                .ancestors()
+                .find(|path| path.is_dir())
+                .ok_or_else(|| {
+                    bvr::BvrError::InvalidArgument(format!(
+                        "could not resolve history source {}",
+                        absolute.display()
+                    ))
+                })?;
+            fs::canonicalize(ancestor)?.join(
+                absolute
+                    .strip_prefix(ancestor)
+                    .expect("ancestor contains source"),
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let directory = path.ancestors().find(|path| path.is_dir()).ok_or_else(|| {
+        bvr::BvrError::InvalidArgument(format!(
+            "could not resolve history source directory {}",
+            path.display()
+        ))
+    })?;
+    let root = match scan.repository_root(directory) {
+        Ok(Some(root)) => root,
+        // Git enriches a live export when available. Only absence of the
+        // executable permits fallback; failed Git commands, damaged history,
+        // and timeouts must still preserve the previously published bundle.
+        Ok(None) | Err(bvr::BvrError::GitUnavailable { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| {
+            bvr::BvrError::InvalidArgument(format!(
+                "history source {} is outside repository {}",
+                path.display(),
+                root.display()
+            ))
+        })?
+        .to_path_buf();
+    Ok(Some((root, relative)))
+}
+
+fn pages_history_revision(
+    cli: &Cli,
+    scan: &mut GitHistoryScan,
+    repo: &Path,
+) -> bvr::Result<Option<String>> {
+    match cli.as_of.as_deref() {
+        Some(revision) => scan.resolve_revision(repo, revision).map(Some),
+        None => scan.head_sha(repo),
+    }
+}
+
+fn export_pages_for_cli(
+    cli: &Cli,
+    issues: &[bvr::model::Issue],
+    output_dir: &Path,
+    options: &bvr::export_pages::ExportPagesOptions,
+    context: &[PagesHistorySnapshot],
+) -> bvr::Result<bvr::export_pages::ExportPagesSummary> {
+    if !options.include_history {
+        return bvr::export_pages::export_pages_bundle(issues, output_dir, options);
+    }
+    let mut scan = GitHistoryScan::default();
+    let mut histories = BTreeMap::new();
+    for snapshot in context {
+        let aliases = pages_history_aliases(
+            issues,
+            snapshot.workspace_prefix.as_deref(),
+            options.include_closed,
+        );
+        if aliases.is_empty() {
+            continue;
+        }
+        histories.extend(scan.load_timeline(
+            &snapshot.repo_root,
+            &snapshot.relative_path,
+            &snapshot.revision,
+            &aliases,
+            cli.history_limit,
+            cli.history_since.as_deref(),
+        )?);
+    }
+    bvr::export_pages::export_pages_bundle_with_history(issues, output_dir, options, &histories)
+}
+
+fn pages_history_aliases(
+    issues: &[bvr::model::Issue],
+    workspace_prefix: Option<&str>,
+    include_closed: bool,
+) -> BTreeMap<String, String> {
+    issues
+        .iter()
+        .filter(|issue| include_closed || issue.is_open_like())
+        .filter(|issue| {
+            workspace_prefix.is_none_or(|prefix| issue.workspace_prefix.as_deref() == Some(prefix))
+        })
+        .map(|issue| {
+            let raw_id = if workspace_prefix.is_some() {
+                issue.workspace_local_id.as_deref().unwrap_or(&issue.id)
+            } else {
+                &issue.id
+            };
+            (raw_id.to_string(), issue.id.clone())
+        })
+        .collect()
+}
+
+fn capture_pages_history_revisions(cli: &Cli) -> bvr::Result<BTreeMap<PathBuf, Option<String>>> {
+    let mut revisions = BTreeMap::new();
+    if !cli.pages_include_history {
+        return Ok(revisions);
+    }
+    let mut scan = GitHistoryScan::default();
+    for source in resolve_pages_history_sources(cli, None)? {
+        let Some((repo, _)) = pages_history_repository(&mut scan, &source)? else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = revisions.entry(repo.clone()) {
+            let revision = pages_history_revision(cli, &mut scan, &repo)?;
+            entry.insert(revision);
+        }
+    }
+    Ok(revisions)
+}
+
 fn resolve_watch_export_paths(cli: &Cli) -> bvr::Result<Vec<PathBuf>> {
     match resolve_issue_load_target(cli)? {
-        IssueLoadTarget::BeadsFile(path) => Ok(vec![path]),
+        IssueLoadTarget::BeadsFile(path) => loader::issue_path_watch_paths(&path),
         IssueLoadTarget::WorkspaceConfig(path) => {
             let mut paths = vec![path.clone()];
             paths.extend(loader::find_workspace_issue_paths(&path)?);
@@ -3142,23 +3863,53 @@ fn resolve_watch_export_paths(cli: &Cli) -> bvr::Result<Vec<PathBuf>> {
             paths.dedup();
             Ok(paths)
         }
-        IssueLoadTarget::RepoPath(repo_path) => {
-            let beads_dir = loader::get_beads_dir(repo_path.as_deref())
-                .map_err(|error| with_workspace_discovery_guidance(cli, error))?;
-            let beads_path = loader::find_jsonl_path(&beads_dir)
-                .map_err(|error| with_workspace_discovery_guidance(cli, error))?;
-            Ok(vec![beads_path])
-        }
+        IssueLoadTarget::RepoPath(repo_path) => loader::issue_watch_paths(repo_path.as_deref())
+            .map_err(|error| with_workspace_discovery_guidance(cli, error)),
     }
 }
 
-fn watch_export_token_for_path(path: &Path) -> bvr::Result<Option<FileWatchToken>> {
-    file_watch_token(path).map_err(|error| {
-        bvr::BvrError::InvalidArgument(format!(
-            "failed to read watch source {}: {error}",
-            path.display()
-        ))
+fn capture_initial_watch_export_tokens(
+    cli: &Cli,
+) -> bvr::Result<Vec<(PathBuf, Option<FileWatchToken>)>> {
+    resolve_watch_export_paths(cli)?
+        .into_iter()
+        .map(|path| {
+            // Reading a live backend here would perform a second load and
+            // could establish a different snapshot. Fill its token from the
+            // initial load's cache after the export instead.
+            let token = if path.is_dir() {
+                None
+            } else {
+                watch_export_token_for_path(&path)
+            };
+            Ok((path, token))
+        })
+        .collect()
+}
+
+fn cached_dolt_watch_token(path: &Path) -> Option<FileWatchToken> {
+    loader::cached_dolt_snapshot_hash(path).map(|content_fingerprint| FileWatchToken {
+        modified_millis: 0,
+        len_bytes: 0,
+        content_fingerprint,
     })
+}
+
+fn watch_export_token_for_path(path: &Path) -> Option<FileWatchToken> {
+    match file_watch_token(path) {
+        Ok(token) => token,
+        Err(error) => {
+            // A candidate fallback may be unreadable while the preferred
+            // source is healthy. The loader decides whether usable data is
+            // available; token sampling must not prevent that load or lose
+            // the other watched paths. A later readable token is a change.
+            eprintln!(
+                "warning: cannot read watch source {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn reconcile_watch_export_paths(
@@ -3178,7 +3929,7 @@ fn reconcile_watch_export_paths(
             Some(existing) => existing,
             None => {
                 path_set_changed = true;
-                watch_export_token_for_path(&path)?
+                watch_export_token_for_path(&path)
             }
         };
         next_tokens.push((path, token));
@@ -3201,6 +3952,16 @@ fn file_watch_token(path: &Path) -> bvr::Result<Option<FileWatchToken>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(bvr::BvrError::Io(error)),
     };
+    if metadata.is_dir() {
+        let issues = loader::load_issues_from_path(path)?;
+        return Ok(Some(FileWatchToken {
+            // Backend maintenance can change directory metadata without
+            // changing an issue. Only complete live content controls reloads.
+            modified_millis: 0,
+            len_bytes: 0,
+            content_fingerprint: bvr::robot::compute_snapshot_hash(&issues),
+        }));
+    }
     let modified_millis = metadata
         .modified()
         .ok()
@@ -3222,25 +3983,124 @@ fn load_issues_from_git_relative_path(
     relative_path: &Path,
     revision: &str,
 ) -> bvr::Result<Vec<bvr::model::Issue>> {
-    let git_ref = format!("{revision}:{}", relative_path.to_string_lossy());
+    let bytes = read_historical_blob(
+        repo_root,
+        relative_path,
+        revision,
+        HISTORICAL_SNAPSHOT_MAX_BYTES,
+    )?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        bvr::BvrError::InvalidIssue(format!(
+            "historical snapshot {} at revision {revision} is not UTF-8: {error}",
+            relative_path.display()
+        ))
+    })?;
+    parse_issues_from_jsonl_text(text).map_err(|error| {
+        bvr::BvrError::InvalidIssue(format!(
+            "historical snapshot {} at revision {revision}: {error}",
+            relative_path.display()
+        ))
+    })
+}
+
+const HISTORICAL_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const HISTORICAL_METADATA_MAX_BYTES: u64 = 1024 * 1024;
+
+fn resolve_historical_commit(repo_root: &Path, revision: &str) -> bvr::Result<Option<String>> {
+    // Pin the revision once so metadata and its declared snapshot cannot come
+    // from different commits when a branch advances during the load.
     let output = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .arg("-C")
         .arg(repo_root)
-        .arg("show")
-        .arg(&git_ref)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("{revision}^{{commit}}"))
         .output()?;
-
     if !output.status.success() {
-        return Err(bvr::BvrError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "could not load {} at revision {revision}",
-                relative_path.display()
-            ),
-        )));
+        let is_absent = |output: &std::process::Output| {
+            output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty()
+        };
+        if !is_absent(&output) {
+            return Err(bvr::BvrError::InvalidIssue(format!(
+                "could not read historical revision {revision} in {}: {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let named = Command::new("git")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(revision)
+            .output()?;
+        if !is_absent(&named) {
+            return Err(bvr::BvrError::InvalidIssue(format!(
+                "historical revision {revision} is not a readable commit in {}: {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&named.stderr).trim()
+            )));
+        }
+        return Ok(None);
+    }
+    let commit = String::from_utf8(output.stdout).map_err(|error| {
+        bvr::BvrError::InvalidArgument(format!(
+            "git returned an invalid commit for revision {revision}: {error}"
+        ))
+    })?;
+    Ok(Some(commit.trim().to_string()))
+}
+
+fn read_historical_blob(
+    repo_root: &Path,
+    relative_path: &Path,
+    revision: &str,
+    max_bytes: u64,
+) -> bvr::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let object_spec = format!("{revision}:{}", relative_path.to_string_lossy());
+    let invalid = |detail: String| {
+        bvr::BvrError::InvalidIssue(format!(
+            "historical file {} at revision {revision}: {detail}",
+            relative_path.display()
+        ))
+    };
+    let size = git_blob_size(repo_root, &object_spec)?
+        .ok_or_else(|| invalid("declared snapshot is missing or unreadable".to_string()))?;
+    if size > max_bytes {
+        return Err(invalid(format!("exceeds {max_bytes} bytes")));
     }
 
-    parse_issues_from_jsonl_text(&String::from_utf8_lossy(&output.stdout))
+    // Request raw blob bytes, without pretty-printing a tree or invoking a
+    // worktree filter. Bound the actual read as well as Git's reported size.
+    let mut child = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["cat-file", "blob"])
+        .arg(&object_spec)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped Git blob stdout");
+    let mut bytes = Vec::new();
+    let result = stdout.take(max_bytes + 1).read_to_end(&mut bytes);
+    if result.is_err() || bytes.len() as u64 > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        result.map_err(|error| invalid(format!("could not read blob: {error}")))?;
+        return Err(invalid(format!("exceeds {max_bytes} bytes")));
+    }
+    let status = child.wait()?;
+    if !status.success() || bytes.len() as u64 != size {
+        return Err(invalid(format!(
+            "could not read a complete Git blob ({status})"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn historical_jsonl_skip_file_name(file_name: &str) -> bool {
@@ -3254,6 +4114,7 @@ fn historical_jsonl_skip_file_name(file_name: &str) -> bool {
 
 fn git_blob_size(repo_root: &Path, object_spec: &str) -> bvr::Result<Option<u64>> {
     let output = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .arg("-C")
         .arg(repo_root)
         .arg("cat-file")
@@ -3262,6 +4123,29 @@ fn git_blob_size(repo_root: &Path, object_spec: &str) -> bvr::Result<Option<u64>
         .output()?;
 
     if !output.status.success() {
+        // A failed cat-file can mean a missing path or a damaged object.
+        // Inspect its tree entry before classifying the snapshot as absent:
+        // ls-tree need not open the referenced blob to prove it was committed.
+        let (revision, path) = object_spec.split_once(':').ok_or_else(|| {
+            bvr::BvrError::InvalidArgument(format!(
+                "invalid historical Git object specification: {object_spec}"
+            ))
+        })?;
+        let entry = Command::new("git")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["ls-tree", "-z", "--full-tree"])
+            .arg(revision)
+            .arg("--")
+            .arg(path)
+            .output()?;
+        if !entry.status.success() || !entry.stdout.is_empty() {
+            return Err(bvr::BvrError::InvalidIssue(format!(
+                "historical Git object {object_spec} is unreadable; its absence could not be established"
+            )));
+        }
         return Ok(None);
     }
 
@@ -3278,37 +4162,75 @@ fn resolve_historical_jsonl_relative_path(
     repo_root: &Path,
     beads_dir_relative: &Path,
     revision: &str,
-) -> bvr::Result<PathBuf> {
+) -> bvr::Result<Option<PathBuf>> {
+    let metadata_path = beads_dir_relative.join("metadata.json");
+    let metadata_spec = format!("{revision}:{}", metadata_path.to_string_lossy());
+    if git_blob_size(repo_root, &metadata_spec)?.is_some() {
+        let bytes = read_historical_blob(
+            repo_root,
+            &metadata_path,
+            revision,
+            HISTORICAL_METADATA_MAX_BYTES,
+        )?;
+        let metadata: loader::BeadsMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+            bvr::BvrError::InvalidIssue(format!(
+                "historical metadata {} at revision {revision} is invalid: {error}",
+                metadata_path.display()
+            ))
+        })?;
+        let declared = metadata.jsonl_export.trim();
+        if !declared.is_empty() {
+            let path = historical_metadata_jsonl_path(repo_root, beads_dir_relative, declared)
+                .map_err(|error| {
+                    bvr::BvrError::InvalidIssue(format!(
+                        "historical metadata {} at revision {revision}: {error}",
+                        metadata_path.display()
+                    ))
+                })?;
+            // An explicit export remains authoritative when empty or missing.
+            // The blob reader diagnoses a missing declaration instead of
+            // silently choosing a different, potentially stale issue file.
+            return Ok(Some(path));
+        }
+    }
+
     for preferred in ["beads.jsonl", "issues.jsonl", "beads.base.jsonl"] {
         let candidate = beads_dir_relative.join(preferred);
         let object_spec = format!("{revision}:{}", candidate.to_string_lossy());
         if git_blob_size(repo_root, &object_spec)?.is_some_and(|size| size > 0) {
-            return Ok(candidate);
+            return Ok(Some(candidate));
         }
     }
 
     let directory_spec = format!("{revision}:{}", beads_dir_relative.to_string_lossy());
+    if git_blob_size(repo_root, &directory_spec)?.is_none() {
+        return Ok(None);
+    }
     let output = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .arg("-C")
         .arg(repo_root)
         .arg("ls-tree")
         .arg("--name-only")
+        .arg("-z")
         .arg(&directory_spec)
         .output()?;
 
     if !output.status.success() {
-        return Err(bvr::BvrError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "could not resolve historical beads directory {} at revision {revision}",
-                beads_dir_relative.display()
-            ),
+        return Err(bvr::BvrError::InvalidIssue(format!(
+            "could not read historical beads directory {} at revision {revision}",
+            beads_dir_relative.display()
         )));
     }
 
-    let mut fallback_candidates = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
+    let names = std::str::from_utf8(&output.stdout).map_err(|error| {
+        bvr::BvrError::InvalidIssue(format!(
+            "historical beads directory {} at revision {revision} contains invalid UTF-8 paths: {error}",
+            beads_dir_relative.display()
+        ))
+    })?;
+    let mut fallback_candidates = names
+        .split('\0')
         .filter(|line| !line.is_empty())
         .filter(|line| line.ends_with(".jsonl"))
         .filter(|line| !historical_jsonl_skip_file_name(&line.to_ascii_lowercase()))
@@ -3316,34 +4238,87 @@ fn resolve_historical_jsonl_relative_path(
         .collect::<Vec<_>>();
     fallback_candidates.sort();
 
-    fallback_candidates
+    Ok(fallback_candidates
         .into_iter()
         .next()
-        .map(|relative_file_name| beads_dir_relative.join(relative_file_name))
-        .ok_or_else(|| {
-            bvr::BvrError::InvalidArgument(format!(
-                "could not resolve historical beads JSONL inside {} at revision {revision}",
-                beads_dir_relative.display()
-            ))
-        })
+        .map(|relative_file_name| beads_dir_relative.join(relative_file_name)))
+}
+
+fn historical_metadata_jsonl_path(
+    repo_root: &Path,
+    beads_dir_relative: &Path,
+    declared: &str,
+) -> bvr::Result<PathBuf> {
+    use std::path::Component;
+
+    let declared = Path::new(declared);
+    let joined = if declared.is_absolute() {
+        declared
+            .strip_prefix(repo_root)
+            .map_err(|_| {
+                bvr::BvrError::InvalidIssue(format!(
+                    "jsonl_export {} is outside repository {}",
+                    declared.display(),
+                    repo_root.display()
+                ))
+            })?
+            .to_path_buf()
+    } else {
+        beads_dir_relative.join(declared)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop() => {}
+            _ => {
+                return Err(bvr::BvrError::InvalidIssue(format!(
+                    "jsonl_export {} escapes the historical repository",
+                    declared.display()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn load_issues_from_history_beads_dir(
     beads_dir: &Path,
     revision: &str,
-) -> bvr::Result<Vec<bvr::model::Issue>> {
-    let absolute_beads_dir = absolute_from_current_dir(beads_dir);
-    let repo_root = resolve_git_toplevel(
+) -> bvr::Result<Option<Vec<bvr::model::Issue>>> {
+    load_issues_from_history_beads_dir_with_snapshot(beads_dir, revision)
+        .map(|loaded| loaded.map(|(issues, _)| issues))
+}
+
+fn load_issues_from_history_beads_dir_with_snapshot(
+    beads_dir: &Path,
+    revision: &str,
+) -> bvr::Result<Option<(Vec<bvr::model::Issue>, PagesHistorySnapshot)>> {
+    let beads_dir = loader::resolve_beads_redirect(beads_dir)?;
+    let absolute_beads_dir = absolute_from_current_dir(&beads_dir);
+    let Some(repo_root) = resolve_git_toplevel(
         absolute_beads_dir
             .parent()
             .unwrap_or_else(|| Path::new(".")),
-    )
-    .ok_or_else(|| {
-        bvr::BvrError::InvalidArgument(format!(
-            "could not determine repository root for historical beads dir {}",
-            absolute_beads_dir.display()
-        ))
-    })?;
+    ) else {
+        // A checkout without Git history can be absent from a workspace
+        // baseline. A present but unusable Git marker is a damaged source.
+        for ancestor in absolute_beads_dir.ancestors().skip(1) {
+            let marker = ancestor.join(".git");
+            match fs::symlink_metadata(&marker) {
+                Ok(_) => {
+                    return Err(bvr::BvrError::InvalidIssue(format!(
+                        "could not resolve historical repository with Git marker {} at revision {revision}",
+                        marker.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(bvr::BvrError::Io(error)),
+            }
+        }
+        return Ok(None);
+    };
     let beads_dir_relative = absolute_beads_dir.strip_prefix(&repo_root).map_err(|_| {
         bvr::BvrError::InvalidArgument(format!(
             "historical beads dir {} is outside repository root {}",
@@ -3351,16 +4326,55 @@ fn load_issues_from_history_beads_dir(
             repo_root.display()
         ))
     })?;
-    let jsonl_relative =
-        resolve_historical_jsonl_relative_path(&repo_root, beads_dir_relative, revision)?;
-
-    load_issues_from_git_relative_path(&repo_root, &jsonl_relative, revision)
+    let Some(commit) = resolve_historical_commit(&repo_root, revision)? else {
+        return Ok(None);
+    };
+    let result: bvr::Result<_> = (|| {
+        let Some(jsonl_relative) =
+            resolve_historical_jsonl_relative_path(&repo_root, beads_dir_relative, &commit)?
+        else {
+            return Ok(None);
+        };
+        let issues = load_issues_from_git_relative_path(&repo_root, &jsonl_relative, &commit)?;
+        Ok(Some((
+            issues,
+            PagesHistorySnapshot {
+                repo_root: repo_root.clone(),
+                relative_path: jsonl_relative,
+                revision: commit.clone(),
+                workspace_prefix: None,
+            },
+        )))
+    })();
+    result.map_err(|error| {
+        bvr::BvrError::InvalidIssue(format!(
+            "could not load historical snapshot in {} at revision {revision}: {error}",
+            absolute_beads_dir.display()
+        ))
+    })
 }
 
 fn load_issues_from_history_file_path(
     path: &Path,
     revision: &str,
 ) -> bvr::Result<Vec<bvr::model::Issue>> {
+    load_issues_from_history_file_path_with_snapshot(path, revision).map(|(issues, _)| issues)
+}
+
+fn load_issues_from_history_file_path_with_snapshot(
+    path: &Path,
+    revision: &str,
+) -> bvr::Result<(Vec<bvr::model::Issue>, PagesHistorySnapshot)> {
+    if path.is_dir() {
+        return load_issues_from_history_beads_dir_with_snapshot(path, revision)?.ok_or_else(
+            || {
+                bvr::BvrError::InvalidArgument(format!(
+                    "could not resolve historical beads JSONL inside {} at revision {revision}",
+                    path.display()
+                ))
+            },
+        );
+    }
     let absolute_path = absolute_from_current_dir(path);
     let repo_root = resolve_git_toplevel(absolute_path.parent().unwrap_or_else(|| Path::new(".")))
         .ok_or_else(|| {
@@ -3377,13 +4391,43 @@ fn load_issues_from_history_file_path(
         ))
     })?;
 
-    load_issues_from_git_relative_path(&repo_root, relative_path, revision)
+    let commit = resolve_historical_commit(&repo_root, revision)?.ok_or_else(|| {
+        bvr::BvrError::InvalidArgument(format!(
+            "could not resolve historical revision {revision} for {}",
+            relative_path.display()
+        ))
+    })?;
+    let issues = load_issues_from_git_relative_path(&repo_root, relative_path, &commit).map_err(
+        |error| {
+            bvr::BvrError::InvalidIssue(format!(
+                "could not load historical snapshot {} at revision {revision}: {error}",
+                relative_path.display()
+            ))
+        },
+    )?;
+    Ok((
+        issues,
+        PagesHistorySnapshot {
+            repo_root: repo_root.clone(),
+            relative_path: relative_path.to_path_buf(),
+            revision: commit,
+            workspace_prefix: None,
+        },
+    ))
 }
 
 fn load_workspace_issues_at_revision(
     config_path: &Path,
     revision: &str,
 ) -> bvr::Result<Vec<bvr::model::Issue>> {
+    load_workspace_issues_at_revision_with_snapshots(config_path, revision)
+        .map(|(issues, _)| issues)
+}
+
+fn load_workspace_issues_at_revision_with_snapshots(
+    config_path: &Path,
+    revision: &str,
+) -> bvr::Result<(Vec<bvr::model::Issue>, Vec<PagesHistorySnapshot>)> {
     let config = loader::load_workspace_config(config_path)?;
     let workspace_root = loader::resolve_workspace_root(config_path);
     let enabled_repos = config
@@ -3398,7 +4442,9 @@ fn load_workspace_issues_at_revision(
         .collect::<Vec<_>>();
 
     let mut all_issues = Vec::new();
-    let mut failed_repos = Vec::new();
+    let mut snapshots = Vec::new();
+    let mut absent_repos = Vec::new();
+    let mut loaded_repos = 0usize;
 
     for repo in enabled_repos {
         let repo_name = repo.effective_name();
@@ -3410,34 +4456,46 @@ fn load_workspace_issues_at_revision(
         };
         let beads_dir = repo_path.join(repo.effective_beads_path(Some(&config.defaults)));
 
-        let repo_issues = (|| -> bvr::Result<Vec<bvr::model::Issue>> {
-            let mut issues = load_issues_from_history_beads_dir(&beads_dir, revision)?;
-            loader::namespace_workspace_issues(&mut issues, &prefix, &repo_name, &known_prefixes);
-            Ok(issues)
-        })();
-
-        match repo_issues {
-            Ok(mut issues) => all_issues.append(&mut issues),
-            Err(error) => {
-                tracing::warn!(
-                    "workspace repo '{}' failed to load at {}: {}",
-                    repo_name,
-                    revision,
-                    error
+        match load_issues_from_history_beads_dir_with_snapshot(&beads_dir, revision) {
+            Ok(Some((mut issues, mut snapshot))) => {
+                loader::namespace_workspace_issues(
+                    &mut issues,
+                    &prefix,
+                    &repo_name,
+                    &known_prefixes,
                 );
-                failed_repos.push(repo_name);
+                snapshot.workspace_prefix = Some(prefix);
+                snapshots.push(snapshot);
+                all_issues.append(&mut issues);
+                loaded_repos += 1;
+            }
+            Ok(None) => {
+                // A repository added after the baseline legitimately has no
+                // historical snapshot. Corrupt existing snapshots take the
+                // error branch below and must never disappear from a diff.
+                tracing::warn!(
+                    "workspace repo '{}' has no historical snapshot at {}",
+                    repo_name,
+                    revision
+                );
+                absent_repos.push(repo_name);
+            }
+            Err(error) => {
+                return Err(bvr::BvrError::InvalidIssue(format!(
+                    "workspace repo '{repo_name}' failed to load at revision {revision}: {error}"
+                )));
             }
         }
     }
 
-    if all_issues.is_empty() && !failed_repos.is_empty() {
+    if loaded_repos == 0 && !absent_repos.is_empty() {
         return Err(bvr::BvrError::InvalidArgument(format!(
             "workspace historical load failed for all repositories at {revision}: {}",
-            failed_repos.join(", ")
+            absent_repos.join(", ")
         )));
     }
 
-    Ok(all_issues)
+    Ok((all_issues, snapshots))
 }
 
 fn load_issues_at_revision(cli: &Cli, revision: &str) -> bvr::Result<Vec<bvr::model::Issue>> {
@@ -3487,7 +4545,28 @@ fn resolve_forecast_sprint_beads(cli: &Cli, sprint_id: &str) -> bvr::Result<BTre
 
 fn load_issues_for_diff(cli: &Cli, diff_since: &str) -> bvr::Result<Vec<bvr::model::Issue>> {
     if let Some(path) = resolve_cli_reference_file_path(diff_since, cli) {
-        let mut issues = loader::load_issues_from_file(&path)?;
+        use std::io::Read;
+
+        let invalid = |detail: String| {
+            bvr::BvrError::InvalidIssue(format!(
+                "historical snapshot {} for --diff-since={diff_since}: {detail}",
+                path.display()
+            ))
+        };
+        let mut bytes = Vec::new();
+        fs::File::open(&path)?
+            .take(HISTORICAL_SNAPSHOT_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| invalid(format!("could not read snapshot: {error}")))?;
+        if bytes.len() as u64 > HISTORICAL_SNAPSHOT_MAX_BYTES {
+            return Err(invalid(format!(
+                "exceeds {HISTORICAL_SNAPSHOT_MAX_BYTES} bytes"
+            )));
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| invalid(format!("snapshot is not UTF-8: {error}")))?;
+        let mut issues =
+            parse_issues_from_jsonl_text(text).map_err(|error| invalid(error.to_string()))?;
         // When the current load target is a workspace, namespace the baseline
         // issues the same way the live workspace pipeline does, so diff IDs match.
         if let Ok(IssueLoadTarget::WorkspaceConfig(config_path)) = resolve_issue_load_target(cli) {
@@ -3532,15 +4611,20 @@ fn load_historical_issues_for_load_target(
         IssueLoadTarget::RepoPath(repo_path) => {
             let beads_dir = loader::get_beads_dir(repo_path.as_deref())
                 .map_err(|error| with_workspace_discovery_guidance(cli, error))?;
-            load_issues_from_history_beads_dir(&beads_dir, reference)
+            load_issues_from_history_beads_dir(&beads_dir, reference)?.ok_or_else(|| {
+                bvr::BvrError::InvalidArgument(format!(
+                    "could not resolve historical beads JSONL inside {} at revision {reference}",
+                    beads_dir.display()
+                ))
+            })
         }
     }
 }
 
 fn load_issues_from_git_ref(cli: &Cli, reference: &str) -> bvr::Result<Vec<bvr::model::Issue>> {
-    load_historical_issues_for_load_target(cli, reference).map_err(|_| {
+    load_historical_issues_for_load_target(cli, reference).map_err(|error| {
         bvr::BvrError::InvalidArgument(format!(
-            "could not resolve --diff-since={reference} to a historical beads JSONL snapshot"
+            "could not resolve --diff-since={reference} to a historical beads JSONL snapshot: {error}"
         ))
     })
 }
@@ -3592,45 +4676,52 @@ fn resolve_as_of(cli: &Cli) -> (Option<String>, Option<String>) {
     (Some(ref_name.clone()), commit)
 }
 
-fn latest_commit_sha(cli: &Cli) -> Option<String> {
-    let repo_root = resolve_repo_root(cli)?;
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo_root)
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
-    }
+fn latest_commit_sha(cli: &Cli, scan: &mut GitHistoryScan) -> bvr::Result<Option<String>> {
+    scan.head_sha(&project_dir_for_load_target(cli)?)
 }
 
+/// Preserve the live loader's mixed-record tolerance and last-record-wins
+/// behavior, while refusing files that cannot establish a historical snapshot.
+/// In particular, a corrupt nonempty baseline is not an empty issue database.
 fn parse_issues_from_jsonl_text(text: &str) -> bvr::Result<Vec<bvr::model::Issue>> {
-    let mut issues = Vec::<bvr::model::Issue>::new();
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
+    if text.contains('\0') {
+        return Err(bvr::BvrError::InvalidIssue(
+            "historical snapshot contains NUL bytes".to_string(),
+        ));
+    }
+    let mut nonblank = false;
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        let line = if index == 0 {
+            raw_line.trim_start_matches('\u{feff}').trim()
+        } else {
+            raw_line.trim()
+        };
         if line.is_empty() {
             continue;
         }
-
-        let mut issue: bvr::model::Issue = serde_json::from_str(line)?;
-        issue.status = issue.normalized_status();
-        issue.validate()?;
-        issues.push(issue);
+        nonblank = true;
+        if line.starts_with("version https://git-lfs.github.com/spec/") {
+            return Err(bvr::BvrError::InvalidIssue(format!(
+                "historical snapshot is a Git LFS pointer on line {line_no}; materialize the JSONL snapshot"
+            )));
+        }
+        if line.starts_with("<<<<<<<")
+            || line.starts_with("|||||||")
+            || line.starts_with("=======")
+            || line.starts_with(">>>>>>>")
+        {
+            return Err(bvr::BvrError::InvalidIssue(format!(
+                "historical snapshot contains a merge conflict marker on line {line_no}"
+            )));
+        }
     }
-
+    let issues = loader::parse_issues_from_text(text)?;
+    if nonblank && issues.is_empty() {
+        return Err(bvr::BvrError::InvalidIssue(
+            "nonempty historical snapshot contains no valid issue records".to_string(),
+        ));
+    }
     Ok(issues)
 }
 
@@ -3685,14 +4776,18 @@ fn build_robot_history_output(
 
     let mut commit_index = BTreeMap::<String, Vec<String>>::new();
     let mut method_distribution = BTreeMap::<String, usize>::new();
-    let mut latest_sha = latest_commit_sha(cli);
+    let mut latest_sha = None;
+    // One budget covers log loading and correlation across the workspace.
+    let mut history_scan = GitHistoryScan::default();
 
     if let Some(workspace_repos) = resolve_workspace_history_repos(cli, issues)? {
         let mut latest_commit = None::<(String, String)>;
         for workspace_repo in workspace_repos {
-            let repo_root = resolve_git_toplevel(&workspace_repo.repo_root)
+            let repo_root = history_scan
+                .repository_root(&workspace_repo.repo_root)?
                 .unwrap_or_else(|| workspace_repo.repo_root.clone());
-            let commits = load_git_commits(&repo_root, cli.history_limit, history_since)?;
+            let commits =
+                history_scan.load_commits(&repo_root, cli.history_limit, history_since)?;
             if let Some(commit) = commits.first() {
                 update_latest_history_commit_sha(
                     &mut latest_commit,
@@ -3700,38 +4795,39 @@ fn build_robot_history_output(
                     &commit.sha,
                 );
             }
-            correlate_histories_with_git_aliases(
+            history_scan.correlate_histories(
                 &repo_root,
                 &commits,
                 &mut histories_map,
                 &mut commit_index,
                 &mut method_distribution,
                 &workspace_repo.aliases,
-            );
+            )?;
         }
         if let Some((_, sha)) = latest_commit {
             latest_sha = Some(sha);
         }
     } else {
         let workspace_aliases = build_workspace_id_aliases(issues);
-        if let Some(repo_root) = resolve_repo_root(cli) {
-            let commits = load_git_commits(&repo_root, cli.history_limit, history_since)?;
+        if let Some(repo_root) = history_scan.repository_root(&project_dir_for_load_target(cli)?)? {
+            let commits =
+                history_scan.load_commits(&repo_root, cli.history_limit, history_since)?;
             if let Some(commit) = commits.first() {
                 latest_sha = Some(commit.sha.clone());
             }
-            correlate_histories_with_git_aliases(
+            history_scan.correlate_histories(
                 &repo_root,
                 &commits,
                 &mut histories_map,
                 &mut commit_index,
                 &mut method_distribution,
                 &workspace_aliases,
-            );
+            )?;
         }
     }
 
     if latest_sha.is_none() {
-        latest_sha = latest_commit_sha(cli);
+        latest_sha = latest_commit_sha(cli, &mut history_scan)?;
     }
 
     if cli.history_min_confidence > 0.0 {
@@ -4117,6 +5213,12 @@ fn build_robot_burndown_output(
         daily_points,
         ideal_line,
         scope_changes,
+        at_risk: bvr::analysis::alerts::detect_at_risk(
+            issues,
+            &sprint.bead_ids,
+            now,
+            bvr::analysis::alerts::AtRiskThresholds::default(),
+        ),
     })
 }
 
@@ -4503,24 +5605,31 @@ fn build_robot_capacity_output(issues: &[bvr::model::Issue], cli: &Cli) -> Robot
         .filter(|issue| !is_closed_status(&issue.status))
         .collect::<Vec<_>>();
     let capacity_graph = bvr::analysis::graph::IssueGraph::build(issues);
-    let capacity_metrics = capacity_graph.compute_metrics();
-    let now = Utc::now();
+    let capacity_metrics = capacity_graph.compute_metrics_with_config(&AnalysisConfig {
+        enable_pagerank: false,
+        enable_betweenness: false,
+        enable_eigenvector: false,
+        enable_hits: false,
+        enable_cycles: false,
+        enable_critical_path: true,
+        enable_k_core: false,
+        enable_articulation: false,
+        enable_slack: false,
+        ..AnalysisConfig::full()
+    });
+    // Capacity consumes effort, not the calendar ETA or prerequisite wait. Keep
+    // the label-scoped median and full-graph depth without traversing every
+    // prerequisite again for each issue.
+    let effort_by_issue =
+        bvr::analysis::forecast::estimate_effort_minutes(&target_issues, &capacity_metrics);
 
     let eta_by_issue = open_issues
         .iter()
         .map(|issue| {
-            let estimated = bvr::analysis::forecast::estimate_eta_for_issue(
-                &target_issues,
-                &capacity_graph,
-                &capacity_metrics,
-                &issue.id,
-                1,
-                now,
-            )
-            .map_or_else(
-                || estimate_issue_minutes(issue),
-                |eta| eta.estimated_minutes,
-            );
+            let estimated = effort_by_issue
+                .get(&issue.id)
+                .copied()
+                .unwrap_or_else(|| estimate_issue_minutes(issue));
             (issue.id.clone(), estimated)
         })
         .collect::<BTreeMap<_, _>>();
@@ -4574,19 +5683,7 @@ fn build_robot_capacity_output(issues: &[bvr::model::Issue], cli: &Cli) -> Robot
         .collect::<Vec<_>>();
     actionable.sort();
 
-    let mut longest_chain = Vec::<String>::new();
-    let mut path = Vec::<String>::new();
-    let mut visiting = BTreeSet::<String>::new();
-    for start in &actionable {
-        dfs_capacity_chain(
-            start,
-            &issue_map,
-            &blocks,
-            &mut visiting,
-            &mut path,
-            &mut longest_chain,
-        );
-    }
+    let longest_chain = longest_capacity_chain(&actionable, &issue_map, &blocks);
 
     let serial_minutes = longest_chain
         .iter()
@@ -4654,37 +5751,126 @@ fn build_robot_capacity_output(issues: &[bvr::model::Issue], cli: &Cli) -> Robot
     }
 }
 
-fn dfs_capacity_chain(
-    issue_id: &str,
+/// Find the same first longest simple path as lexical DFS, sharing acyclic
+/// suffixes instead of enumerating every path through a dependency diamond.
+/// Cyclic regions retain the existing simple-path semantics using heap frames.
+fn longest_capacity_chain(
+    actionable: &[String],
     issue_map: &BTreeMap<String, &bvr::model::Issue>,
     blocks: &BTreeMap<String, Vec<String>>,
-    visiting: &mut BTreeSet<String>,
-    path: &mut Vec<String>,
-    longest_chain: &mut Vec<String>,
-) {
-    if visiting.contains(issue_id) {
-        return;
+) -> Vec<String> {
+    let ids = issue_map.keys().map(String::as_str).collect::<Vec<_>>();
+    let indices = ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| (id, index))
+        .collect::<HashMap<_, _>>();
+    let next = ids
+        .iter()
+        .map(|id| {
+            let mut successors = blocks
+                .get(*id)
+                .into_iter()
+                .flatten()
+                .filter(|id| {
+                    issue_map
+                        .get(*id)
+                        .is_some_and(|issue| !is_closed_status(&issue.status))
+                })
+                .filter_map(|id| indices.get(id.as_str()).copied())
+                .collect::<Vec<_>>();
+            successors.sort_unstable();
+            successors.dedup();
+            successors
+        })
+        .collect::<Vec<_>>();
+    let mut predecessors = vec![Vec::new(); ids.len()];
+    for (from, successors) in next.iter().enumerate() {
+        for &to in successors {
+            predecessors[to].push(from);
+        }
     }
-    visiting.insert(issue_id.to_string());
-    path.push(issue_id.to_string());
 
-    if path.len() > longest_chain.len() {
-        *longest_chain = path.clone();
-    }
-
-    if let Some(next_ids) = blocks.get(issue_id) {
-        for next_id in next_ids {
-            if issue_map
-                .get(next_id)
-                .is_some_and(|issue| !is_closed_status(&issue.status))
+    // Peeling sinks also identifies which suffixes are independent of an
+    // active DFS path. A node left behind can reach a cycle and must not reuse
+    // a path-dependent result. The stored next hop keeps memory linear even
+    // for very deep chains.
+    let mut pending = next.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut ready = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &count)| (count == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut suffix_length = vec![1usize; ids.len()];
+    let mut suffix_next = vec![None; ids.len()];
+    while let Some(node) = ready.pop_front() {
+        for &predecessor in &predecessors[node] {
+            let length = suffix_length[node] + 1;
+            if length > suffix_length[predecessor]
+                || (length == suffix_length[predecessor]
+                    && suffix_next[predecessor].is_none_or(|previous| node < previous))
             {
-                dfs_capacity_chain(next_id, issue_map, blocks, visiting, path, longest_chain);
+                suffix_length[predecessor] = length;
+                suffix_next[predecessor] = Some(node);
+            }
+            pending[predecessor] -= 1;
+            if pending[predecessor] == 0 {
+                ready.push_back(predecessor);
             }
         }
     }
 
-    path.pop();
-    visiting.remove(issue_id);
+    let mut best = Vec::new();
+    let mut path = Vec::new();
+    let mut visiting = vec![false; ids.len()];
+    let mut stack = Vec::new();
+    for start in actionable {
+        let Some(&start) = indices.get(start.as_str()) else {
+            continue;
+        };
+        stack.push((start, 0));
+        path.push(start);
+        visiting[start] = true;
+
+        while let Some((node, cursor)) = stack.last_mut() {
+            let node = *node;
+            if pending[node] == 0 || *cursor == next[node].len() {
+                // A prefix cannot beat its own extension. Materialize only a
+                // completed path or cached suffix, avoiding quadratic copying
+                // along a deep chain that eventually reaches a cycle.
+                let length = if pending[node] == 0 {
+                    path.len() - 1 + suffix_length[node]
+                } else {
+                    path.len()
+                };
+                if length > best.len() {
+                    best.clone_from(&path);
+                    if pending[node] == 0 {
+                        let mut suffix = suffix_next[node];
+                        while let Some(next_node) = suffix {
+                            best.push(next_node);
+                            suffix = suffix_next[next_node];
+                        }
+                    }
+                }
+                visiting[node] = false;
+                path.pop();
+                stack.pop();
+                continue;
+            }
+            let child = next[node][*cursor];
+            *cursor += 1;
+            if !visiting[child] {
+                visiting[child] = true;
+                path.push(child);
+                stack.push((child, 0));
+            }
+        }
+    }
+
+    best.into_iter()
+        .map(|index| ids[index].to_string())
+        .collect()
 }
 
 fn estimate_issue_minutes(issue: &bvr::model::Issue) -> i64 {
@@ -4919,6 +6105,168 @@ fn extract_graph_subgraph(
         .collect()
 }
 
+/// Render an `--export` report. `include_graph` adds dependency context: a
+/// Mermaid section (markdown), a `graph` object (json); it is required for
+/// mermaid and rejected for csv, which is a flat issue table.
+/// Render a legacy `--export-template` report: read the Go text/template
+/// (at most 1 MiB), expose the escaped report fields, and cap the output at
+/// 16 MiB, as legacy bv does.
+fn render_report_template(
+    issues: &[bvr::model::Issue],
+    template_path: &Path,
+    include_graph: bool,
+) -> Result<String, String> {
+    use bvr::report_template::{Value, escape_report_text};
+    use std::io::Read;
+
+    const MAX_TEMPLATE: u64 = 1 << 20;
+    let file =
+        fs::File::open(template_path).map_err(|error| format!("read export template: {error}"))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("read export template: {error}"))?
+        .len();
+    if size > MAX_TEMPLATE {
+        return Err(format!("export template exceeds {MAX_TEMPLATE} bytes"));
+    }
+
+    // Metadata can be stale or report zero for a stream. Bound the actual read
+    // before allocation, and check bytes before decoding a possibly split UTF-8
+    // sequence at the size limit.
+    let mut bytes = Vec::new();
+    file.take(MAX_TEMPLATE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read export template: {error}"))?;
+    if bytes.len() as u64 > MAX_TEMPLATE {
+        return Err(format!("export template exceeds {MAX_TEMPLATE} bytes"));
+    }
+    let template =
+        String::from_utf8(bytes).map_err(|error| format!("read export template: {error}"))?;
+    let text = |value: &str| Value::Str(escape_report_text(value));
+    let issue_values = issues
+        .iter()
+        .map(|issue| {
+            Value::Map(BTreeMap::from([
+                ("ID".to_string(), text(&issue.id)),
+                ("Title".to_string(), text(&issue.title)),
+                ("Status".to_string(), text(&issue.status)),
+                ("IssueType".to_string(), text(&issue.issue_type)),
+                ("Description".to_string(), text(&issue.description)),
+                (
+                    "Priority".to_string(),
+                    Value::Int(i64::from(issue.priority)),
+                ),
+                (
+                    "Labels".to_string(),
+                    Value::List(issue.labels.iter().map(|label| text(label)).collect()),
+                ),
+            ]))
+        })
+        .collect();
+    let graph = if include_graph {
+        generate_mermaid(issues, &build_graph_edges(issues))
+    } else {
+        String::new()
+    };
+    let data = Value::Map(BTreeMap::from([
+        ("Title".to_string(), text("Beads Export")),
+        (
+            "GeneratedAt".to_string(),
+            Value::Str(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        ),
+        ("Graph".to_string(), Value::Str(graph)),
+        ("Issues".to_string(), Value::List(issue_values)),
+    ]));
+    bvr::report_template::render(&template, &data, 16 << 20)
+        .map_err(|error| format!("render export template: {error}"))
+}
+
+fn render_export_report(
+    issues: &[bvr::model::Issue],
+    format: &str,
+    include_graph: bool,
+) -> Result<String, String> {
+    match (format, include_graph) {
+        ("csv", true) => {
+            return Err(
+                "CSV cannot include a graph; pass --export-include-graph=false".to_string(),
+            );
+        }
+        ("mermaid", false) => {
+            return Err("Mermaid export requires the graph (--export-include-graph)".to_string());
+        }
+        ("markdown" | "json" | "csv" | "mermaid", _) => {}
+        _ => {
+            return Err(format!(
+                "export format {format:?} must be markdown, json, csv, or mermaid"
+            ));
+        }
+    }
+
+    let edges = build_graph_edges(issues);
+    match format {
+        "markdown" => {
+            let mut report = bvr::export_md::generate_markdown_report(issues);
+            if include_graph {
+                report.push_str("\n## Dependency Graph\n\n```mermaid\n");
+                report.push_str(&generate_mermaid(issues, &edges));
+                report.push_str("```\n");
+            }
+            Ok(report)
+        }
+        "json" => {
+            let graph = include_graph.then(|| {
+                serde_json::json!({
+                    "nodes": issues.iter().map(|issue| issue.id.clone()).collect::<Vec<_>>(),
+                    "edges": edges,
+                })
+            });
+            let mut payload = serde_json::json!({
+                "title": "Beads Export",
+                "generated_at": Utc::now().to_rfc3339(),
+                "data_hash": compute_data_hash(issues),
+                "issue_count": issues.len(),
+                "issues": issues,
+            });
+            if let Some(graph) = graph {
+                payload["graph"] = graph;
+            }
+            serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())
+        }
+        "csv" => {
+            let mut out =
+                String::from("id,title,status,priority,issue_type,assignee,labels,description\n");
+            for issue in issues {
+                let row = [
+                    issue.id.clone(),
+                    issue.title.clone(),
+                    issue.status.clone(),
+                    issue.priority.to_string(),
+                    issue.issue_type.clone(),
+                    issue.assignee.clone(),
+                    issue.labels.join(";"),
+                    issue.description.clone(),
+                ];
+                let cells: Vec<String> = row.iter().map(|cell| csv_cell(cell)).collect();
+                out.push_str(&cells.join(","));
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        _ => Ok(generate_mermaid(issues, &edges)),
+    }
+}
+
+/// RFC 4180 cell quoting: wrap in quotes (doubling inner quotes) whenever the
+/// value holds a comma, quote, or line break.
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn build_graph_edges(issues: &[bvr::model::Issue]) -> Vec<GraphAdjacencyEdge> {
     let issue_ids = issues
         .iter()
@@ -4997,6 +6345,8 @@ enum StaticGraphFormat {
 enum GraphExportTarget {
     Text(GraphFormat),
     Static(StaticGraphFormat),
+    /// Self-contained interactive force-graph page (`.html`).
+    Interactive,
 }
 
 #[derive(Debug, Clone)]
@@ -5182,6 +6532,8 @@ fn resolve_graph_export_target(path: &Path, fallback: GraphFormat) -> GraphExpor
         GraphExportTarget::Static(StaticGraphFormat::Svg)
     } else if extension.eq_ignore_ascii_case("png") {
         GraphExportTarget::Static(StaticGraphFormat::Png)
+    } else if extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm") {
+        GraphExportTarget::Interactive
     } else {
         GraphExportTarget::Text(fallback)
     }
@@ -5251,6 +6603,211 @@ fn render_graph_export_snapshot(
             "unsupported graph export format: {other}"
         ))),
     }
+}
+
+const INTERACTIVE_GRAPH_TEMPLATE: &str = include_str!("../viewer_assets/graph_export.html");
+const FORCE_GRAPH_JS: &str = include_str!("../viewer_assets/vendor/force-graph.min.js");
+const MARKED_JS: &str = include_str!("../viewer_assets/vendor/marked.min.js");
+
+/// Escape HTML text content and attribute values.
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Rank map (1 = highest) for a metric, ties broken by ID for determinism.
+fn metric_ranks(values: &HashMap<String, f64>) -> HashMap<String, usize> {
+    let mut ordered: Vec<(&String, f64)> = values.iter().map(|(id, v)| (id, *v)).collect();
+    ordered.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.clone(), index + 1))
+        .collect()
+}
+
+/// Render the self-contained interactive dependency graph page
+/// (`--export-graph graph.html`): force-graph and marked are inlined, every
+/// node carries its full bead content plus graph metrics, links on the zero-
+/// slack critical path are flagged, and triage recommendations ride along.
+fn render_interactive_graph_html(
+    issues: &[bvr::model::Issue],
+    graph: &bvr::analysis::graph::IssueGraph,
+    metrics: &bvr::analysis::graph::GraphMetrics,
+    triage: &bvr::analysis::triage::TriageResult,
+    title: Option<&str>,
+) -> Result<String, String> {
+    if issues.is_empty() {
+        return Err("no issues to export".to_string());
+    }
+    let generated_at = Utc::now();
+    let actionable: HashSet<String> = graph.actionable_ids_at(generated_at).into_iter().collect();
+    let dependency_unblocked: HashSet<String> =
+        graph.dependency_unblocked_ids().into_iter().collect();
+    let ids: HashSet<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
+    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
+    for issue in issues {
+        for dep in &issue.dependencies {
+            if dep.is_blocking() && ids.contains(dep.depends_on_id.as_str()) {
+                blocks
+                    .entry(dep.depends_on_id.as_str())
+                    .or_default()
+                    .push(issue.id.as_str());
+            }
+        }
+    }
+    let pagerank_rank = metric_ranks(&metrics.pagerank);
+    let betweenness_rank = metric_ranks(&metrics.betweenness);
+    let fmt_time = |time: Option<DateTime<Utc>>, format: &str| {
+        time.map(|t| t.format(format).to_string())
+            .unwrap_or_default()
+    };
+    let float = |map: &HashMap<String, f64>, id: &str| map.get(id).copied().unwrap_or(0.0);
+
+    let mut sorted: Vec<&bvr::model::Issue> = issues.iter().collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut nodes = Vec::with_capacity(sorted.len());
+    let mut links = Vec::new();
+    for issue in sorted {
+        let id = issue.id.as_str();
+        let blocked_by: Vec<&str> = issue
+            .dependencies
+            .iter()
+            .filter(|dep| dep.is_blocking() && ids.contains(dep.depends_on_id.as_str()))
+            .map(|dep| dep.depends_on_id.as_str())
+            .collect();
+        let slack = metrics.slack.get(id).copied();
+        nodes.push(serde_json::json!({
+            "id": id,
+            "title": issue.title,
+            "description": issue.description,
+            "design": issue.design,
+            "acceptance_criteria": issue.acceptance_criteria,
+            "notes": issue.notes,
+            "status": issue.status,
+            "priority": issue.priority,
+            "type": issue.issue_type,
+            "labels": issue.labels,
+            "assignee": issue.assignee,
+            "created_at": fmt_time(issue.created_at, "%Y-%m-%d %H:%M"),
+            "updated_at": fmt_time(issue.updated_at, "%Y-%m-%d %H:%M"),
+            "closed_at": fmt_time(issue.closed_at, "%Y-%m-%d %H:%M"),
+            "due_date": fmt_time(issue.due_date, "%Y-%m-%d"),
+            "blocked_by": blocked_by,
+            "blocks": blocks.get(id).cloned().unwrap_or_default(),
+            "is_actionable": actionable.contains(id),
+            "is_dependency_blocked": issue.is_open_like() && !dependency_unblocked.contains(id),
+            "open_blocker_count": graph.open_blockers(id).len(),
+            "pagerank": float(&metrics.pagerank, id),
+            "betweenness": float(&metrics.betweenness, id),
+            "eigenvector": float(&metrics.eigenvector, id),
+            "hub": float(&metrics.hubs, id),
+            "authority": float(&metrics.authorities, id),
+            "critical_path": metrics.critical_depth.get(id).copied().unwrap_or(0),
+            "in_degree": metrics.blocks_count.get(id).copied().unwrap_or(0),
+            "out_degree": metrics.blocked_by_count.get(id).copied().unwrap_or(0),
+            "core_number": metrics.k_core.get(id).copied().unwrap_or(0),
+            "slack": slack.unwrap_or(0.0),
+            "is_articulation": metrics.articulation_points.contains(id),
+            "pagerank_rank": pagerank_rank.get(id).copied().unwrap_or(0),
+            "betweenness_rank": betweenness_rank.get(id).copied().unwrap_or(0),
+        }));
+        for dep in &issue.dependencies {
+            let target = dep.depends_on_id.as_str();
+            if !ids.contains(target) {
+                continue;
+            }
+            let critical = slack == Some(0.0) && metrics.slack.get(target).copied() == Some(0.0);
+            let dep_type = if dep.dep_type.trim().is_empty() {
+                "blocks"
+            } else {
+                dep.dep_type.as_str()
+            };
+            links.push(serde_json::json!({
+                "source": id,
+                "target": target,
+                "type": dep_type,
+                "critical": critical,
+            }));
+        }
+    }
+
+    let node_count = nodes.len();
+    let edge_count = links.len();
+    let data_hash = compute_data_hash(issues);
+    let payload = serde_json::json!({
+        "generated_at": generated_at.to_rfc3339(),
+        "data_hash": data_hash,
+        "version": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "nodes": nodes,
+        "links": links,
+        "triage": triage,
+    });
+    // `<`, `>`, `&` only occur inside JSON strings, so \u escapes keep the
+    // JSON valid while making `</script>` injection impossible.
+    let data_json = serde_json::to_string(&payload)
+        .map_err(|error| error.to_string())?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|dir| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    let title = escape_html(title.unwrap_or("Dependency Graph"));
+    let values: HashMap<&str, String> = HashMap::from([
+        ("TITLE", title),
+        ("NODE_COUNT", node_count.to_string()),
+        ("EDGE_COUNT", edge_count.to_string()),
+        (
+            "TIMESTAMP",
+            Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        ),
+        ("DATA_HASH", escape_html(&data_hash)),
+        ("PROJECT", escape_html(&project)),
+        ("FORCE_GRAPH_JS", FORCE_GRAPH_JS.to_string()),
+        ("MARKED_JS", MARKED_JS.to_string()),
+        ("GRAPH_DATA_JSON", data_json),
+    ]);
+
+    // Single pass over the template so substituted content (minified
+    // libraries, bead text) is never re-scanned for placeholders.
+    let mut out =
+        String::with_capacity(INTERACTIVE_GRAPH_TEMPLATE.len() + FORCE_GRAPH_JS.len() * 2);
+    let mut rest = INTERACTIVE_GRAPH_TEMPLATE;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after
+            .find("}}")
+            .and_then(|end| values.get(&after[..end]).map(|v| (end, v)))
+        {
+            Some((end, value)) => {
+                out.push_str(value);
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn write_static_graph_export_snapshot(
@@ -6189,7 +7746,7 @@ fn build_robot_overview_output(
             title: pick.title.clone(),
             score: pick.score,
             reasons: pick.reasons.clone(),
-            claim_command: format!("br update {} --status=in_progress", pick.id),
+            claim_command: bvr::model::claim_command_for(issues, &pick.id),
         });
 
     let top_blocker = triage
@@ -6199,7 +7756,7 @@ fn build_robot_overview_output(
             id: blocker.id.clone(),
             title: blocker.title.clone(),
             unblocks: blocker.unblocks,
-            show_command: format!("br show {}", blocker.id),
+            show_command: bvr::model::show_command_for(issues, &blocker.id),
         });
 
     // Build diverse work fronts from label-grouped recommendations.
@@ -6229,7 +7786,7 @@ fn build_robot_overview_output(
                     title: rec.title.clone(),
                     score: rec.score,
                     reasons: rec.reasons.clone(),
-                    claim_command: format!("br update {} --status=in_progress", rec.id),
+                    claim_command: rec.claim_command.clone(),
                 },
             })
         })
@@ -6279,7 +7836,7 @@ fn build_robot_overview_output(
                 .unwrap_or_default(),
             marginal_unlocks: item.marginal_unlocks,
             cumulative_unlocks: item.cumulative_unlocks,
-            claim_command: format!("br update {} --status=in_progress", item.id),
+            claim_command: bvr::model::claim_command_for(issues, &item.id),
         })
         .collect();
 
@@ -6325,6 +7882,173 @@ struct RobotTriageOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     feedback: Option<bvr::analysis::recipe::FeedbackStats>,
     usage_hints: Vec<String>,
+}
+
+/// One recommendation in the compact `--robot-triage --brief` payload: only
+/// the fields agents use for work selection (identity, claim state, edges).
+#[derive(Debug, Serialize)]
+struct BriefTriageRecommendation {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    assignee: String,
+    score: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unblocks: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked_by: Vec<String>,
+    claimable: bool,
+    claim_command: String,
+    show_command: String,
+}
+
+/// Compact `--robot-triage --brief` payload. Keeps `quick_ref` (counts and
+/// claimable top picks), quick-win and blocker ids, and lean recommendations;
+/// drops score breakdowns, project health, and usage hints, which dominate
+/// the full payload's token cost.
+#[derive(Debug, Serialize)]
+struct RobotTriageBriefOutput {
+    #[serde(flatten)]
+    envelope: bvr::robot::RobotEnvelope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_of: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_of_commit: Option<String>,
+    brief: bool,
+    quick_ref: bvr::analysis::triage::QuickRef,
+    recommendations: Vec<BriefTriageRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quick_wins: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blockers_to_clear: Vec<String>,
+}
+
+fn build_triage_brief_output(
+    envelope: bvr::robot::RobotEnvelope,
+    as_of: Option<String>,
+    as_of_commit: Option<String>,
+    triage: bvr::analysis::triage::TriageResult,
+) -> RobotTriageBriefOutput {
+    RobotTriageBriefOutput {
+        envelope,
+        as_of,
+        as_of_commit,
+        brief: true,
+        quick_ref: triage.quick_ref,
+        recommendations: triage
+            .recommendations
+            .into_iter()
+            .map(|rec| BriefTriageRecommendation {
+                id: rec.id,
+                title: rec.title,
+                status: rec.status,
+                assignee: rec.assignee,
+                score: rec.score,
+                unblocks: rec.unblocks_ids,
+                blocked_by: rec.blocked_by,
+                claimable: rec.claimable,
+                claim_command: rec.claim_command,
+                show_command: rec.show_command,
+            })
+            .collect(),
+        quick_wins: triage.quick_wins.into_iter().map(|rec| rec.id).collect(),
+        blockers_to_clear: triage
+            .blockers_to_clear
+            .into_iter()
+            .map(|blocker| blocker.id)
+            .collect(),
+    }
+}
+
+/// The process argv with agent-intent aliases (`bvr triage --json`,
+/// `bvr robot-next`, `bvr search "q"`) rewritten onto canonical flags. A
+/// non-UTF-8 argument disables the rewrite so clap sees argv untouched.
+fn agent_intent_argv() -> Vec<std::ffi::OsString> {
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let Some((program, rest)) = raw.split_first() else {
+        return raw;
+    };
+    let Some(utf8) = rest
+        .iter()
+        .map(|arg| arg.to_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return raw;
+    };
+    std::iter::once(program.clone())
+        .chain(
+            bvr::cli::rewrite_agent_intent_args(&utf8)
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .collect()
+}
+
+/// The root issue plus every issue that reaches it through dependency edges
+/// (children and dependents, transitively), in original order. Empty when the
+/// root is unknown.
+fn descendant_subgraph(issues: &[bvr::model::Issue], root: &str) -> Vec<bvr::model::Issue> {
+    if !issues.iter().any(|issue| issue.id == root) {
+        return Vec::new();
+    }
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for issue in issues {
+        for dep in &issue.dependencies {
+            dependents
+                .entry(dep.depends_on_id.as_str())
+                .or_default()
+                .push(issue.id.as_str());
+        }
+    }
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue = VecDeque::from([root]);
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(next) = dependents.get(current) {
+            queue.extend(next.iter().copied().filter(|id| !visited.contains(id)));
+        }
+    }
+    issues
+        .iter()
+        .filter(|issue| visited.contains(issue.id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Resolve the opt-in not-ready label class: `--robot-not-ready-labels`
+/// (comma-separated) wins, else `BV_ROBOT_NOT_READY_LABELS`. Empty entries are
+/// dropped; an empty result disables the gate.
+/// Parse `--search-min-score`: a finite number from -1 to 1 (legacy bv's
+/// cosine-similarity range).
+fn parse_search_min_score(raw: &str) -> Result<f64, String> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|score| score.is_finite() && (-1.0..=1.0).contains(score))
+        .ok_or_else(|| {
+            format!("invalid --search-min-score {raw:?} (expected a finite number from -1 to 1)")
+        })
+}
+
+fn resolve_not_ready_labels(cli: &Cli) -> Vec<String> {
+    let raw = cli
+        .robot_not_ready_labels
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("BV_ROBOT_NOT_READY_LABELS")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_default();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -6621,6 +8345,9 @@ struct RobotBurndownOutput {
     ideal_line: Vec<BurndownPointCompat>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     scope_changes: Vec<ScopeChangeCompat>,
+    /// Sprint beads flagged by the legacy at-risk signals (blocked too
+    /// long, no activity, critical blocked, blockers not closing).
+    at_risk: Vec<bvr::analysis::alerts::AtRiskItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6954,16 +8681,498 @@ mod tests {
 
     use super::{
         BackgroundModeSource, BvrCommand, Cli, IssueLoadTarget, actionable_ids_for_recipe_filters,
-        build_background_mode_config, compare_versions, compute_related_work_result,
-        discover_workspace_config_from_starts, feedback_project_dir, file_watch_token,
-        filter_by_repo, generate_daily_burndown_points, handle_operational_commands, load_issues,
-        parse_background_mode_bool, parse_crates_io_latest_version, parse_github_highest_tag,
-        parse_github_latest_release, parse_scope_git_header_line, project_dir_for_export_hooks,
+        build_background_mode_config, check_update_outcome, compare_versions,
+        compute_related_work_result, confirm_upgrade, discover_workspace_config_from_starts,
+        feedback_project_dir, file_watch_token, filter_by_repo, generate_daily_burndown_points,
+        load_issues, load_issues_from_git_ref, parse_background_mode_bool,
+        parse_crates_io_latest_version, parse_github_highest_tag, parse_github_latest_release,
+        parse_issues_from_jsonl_text, parse_scope_git_header_line, project_dir_for_export_hooks,
         reconcile_watch_export_paths, resolve_background_mode, resolve_cli_path_from_project_dir,
         resolve_cli_reference_file_path, resolve_git_toplevel, resolve_issue_load_target,
         resolve_reference_file_path, resolve_watch_export_paths, resolve_workspace_config_path,
         upgrade_cargo_args,
     };
+
+    fn export_fixture() -> Vec<bvr::model::Issue> {
+        vec![
+            bvr::model::Issue {
+                id: "A-1".to_string(),
+                title: "Root, with \"quotes\"".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                labels: vec!["api".to_string(), "core".to_string()],
+                ..Default::default()
+            },
+            bvr::model::Issue {
+                id: "A-2".to_string(),
+                title: "Child".to_string(),
+                status: "blocked".to_string(),
+                issue_type: "bug".to_string(),
+                dependencies: vec![bvr::model::Dependency {
+                    issue_id: "A-2".to_string(),
+                    depends_on_id: "A-1".to_string(),
+                    dep_type: "blocks".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn capacity_chain_fixture(
+        ids: &[String],
+        edges: &[(usize, usize)],
+    ) -> (
+        Vec<bvr::model::Issue>,
+        BTreeMap<String, Vec<String>>,
+        Vec<String>,
+    ) {
+        let issues = ids
+            .iter()
+            .map(|id| bvr::model::Issue {
+                id: id.clone(),
+                status: "open".to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut blocks = BTreeMap::<String, Vec<String>>::new();
+        let mut incoming = vec![0; ids.len()];
+        for &(from, to) in edges {
+            blocks
+                .entry(ids[from].clone())
+                .or_default()
+                .push(ids[to].clone());
+            incoming[to] += 1;
+        }
+        for successors in blocks.values_mut() {
+            successors.sort();
+            successors.dedup();
+        }
+        let mut actionable = ids
+            .iter()
+            .zip(incoming)
+            .filter(|(_, count)| *count == 0)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        actionable.sort();
+        (issues, blocks, actionable)
+    }
+
+    fn reference_capacity_chain(
+        actionable: &[String],
+        issue_map: &BTreeMap<String, &bvr::model::Issue>,
+        blocks: &BTreeMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        fn visit(
+            id: &str,
+            issue_map: &BTreeMap<String, &bvr::model::Issue>,
+            blocks: &BTreeMap<String, Vec<String>>,
+            path: &mut Vec<String>,
+            best: &mut Vec<String>,
+        ) {
+            if path.iter().any(|item| item == id) {
+                return;
+            }
+            path.push(id.to_string());
+            if path.len() > best.len() {
+                best.clone_from(path);
+            }
+            for next in blocks.get(id).into_iter().flatten() {
+                if issue_map
+                    .get(next)
+                    .is_some_and(|issue| !super::is_closed_status(&issue.status))
+                {
+                    visit(next, issue_map, blocks, path, best);
+                }
+            }
+            path.pop();
+        }
+
+        let mut best = Vec::new();
+        for root in actionable {
+            visit(root, issue_map, blocks, &mut Vec::new(), &mut best);
+        }
+        best
+    }
+
+    #[test]
+    fn capacity_chain_matches_simple_path_oracle_on_all_four_node_graphs() {
+        let ids = ["A", "B", "C", "D"].map(str::to_string);
+        let possible_edges = (0..ids.len())
+            .flat_map(|from| {
+                (0..ids.len())
+                    .filter(move |&to| to != from)
+                    .map(move |to| (from, to))
+            })
+            .collect::<Vec<_>>();
+        for mask in 0..(1_u32 << possible_edges.len()) {
+            let edges = possible_edges
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, &edge)| edge)
+                .collect::<Vec<_>>();
+            let (issues, blocks, actionable) = capacity_chain_fixture(&ids, &edges);
+            let issue_map = issues
+                .iter()
+                .map(|issue| (issue.id.clone(), issue))
+                .collect();
+            assert_eq!(
+                super::longest_capacity_chain(&actionable, &issue_map, &blocks),
+                reference_capacity_chain(&actionable, &issue_map, &blocks),
+                "capacity chain differs for edge mask {mask:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_chain_handles_twenty_five_thousand_dependencies_without_recursion() {
+        let ids = (0..25_000)
+            .map(|index| format!("I{index:05}"))
+            .collect::<Vec<_>>();
+        let edges = (1..ids.len())
+            .map(|index| (index - 1, index))
+            .collect::<Vec<_>>();
+        let (issues, blocks, actionable) = capacity_chain_fixture(&ids, &edges);
+        let issue_map = issues
+            .iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect();
+        assert_eq!(
+            super::longest_capacity_chain(&actionable, &issue_map, &blocks),
+            ids
+        );
+    }
+
+    #[test]
+    fn capacity_chain_handles_deep_prefix_before_cycle() {
+        let ids = (0..25_000)
+            .map(|index| format!("I{index:05}"))
+            .collect::<Vec<_>>();
+        let mut edges = (1..ids.len())
+            .map(|index| (index - 1, index))
+            .collect::<Vec<_>>();
+        edges.push((ids.len() - 1, ids.len() - 2));
+        let (issues, blocks, actionable) = capacity_chain_fixture(&ids, &edges);
+        let issue_map = issues
+            .iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect();
+        assert_eq!(
+            super::longest_capacity_chain(&actionable, &issue_map, &blocks),
+            ids
+        );
+    }
+
+    #[test]
+    fn capacity_chain_shares_diamond_suffixes_even_after_a_cycle() {
+        let mut ids = vec![
+            "ROOT".to_string(),
+            "CYCLE-A".to_string(),
+            "CYCLE-B".to_string(),
+        ];
+        let mut edges = vec![(0, 1), (1, 2), (2, 1)];
+        let mut previous = vec![2];
+        let mut expected = ids.clone();
+        // There are 2^32 different paths after the cycle. The selected result
+        // must retain the lexical tie break without enumerating those paths.
+        for level in 0..32 {
+            let first = ids.len();
+            ids.push(format!("L{level:02}-A"));
+            ids.push(format!("L{level:02}-B"));
+            for &from in &previous {
+                edges.push((from, first));
+                edges.push((from, first + 1));
+            }
+            expected.push(ids[first].clone());
+            previous = vec![first, first + 1];
+        }
+        let sink = ids.len();
+        ids.push("SINK".to_string());
+        expected.push("SINK".to_string());
+        for from in previous {
+            edges.push((from, sink));
+        }
+        let (issues, blocks, actionable) = capacity_chain_fixture(&ids, &edges);
+        let issue_map = issues
+            .iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect();
+        assert_eq!(
+            super::longest_capacity_chain(&actionable, &issue_map, &blocks),
+            expected
+        );
+    }
+
+    #[test]
+    fn capacity_chain_retains_self_loop_and_closed_node_semantics() {
+        let ids = ["ROOT", "LOOP", "DONE", "TAIL"].map(str::to_string);
+        let (mut issues, blocks, _) =
+            capacity_chain_fixture(&ids, &[(0, 1), (1, 1), (1, 2), (2, 3)]);
+        issues[2].status = "closed".to_string();
+        let issue_map = issues
+            .iter()
+            .map(|issue| (issue.id.clone(), issue))
+            .collect();
+        let roots = vec!["ROOT".to_string(), "TAIL".to_string()];
+        assert_eq!(
+            super::longest_capacity_chain(&roots, &issue_map, &blocks),
+            vec!["ROOT", "LOOP"]
+        );
+        assert_eq!(
+            super::longest_capacity_chain(&roots, &issue_map, &blocks),
+            reference_capacity_chain(&roots, &issue_map, &blocks)
+        );
+    }
+
+    #[test]
+    fn capacity_chain_retains_root_admission_for_duplicate_issue_records() {
+        let issues = vec![
+            bvr::model::Issue {
+                id: "A".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                estimated_minutes: Some(80),
+                ..Default::default()
+            },
+            bvr::model::Issue {
+                id: "A".to_string(),
+                status: "closed".to_string(),
+                issue_type: "task".to_string(),
+                estimated_minutes: Some(200),
+                ..Default::default()
+            },
+        ];
+        let cli = Cli::parse_from(["bvr", "--robot-capacity"]);
+        let output = super::build_robot_capacity_output(&issues, &cli);
+        // The open record is still a root, while issue_map has the last closed
+        // record. Historical root admission does not apply the child gate.
+        assert_eq!(output.actionable, vec!["A"]);
+        assert_eq!(output.critical_path, vec!["A"]);
+        assert_eq!(output.serial_minutes, output.total_minutes);
+        assert!(output.total_minutes > 0);
+        assert_eq!(output.parallel_minutes, 0);
+    }
+
+    #[test]
+    fn capacity_effort_keeps_scoped_median_full_graph_depth_and_all_edge_types() {
+        let issues = vec![
+            bvr::model::Issue {
+                id: "A".to_string(),
+                title: "Unestimated API task".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                labels: vec!["api".to_string()],
+                ..Default::default()
+            },
+            bvr::model::Issue {
+                id: "B".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                estimated_minutes: Some(100),
+                labels: vec!["API".to_string()],
+                dependencies: vec![bvr::model::Dependency {
+                    issue_id: "B".to_string(),
+                    depends_on_id: "A".to_string(),
+                    dep_type: "related".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            bvr::model::Issue {
+                id: "C".to_string(),
+                status: "open".to_string(),
+                issue_type: "task".to_string(),
+                estimated_minutes: Some(1_000),
+                labels: vec!["external".to_string()],
+                dependencies: vec![bvr::model::Dependency {
+                    issue_id: "C".to_string(),
+                    depends_on_id: "A".to_string(),
+                    dep_type: "blocks".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let cli = Cli::parse_from(["bvr", "--robot-capacity", "--capacity-label", "Api"]);
+        let output = super::build_robot_capacity_output(&issues, &cli);
+        // Median=100 within the selected label. A retains full-graph depth2
+        // through C, while B has depth1. Capacity paths retain related edges.
+        assert_eq!(output.total_minutes, 230);
+        assert_eq!(output.serial_minutes, 230);
+        assert_eq!(output.parallel_minutes, 0);
+        assert_eq!(output.critical_path, vec!["A", "B"]);
+        assert_eq!(output.actionable, vec!["A"]);
+        assert_eq!(output.open_issue_count, 2);
+    }
+
+    #[test]
+    fn export_report_renders_every_format() {
+        let issues = export_fixture();
+
+        let markdown = super::render_export_report(&issues, "markdown", true).expect("md");
+        assert!(markdown.contains("# Beads Export"));
+        assert!(markdown.contains("```mermaid"));
+        let plain = super::render_export_report(&issues, "markdown", false).expect("md");
+        assert!(!plain.contains("```mermaid"));
+
+        let json = super::render_export_report(&issues, "json", true).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value["issue_count"], 2);
+        assert_eq!(value["graph"]["edges"][0]["from"], "A-2");
+        assert_eq!(value["graph"]["edges"][0]["to"], "A-1");
+
+        let csv = super::render_export_report(&issues, "csv", false).expect("csv");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some("id,title,status,priority,issue_type,assignee,labels,description")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("A-1,\"Root, with \"\"quotes\"\"\",open,0,task,,api;core,")
+        );
+
+        let mermaid = super::render_export_report(&issues, "mermaid", true).expect("mermaid");
+        assert!(mermaid.starts_with("graph TD"));
+        assert!(mermaid.contains("A-2 ==> A-1"));
+    }
+
+    #[test]
+    fn interactive_graph_html_is_self_contained_and_injection_safe() {
+        let mut issues = export_fixture();
+        issues[0].title = "</script><script>alert(1)</script>".to_string();
+        issues.extend([
+            bvr::model::Issue {
+                id: "A-3".to_string(),
+                title: "Child of a blocked parent".to_string(),
+                status: "open".to_string(),
+                dependencies: vec![bvr::model::Dependency {
+                    issue_id: "A-3".to_string(),
+                    depends_on_id: "A-2".to_string(),
+                    dep_type: "parent-child".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            bvr::model::Issue {
+                id: "A-4".to_string(),
+                title: "Future work".to_string(),
+                status: "open".to_string(),
+                defer_until: Some("2999-01-01T00:00:00Z".parse().expect("future timestamp")),
+                ..Default::default()
+            },
+        ]);
+        let analyzer = bvr::analysis::Analyzer::new(issues.clone());
+        let triage = analyzer.triage(super::TriageOptions::default());
+        let html = super::render_interactive_graph_html(
+            &issues,
+            &analyzer.graph,
+            &analyzer.metrics,
+            &triage.result,
+            Some("Deps <&> \"quoted\""),
+        )
+        .expect("render");
+
+        assert!(!html.contains("{{GRAPH_DATA_JSON}}") && !html.contains("{{TITLE}}"));
+        assert!(html.contains("<title>Deps &lt;&amp;&gt; &quot;quoted&quot; | bv Graph</title>"));
+        assert!(
+            !html.contains("</script><script>alert(1)"),
+            "bead text must not close the script"
+        );
+        assert!(html.contains("\\u003c/script\\u003e"));
+        assert!(html.contains("forceGraph") || html.contains("ForceGraph"));
+        assert!(html.contains("\"source\":\"A-2\""));
+        let data_json = html
+            .lines()
+            .find_map(|line| line.strip_prefix("const DATA = ")?.strip_suffix(';'))
+            .expect("embedded graph data");
+        let data: serde_json::Value = serde_json::from_str(data_json).expect("valid graph JSON");
+        let nodes = data["nodes"].as_array().expect("node array");
+        for (id, actionable, dependency_blocked, direct_blockers) in [
+            ("A-1", true, false, 0),
+            ("A-2", false, true, 1),
+            ("A-3", false, true, 0),
+            ("A-4", false, false, 0),
+        ] {
+            let node = nodes.iter().find(|node| node["id"] == id).expect(id);
+            assert_eq!(node["is_actionable"], actionable, "readiness for {id}");
+            assert_eq!(
+                node["is_dependency_blocked"], dependency_blocked,
+                "inherited dependency state for {id}"
+            );
+            assert_eq!(node["open_blocker_count"], direct_blockers);
+        }
+        assert!(
+            super::render_interactive_graph_html(
+                &[],
+                &analyzer.graph,
+                &analyzer.metrics,
+                &triage.result,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn descendant_subgraph_follows_dependents_transitively() {
+        let mut issues = export_fixture();
+        issues.push(bvr::model::Issue {
+            id: "A-3".to_string(),
+            title: "Grandchild".to_string(),
+            status: "open".to_string(),
+            dependencies: vec![bvr::model::Dependency {
+                issue_id: "A-3".to_string(),
+                depends_on_id: "A-2".to_string(),
+                dep_type: "parent-child".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        issues.push(bvr::model::Issue {
+            id: "Z-9".to_string(),
+            title: "Unrelated".to_string(),
+            ..Default::default()
+        });
+        let ids = |scoped: Vec<bvr::model::Issue>| {
+            scoped.into_iter().map(|issue| issue.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(super::descendant_subgraph(&issues, "A-1")),
+            ["A-1", "A-2", "A-3"]
+        );
+        assert_eq!(
+            ids(super::descendant_subgraph(&issues, "A-2")),
+            ["A-2", "A-3"]
+        );
+        assert!(super::descendant_subgraph(&issues, "missing").is_empty());
+    }
+
+    #[test]
+    fn export_report_rejects_invalid_combinations() {
+        let issues = export_fixture();
+        assert!(super::render_export_report(&issues, "csv", true).is_err());
+        assert!(super::render_export_report(&issues, "mermaid", false).is_err());
+        assert!(super::render_export_report(&issues, "yaml", true).is_err());
+    }
+
+    #[test]
+    fn not_ready_labels_flag_parses_and_trims() {
+        let cli = Cli::try_parse_from([
+            "bvr",
+            "--robot-triage",
+            "--brief",
+            "--robot-not-ready-labels",
+            " needs-design , ,blocked-external",
+        ])
+        .expect("parse");
+        assert!(cli.brief);
+        assert_eq!(
+            super::resolve_not_ready_labels(&cli),
+            vec!["needs-design".to_string(), "blocked-external".to_string()]
+        );
+    }
 
     struct CurrentDirGuard {
         original: PathBuf,
@@ -7410,6 +9619,153 @@ mod tests {
     }
 
     #[test]
+    fn parse_issues_from_jsonl_text_skips_unknown_status_and_malformed_lines() {
+        // Historical parsing must mirror the live loader's tolerance (issue
+        // #24): a custom status that `br` accepts and a malformed line must be
+        // skipped with a warning, not abort the whole snapshot load.
+        let text = concat!(
+            "\u{feff}{\"id\":\"demo-1\",\"title\":\"ordinary\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\"}\n",
+            "{\"id\":\"demo-2\",\"title\":\"glossary\",\"status\":\"reference\",\"priority\":4,\"issue_type\":\"vocabulary\"}\n",
+            "not json at all\n",
+            "\n",
+            "{\"id\":\"demo-3\",\"title\":\"still parsed\",\"status\":\"closed\",\"priority\":1,\"issue_type\":\"task\"}\n",
+        );
+
+        let issues = parse_issues_from_jsonl_text(text).expect("tolerant parse must not fail");
+
+        let ids: Vec<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["demo-1", "demo-3"],
+            "known-status issues around skipped records must survive"
+        );
+    }
+
+    #[test]
+    fn historical_snapshot_parser_accepts_empty_and_escaped_content() {
+        for text in ["", " \n\t\r\n", "\u{feff}\n \n"] {
+            assert!(
+                parse_issues_from_jsonl_text(text)
+                    .expect("empty snapshot")
+                    .is_empty()
+            );
+        }
+        let text = r#"{"id":"SAFE-1","title":"ordinary","status":"open","issue_type":"task","description":"<<<<<<< text\n=======\n>>>>>>> text\u0000"}"#;
+        let issues = parse_issues_from_jsonl_text(text).expect("escaped issue text");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].description.contains('\0'));
+    }
+
+    #[test]
+    fn historical_snapshot_parser_rejects_structural_corruption_and_empty_results() {
+        for (text, diagnostic) in [
+            (
+                "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 10",
+                "Git LFS pointer",
+            ),
+            (
+                "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> branch",
+                "merge conflict marker",
+            ),
+            ("\0", "NUL"),
+            ("not JSON", "no valid issue records"),
+            ("{\"title\":\"no issue ID\"}", "no valid issue records"),
+        ] {
+            let error =
+                parse_issues_from_jsonl_text(text).expect_err("invalid historical snapshot");
+            assert!(error.to_string().contains(diagnostic), "{error}");
+        }
+    }
+
+    #[test]
+    fn historical_snapshot_metadata_paths_stay_inside_the_git_tree() {
+        let directory = tempdir().expect("metadata path fixture");
+        let root = directory.path();
+        let beads = Path::new(".beads");
+        for declared in [
+            PathBuf::from("../archive/issues.jsonl"),
+            root.join("archive/issues.jsonl"),
+        ] {
+            assert_eq!(
+                super::historical_metadata_jsonl_path(root, beads, &declared.to_string_lossy())
+                    .expect("in-tree path"),
+                Path::new("archive/issues.jsonl")
+            );
+        }
+        for declared in [
+            PathBuf::from("../../outside.jsonl"),
+            root.parent()
+                .expect("fixture parent")
+                .join("elsewhere/issues.jsonl"),
+            root.join("../outside.jsonl"),
+        ] {
+            assert!(
+                super::historical_metadata_jsonl_path(root, beads, &declared.to_string_lossy())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn historical_snapshot_blob_reader_enforces_its_byte_limit() {
+        let directory = tempdir().expect("Git blob fixture");
+        let root = directory.path();
+        fs::create_dir(root.join(".beads")).expect("tracker directory");
+        fs::write(root.join(".beads/issues.jsonl"), b"12345").expect("five-byte blob");
+        fs::write(root.join(".beads/empty.jsonl"), b"").expect("empty blob");
+        run_git(root, &["init"]);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "bounded blobs"]);
+        let commit = super::resolve_historical_commit(root, "HEAD")
+            .expect("resolve revision")
+            .expect("commit");
+        let path = Path::new(".beads/issues.jsonl");
+        assert_eq!(
+            super::read_historical_blob(root, path, &commit, 5).expect("exact cap"),
+            b"12345"
+        );
+        let error = super::read_historical_blob(root, path, &commit, 4).expect_err("exceeds cap");
+        assert!(error.to_string().contains("exceeds 4 bytes"));
+        assert_eq!(
+            super::read_historical_blob(root, Path::new(".beads/empty.jsonl"), &commit, 0)
+                .expect("empty blob"),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn load_issues_from_git_ref_preserves_underlying_cause() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join(".beads")).expect("create beads dir");
+        fs::write(root.join("README.md"), "readme\n").expect("write readme");
+        run_git(root, &["init"]);
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-m", "no beads committed"]);
+
+        let repo_arg = root.to_string_lossy().to_string();
+        let cli = Cli::parse_from(["bvr", "--repo-path", &repo_arg]);
+
+        let error = load_issues_from_git_ref(&cli, "HEAD")
+            .expect_err("historical load must fail when no beads file exists at the revision");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not resolve --diff-since=HEAD"),
+            "resolution context missing from: {message}"
+        );
+        assert!(
+            message.contains("historical beads JSONL snapshot: "),
+            "underlying cause was discarded: {message}"
+        );
+        // The underlying loader error names the file it could not load, which
+        // is exactly the detail the old map_err(|_| ...) threw away.
+        assert!(
+            message.contains("revision") || message.contains("could not load"),
+            "underlying cause text missing from: {message}"
+        );
+    }
+
+    #[test]
     fn resolve_watch_export_paths_includes_workspace_config_file() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
@@ -7600,17 +9956,21 @@ mod tests {
     #[test]
     fn operational_check_update_is_deterministic_and_successful() {
         let cli = Cli::parse_from(["bvr", "--check-update"]);
-        let outcome = handle_operational_commands(&cli);
-
-        assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
-        assert!(!outcome.to_stderr);
-        assert!(
-            outcome.message.contains("Up to date (v")
-                || outcome.message.contains("Newer version available:")
-                || outcome
-                    .message
-                    .contains("Could not check for updates (network unavailable).")
-        );
+        assert!(cli.is_operational_command());
+        for (latest, expected) in [
+            (Ok("0.4.0".to_string()), "Up to date (v0.4.0)"),
+            (Ok("0.3.0".to_string()), "Up to date (v0.4.0)"),
+            (Ok("0.5.0".to_string()), "Newer version available: v0.5.0"),
+            (
+                Err("offline test fixture".to_string()),
+                "Could not check for updates (network unavailable).",
+            ),
+        ] {
+            let outcome = check_update_outcome("0.4.0", latest);
+            assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+            assert!(!outcome.to_stderr);
+            assert!(outcome.message.contains(expected), "{}", outcome.message);
+        }
     }
 
     #[test]
@@ -7646,6 +10006,98 @@ mod tests {
                 "--locked"
             ]
         );
+    }
+
+    #[test]
+    fn upgrade_confirmation_accepts_only_explicit_affirmative_answers() {
+        let command = "cargo install beads_viewer_rust --version 0.9.3 --locked";
+        for answer in ["y\n", "Y\n", "yes\r\n", " YES \n"] {
+            let mut input = std::io::Cursor::new(answer);
+            let mut prompt = Vec::new();
+            assert!(
+                confirm_upgrade(command, true, &mut input, &mut prompt)
+                    .expect("read affirmative answer"),
+                "{answer:?}"
+            );
+            let prompt = String::from_utf8(prompt).expect("UTF-8 prompt");
+            assert!(prompt.contains(command), "{prompt}");
+            assert!(prompt.ends_with("Continue? [y/N] "), "{prompt}");
+        }
+
+        for answer in [
+            "",
+            "\n",
+            "n\n",
+            "no\n",
+            "no\nyes\n",
+            "okay\n",
+            "yesterday\n",
+        ] {
+            assert!(
+                !confirm_upgrade(
+                    command,
+                    true,
+                    &mut std::io::Cursor::new(answer),
+                    &mut Vec::new(),
+                )
+                .expect("read declined answer"),
+                "{answer:?} must not authorize installation"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_confirmation_does_not_read_nonterminal_input() {
+        let mut input = std::io::Cursor::new("yes\n");
+        let mut prompt = Vec::new();
+        let error = confirm_upgrade("cargo install", false, &mut input, &mut prompt)
+            .expect_err("piped confirmation must be refused");
+        assert!(error.contains("interactive terminal"), "{error}");
+        assert!(error.contains("upgrade --yes"), "{error}");
+        assert_eq!(input.position(), 0);
+        assert_eq!(prompt, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn upgrade_confirmation_fails_closed_on_input_or_output_errors() {
+        struct BrokenIo;
+
+        impl std::io::Read for BrokenIo {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken input"))
+            }
+        }
+
+        impl std::io::Write for BrokenIo {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken output"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = confirm_upgrade(
+            "cargo install",
+            true,
+            &mut std::io::BufReader::new(BrokenIo),
+            &mut Vec::new(),
+        )
+        .expect_err("input failure must not authorize installation");
+        assert!(
+            error.contains("Could not read upgrade confirmation"),
+            "{error}"
+        );
+
+        let mut input = std::io::Cursor::new("yes\n");
+        let error = confirm_upgrade("cargo install", true, &mut input, &mut BrokenIo)
+            .expect_err("an invisible prompt must not authorize installation");
+        assert!(
+            error.contains("Could not display upgrade confirmation"),
+            "{error}"
+        );
+        assert_eq!(input.position(), 0);
     }
 
     #[test]
@@ -8692,9 +11144,12 @@ mod tests {
             daily_points: Vec::new(),
             ideal_line: Vec::new(),
             scope_changes: Vec::new(),
+            at_risk: Vec::new(),
         };
 
         let json = serde_json::to_value(&output).unwrap();
+        // Legacy bv always emits at_risk, even when nothing is flagged.
+        assert_eq!(json["at_risk"], serde_json::json!([]));
         assert!(json.get("start_date").is_none());
         assert!(json.get("end_date").is_none());
         assert!(json.get("projected_complete").is_none());

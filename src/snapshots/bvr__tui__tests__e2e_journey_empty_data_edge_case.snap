@@ -5,16 +5,16 @@ expression: artifact
 === E2E Journey: empty-data-edge-case | 100x30 ===
 
 --- Step 1: empty_main ---
-bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=0/0 | filter=all |
-┌Issues [focus]──────────────────────────┐┌Details─────────────────────────────────────────────────┐
+┌────────────────────────────────────────┐┌────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID               ││ No issues selected                                     │
+│No issues in the current triage slice   ││                                                        │
+│Scope: filter=all                       ││                                                        │
+│Recover: a all | o open | I in-progress ││                                                        │
 │                                        ││                                                        │
-│ Focus: list owns selection, / s…       ││ No issues to display. Create or load a .beads/*.jsonl  │
-│ scope=all | label=any | repo=any | pos ││                                                        │
-│ Guide: / search-as-you-type | o/c/r/B/ ││                                                        │
 │                                        ││                                                        │
-│ No issues in the current triage slice  ││                                                        │
-│ Scope: filter=all                      ││                                                        │
-│ Recover: a all | o open | I in-progres ││                                                        │
+│                                        ││                                                        │
+│                                        ││                                                        │
+│                                        ││                                                        │
 │                                        ││                                                        │
 │                                        ││                                                        │
 │                                        ││                                                        │
@@ -34,42 +34,41 @@ bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=0/0 | filter=all
 │                                        ││                                                        │
 │                                        ││                                                        │
 └────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize
+ 📋 ALL  ○0 ◉0 ◈0 ●0                    0 issues  tab focus │ C copy │ x export │ / search │ ? help
 
 --- Step 2: empty_board ---
-bvr 1 Main b Board i Insights | mode=Board | focus=list | issues=0/0 | filter=all |
-┌Board Lanes [focus]─────────────────────┐┌Board Focus─────────────────────────────────────────────┐
-│                                        ││                                                        │
-│ (no issues loaded)                     ││ No issues to display in board mode.                    │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-└────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-Board │ Tab focus │ / search │ s grouping=status │ e empty-lanes=Auto │ 1-4 lanes │ 0/$ edges
+                                         BOARD [by: Status]
+       📋 OPEN (0)          🔄 IN PROGRESS (0)         🚫 BLOCKED (0)            ✅ CLOSED (0)
+╭───────────────────────╮╭───────────────────────╮╭───────────────────────╮╭───────────────────────╮
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│        (empty)        ││        (empty)        ││        (empty)        ││        (empty)        │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+│                       ││                       ││                       ││                       │
+╰───────────────────────╯╰───────────────────────╯╰───────────────────────╯╰───────────────────────╯
+ 📋 ALL  ○0 ◉0 ◈0 ●0                            0 issues  hjkl nav │ G bottom │ tab detail │ b list
 
 --- Step 3: empty_graph ---
-bvr 1 Main b Board i Insights g Graph | mode=Graph | focus=list | issues=0/0 | filter=all |
 ┌Graph Nodes [focus]─────────────────────┐┌Graph Focus─────────────────────────────────────────────┐
 │                                        ││                                                        │
 │ (no issues match filter: all)          ││ No graph data available.                               │
@@ -97,116 +96,117 @@ bvr 1 Main b Board i Insights g Graph | mode=Graph | focus=list | issues=0/0 | f
 │                                        ││                                                        │
 │                                        ││                                                        │
 │                                        ││                                                        │
+│                                        ││                                                        │
 └────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-h/l nodes │ j/k nodes │ ^u/L jump │ Tab detail │ / search │ Enter open details │ g/Esc back
+ 📋 ALL  ○0 ◉0 ◈0 ●0    0 issues  h/l nodes │ j/k nodes │ tab edges │ / search │ ⏎ details │ g list
 
 --- Step 4: empty_insights ---
-bvr 1 Main b Board i Insights | mode=Insights | focus=list | issues=0/0 | filter=all |
-┌Insight Queue [focus]───────────────────┐┌Insight Detail──────────────────────────────────────────┐
-│                                        ││                                                        │
-│ (no issues loaded)                     ││ No insights available.                                 │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-└────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-Insights [bottlenecks] │ Tab focus │ / search │ s/S panel │ e explanations=on │ x proof=off
+╭───────────────────────────────╮╭───────────────────────────────╮╭───────────────────────────────╮
+│ 🚧 Bottlenecks (0)            ││ 🏛 Keystones (0)               ││ 🌐 Influencers (0)            │
+│ Betweenness Centrality        ││ Impact Depth                  ││ Eigenvector Centrality        │
+│ Measures how often a bead     ││ Measures how deep in the      ││ Scores beads by their         │
+│                               ││                               ││                               │
+╰───────────────────────────────╯╰───────────────────────────────╯╰───────────────────────────────╯
+╭───────────────────────────────╮╭───────────────────────────────╮╭───────────────────────────────╮
+│ 🛰 Hubs (0)                    ││ 📚 Authorities (0)            ││ 🧠 Cores (0)                  │
+│ HITS Hub Score                ││ HITS Authority Score          ││ k-core Cohesion               │
+│ Beads that depend on many     ││ Beads that are depended upon  ││ Nodes with highest k-core     │
+│                               ││                               ││                               │
+╰───────────────────────────────╯╰───────────────────────────────╯╰───────────────────────────────╯
+╭───────────────────────────────╮╭───────────────────────────────╮╭───────────────────────────────╮
+│ 🪢 Cut Points (0)             ││ ⏳ Slack (0)                  ││ 🔄 Cycles (0)                 │
+│ Articulation Vertices         ││ Longest-path slack            ││ Circular Dependencies         │
+│ Nodes whose removal           ││ Distance from critical chain  ││ Groups of beads forming       │
+│                               ││                               ││ ✓ No cycles detected          │
+╰───────────────────────────────╯╰───────────────────────────────╯╰───────────────────────────────╯
+╭─────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ 🎯 Priority (0)   Agent-First Triage                                                            │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+│                                                                                                 │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 📋 ALL  ○0 ◉0 ◈0 ●0              0 issues  h/l panels │ j/k items │ / search │ tab detail │ ? help
 
 --- Step 5: empty_actionable ---
-bvr 1 Main b Board i Insights a Actionable | mode=Actionable | focus=list | issues=0/0 | filter=all
-┌Execution Tracks [focus]────────────────┐┌Track Detail────────────────────────────────────────────┐
-│                                        ││                                                        │
-│ (no issues loaded)                     ││ (no track selected)                                    │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-└────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-Actionable: 0 tracks, 0 items │ j/k navigate │ Tab focus │ a/Esc back
+ ⚡ ACTIONABLE ITEMS  │  0 items in 0 tracks
+
+✓ No actionable items. All tasks are either blocked or completed.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  ○0 ◉0 ◈0 ●0                0 issues  j/k nav │ tab tracks/items │ ⏎ view │ a list │ ? help
 
 --- Step 6: empty_tree ---
-bvr 1 Main b Board i Insights T Tree | mode=Tree | focus=list | issues=0/0 | filter=all |
-┌Dependency Tree [focus]─────────────────┐┌Issue Detail────────────────────────────────────────────┐
-│                                        ││                                                        │
-│ (no dependency tree — all issues are i ││ (no node selected)                                     │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-│                                        ││                                                        │
-└────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-Tree: 0 nodes │ j/k navigate │ Enter expand/collapse │ Tab focus │ T/Esc back
+Tree View
+
+No issues to display.
+
+To create hierarchy, add parent-child dependencies:
+  br dep add <child> parent-child:<parent>
+
+Press T to return to list view.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  ○0 ◉0 ◈0 ●0                  0 issues  j/k nav │ h/l fold │ ⏎ toggle │ tab detail │ T list
 
 --- Step 7: empty_main_return ---
-bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=0/0 | filter=all |
-┌Issues [focus]──────────────────────────┐┌Details─────────────────────────────────────────────────┐
+┌────────────────────────────────────────┐┌────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID               ││ No issues selected                                     │
+│No issues in the current triage slice   ││                                                        │
+│Scope: filter=all                       ││                                                        │
+│Recover: a all | o open | I in-progress ││                                                        │
 │                                        ││                                                        │
-│ Focus: list owns selection, / s…       ││ No issues to display. Create or load a .beads/*.jsonl  │
-│ scope=all | label=any | repo=any | pos ││                                                        │
-│ Guide: / search-as-you-type | o/c/r/B/ ││                                                        │
 │                                        ││                                                        │
-│ No issues in the current triage slice  ││                                                        │
-│ Scope: filter=all                      ││                                                        │
-│ Recover: a all | o open | I in-progres ││                                                        │
+│                                        ││                                                        │
+│                                        ││                                                        │
+│                                        ││                                                        │
 │                                        ││                                                        │
 │                                        ││                                                        │
 │                                        ││                                                        │
@@ -226,4 +226,4 @@ bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=0/0 | filter=all
 │                                        ││                                                        │
 │                                        ││                                                        │
 └────────────────────────────────────────┘└────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize
+ 📋 ALL  ○0 ◉0 ◈0 ●0                    0 issues  tab focus │ C copy │ x export │ / search │ ? help

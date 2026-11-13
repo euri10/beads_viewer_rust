@@ -7,11 +7,21 @@ pub enum BvrError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("git history: could not start {operation}: {source}")]
+    GitUnavailable {
+        operation: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("sqlite read of {path}: {message}")]
+    SqliteSource { path: PathBuf, message: String },
 
     #[error("beads directory not found: {0}")]
     MissingBeadsDir(PathBuf),
@@ -21,6 +31,11 @@ pub enum BvrError {
 
     #[error("invalid issue data: {0}")]
     InvalidIssue(String),
+
+    #[error(
+        "bd export failed for {beads_dir}: {message}; use BV_DATA_SOURCE=jsonl for an existing issues.jsonl snapshot"
+    )]
+    DoltExport { beads_dir: PathBuf, message: String },
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -43,6 +58,22 @@ mod tests {
     }
 
     #[test]
+    fn git_unavailable_identifies_the_operation_and_preserves_the_source() {
+        let error = BvrError::GitUnavailable {
+            operation: "git rev-parse --show-toplevel".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "Git executable missing"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "git history: could not start git rev-parse --show-toplevel: Git executable missing"
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "Git executable missing"
+        );
+    }
+
+    #[test]
     fn json_error_converts_from_serde() {
         let bad_json = "{{invalid";
         let result: std::result::Result<serde_json::Value, _> = serde_json::from_str(bad_json);
@@ -62,6 +93,18 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_source_error_identifies_the_database_without_implying_a_fallback() {
+        let error = BvrError::SqliteSource {
+            path: PathBuf::from("/tmp/live/.beads/beads.db"),
+            message: "invalid dependency row".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("/tmp/live/.beads/beads.db"));
+        assert!(message.contains("invalid dependency row"));
+        assert!(!message.contains("BV_DATA_SOURCE"));
+    }
+
+    #[test]
     fn missing_beads_dir_shows_path() {
         let err = BvrError::MissingBeadsDir(PathBuf::from("/tmp/nope"));
         assert!(err.to_string().contains("/tmp/nope"));
@@ -77,6 +120,19 @@ mod tests {
     fn invalid_issue_shows_detail() {
         let err = BvrError::InvalidIssue("bad id".to_string());
         assert!(err.to_string().contains("bad id"));
+    }
+
+    #[test]
+    fn dolt_error_identifies_workspace_and_explicit_snapshot_option() {
+        let err = BvrError::DoltExport {
+            beads_dir: PathBuf::from("/tmp/live/.beads"),
+            message: "timed out after 5 seconds".to_string(),
+        };
+        let message = err.to_string();
+        assert!(message.contains("bd export"));
+        assert!(message.contains("/tmp/live/.beads"));
+        assert!(message.contains("timed out"));
+        assert!(message.contains("BV_DATA_SOURCE=jsonl"));
     }
 
     #[test]

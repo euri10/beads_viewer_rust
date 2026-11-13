@@ -5,297 +5,297 @@ expression: artifact
 === E2E Journey: actionable→tree→attention | 120x35 ===
 
 --- Step 1: main_start ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Main | focus=list | issues=3/3 | filter=all | sort=default |
-┌Issues [focus]──────────────────────────────┐┌Details─────────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────┐┌────────────────────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID                   ││ ✨ Feature work                                                        │
+│▸ ✨ P1 OPEN A Feature work                 ││                                                                        │
+│  🐛 P2 OPEN B Bug fix                      ││ ┌────┬────────┬──────────┬──────────┬─────────┐                        │
+│  📋 P3 OPEN C UI polish                    ││ │ ID │ Status │ Priority │ Assignee │ Created │                        │
+│                                            ││ ├────┼────────┼──────────┼──────────┼─────────┤                        │
+│                                            ││ │ A  │ OPEN   │ ⚡ P1    │ —        │ —       │                        │
+│                                            ││ └────┴────────┴──────────┴──────────┴─────────┘                        │
 │                                            ││                                                                        │
-│ Focus: list owns selection, / s…           ││ ────────────────────────────────────────────────                       │
-│ scope=all | label=any | repo=any | pos=1/3 ││ Summary  ready to execute                                              │
-│ Guide: / search-as-you-type | o/c/r/B/I qu ││ F A  Feature work  (C copy id)                                         │
-│                                            ││ Status: open | Priority: p1 | Type: feature | State: ready             │
-│ ▸ #01 ready P1 A Feature work              ││ Action: Pull now | Downstream impact: 0 | Critical depth: 1            │
-│   #02 ready P2 B Bug fix                   ││ Assignee: unassigned | Repo: local | Estimate: n/a  (w repo filter)    │
-│   #03 ready P3 C UI polish                 ││ Closed: n/a | Labels: [backend] [urgent]  (L label filter)             │
-│                                            ││ Created: n/a | Updated: n/a | Due: n/a  (t time-travel)                │
+│                                            ││ Labels: backend, urgent                                                │
+│                                            ││ C copy id • L label filter • w repo filter • t time-travel             │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Signals  rank and graph pressure                                       │
-│                                            ││ Depth 1 | k-core 0 | slack 0.0000 | cut-point no                       │
-│                                            ││ PR ██████ 0.33  BW ░░░░░░ 0.00                                         │
-│                                            ││ EV ██████ 0.58  blockers=0 | unblocks=0                                │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Dependencies  upstream, gates, downstream                              │
-│                                            ││ Upstream: none                                                         │
-│                                            ││ Open Gate: none                                                        │
-│                                            ││ Downstream: none                                                       │
+│                                            ││ Graph Analysis                                                         │
+│                                            ││ • Impact Depth: 1 (downstream chain length)                            │
+│                                            ││ • Centrality: PR 0.3333 • BW 0.0000 • EV 0.5774                        │
+│                                            ││ • Flow Role: Hub 0.0000 • Authority 0.0000                             │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ History Summary (1 events)                                             │
-│                                            ││   + n/a Issue A created                                                │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│               Page 1 of 1 (items 1-3 of 3) ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize │ ^0 reset split
+ 📋 ALL  L:labels • h:detail  ○3 ◉3 ◈0 ●0                   3 issues  tab focus │ C copy │ x export │ / search │ ? help
 
 --- Step 2: actionable_entry ---
-bvr 1 Main b Board i Insights g Graph H History a Actionable | mode=Actionable | focus=list | issues=3/3 | filter=all |
-┌Execution Tracks [focus]────────────────────┐┌Track Detail────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ ⚡ ACTIONABLE ITEMS | 3 items in 3 tracks  ││ TRACK 1                                                                │
-│ RECOMMENDED: Start with A -> highest impac ││ independent issue — can execute in parallel                            │
-│                                            ││ 1 actionable item                                                      │
-│ ▸ TRACK 1 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││ ▸ A  score 0.591                                                       │
-│    └─ P1 A             0.59  Feature work  ││   Feature work                                                         │
-│                                            ││   Claim: br update A --status=in_progress                              │
-│   TRACK 2 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││ Highest impact: A                                                      │
-│    └─ P2 B             0.58  Bug fix       ││ Impact detail: highest impact: A (score 0.59)                          │
-│                                            ││                                                                        │
-│   TRACK 3 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││                                                                        │
-│    └─ P3 C             0.41  UI polish     ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│ ═══ Parallel Track Overview ═══            ││                                                                        │
-│ Track 1 (1)                           Trac ││                                                                        │
-│   A 0.59                                B  ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Actionable: 3 tracks, 3 items │ j/k navigate │ Tab focus │ a/Esc back
+ ⚡ ACTIONABLE ITEMS  │  3 items in 3 tracks
+
+ 💡 RECOMMENDED: Start with A → highest impact: A (score 0.59)
+
+ TRACK A  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+▸ └─ ⚡ A Feature work
+
+ TRACK B  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  └─ 🔹 B Bug fix
+
+ TRACK C  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  └─ ☕ C UI polish
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  L:labels • h:detail  ○3 ◉3 ◈0 ●0               3 issues  j/k nav │ tab tracks/items │ ⏎ view │ a list │ ? help
 
 --- Step 3: actionable_detail_nav ---
-bvr 1 Main b Board i Insights g Graph H History a Actionable | mode=Actionable | focus=detail | issues=3/3 | filter=all
-┌Execution Tracks────────────────────────────┐┌Track Detail [focus]────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ ⚡ ACTIONABLE ITEMS | 3 items in 3 tracks  ││ TRACK 1                                                                │
-│ RECOMMENDED: Start with A -> highest impac ││ independent issue — can execute in parallel                            │
-│                                            ││ 1 actionable item                                                      │
-│   TRACK 1 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││ ▸ A  score 0.591                                                       │
-│   ▸└─ P1 A             0.59  Feature work  ││   Feature work                                                         │
-│                                            ││   Claim: br update A --status=in_progress                              │
-│   TRACK 2 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││ Highest impact: A                                                      │
-│    └─ P2 B             0.58  Bug fix       ││ Impact detail: highest impact: A (score 0.59)                          │
-│                                            ││                                                                        │
-│   TRACK 3 | independent issue — can execut ││                                                                        │
-│   1 item                                   ││                                                                        │
-│    └─ P3 C             0.41  UI polish     ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│ ═══ Parallel Track Overview ═══            ││                                                                        │
-│ Track 1 (1)                           Trac ││                                                                        │
-│   A 0.59                                B  ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Actionable: 3 tracks, 3 items │ j/k navigate │ Tab focus │ a/Esc back
+ ⚡ ACTIONABLE ITEMS  │  3 items in 3 tracks
+
+ 💡 RECOMMENDED: Start with A → highest impact: A (score 0.59)
+
+ TRACK A  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+▸ └─ ⚡ A Feature work
+
+ TRACK B  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  └─ 🔹 B Bug fix
+
+ TRACK C  independent issue — can execute in parallel
+┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+  └─ ☕ C UI polish
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  L:labels • h:detail  ○3 ◉3 ◈0 ●0               3 issues  j/k nav │ tab tracks/items │ ⏎ view │ a list │ ? help
 
 --- Step 4: tree_entry ---
-bvr 1 Main b Board i Insights g Graph H History T Tree | mode=Tree | focus=list | issues=3/3 | filter=all | sort=default
-┌Dependency Tree [focus]─────────────────────┐┌Issue Detail────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Dependency tree  3 nodes | Enter/za toggle ││ ID: A                                                                  │
-│ ────────────────────────────────────────── ││ Title: Feature work                                                    │
-│ ▸     o P1 A Feature work                  ││ Status: open                                                           │
-│       o P2 B Bug fix                       ││ Type: feature                                                          │
-│       o P3 C UI polish                     ││ Depth: 0                                                               │
-│                                            ││ Labels: backend, urgent                                                │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Tree: 3 nodes │ j/k navigate │ Enter expand/collapse │ Tab focus │ T/Esc back
+┃ • ✨ P1 A Feature work 🟢
+  • 🐛 P2 B Bug fix 🟢
+  • 📋 P3 C UI polish 🟢
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  ○3 ◉3 ◈0 ●0                                      3 issues  j/k nav │ h/l fold │ ⏎ toggle │ tab detail │ T list
 
 --- Step 5: tree_navigate ---
-bvr 1 Main b Board i Insights g Graph H History T Tree | mode=Tree | focus=list | issues=3/3 | filter=all | sort=default
-┌Dependency Tree [focus]─────────────────────┐┌Issue Detail────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Dependency tree  3 nodes | Enter/za toggle ││ ID: A                                                                  │
-│ ────────────────────────────────────────── ││ Title: Feature work                                                    │
-│ ▸     o P1 A Feature work                  ││ Status: open                                                           │
-│       o P2 B Bug fix                       ││ Type: feature                                                          │
-│       o P3 C UI polish                     ││ Depth: 0                                                               │
-│                                            ││ Labels: backend, urgent                                                │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Tree: 3 nodes │ j/k navigate │ Enter expand/collapse │ Tab focus │ T/Esc back
+┃ • ✨ P1 A Feature work 🟢
+  • 🐛 P2 B Bug fix 🟢
+  • 📋 P3 C UI polish 🟢
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  ○3 ◉3 ◈0 ●0                                      3 issues  j/k nav │ h/l fold │ ⏎ toggle │ tab detail │ T list
 
 --- Step 6: attention_entry ---
-bvr 1 Main b Board i Insights g Graph H History ! Attention | mode=Attention | focus=list | issues=3/3 | filter=all | so
-┌Label Attention [focus]─────────────────────┐┌Label Detail────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Rank  Label                 Score  Reason  ││ Label: backend                                                         │
-│ ────────────────────────────────────────── ││ Rank: #1                                                               │
-│ ▸  1  backend                0.7  2 open i ││ Attention Score: 0.667                                                 │
-│    2  frontend               0.3  1 open i ││ Normalized: 1.000                                                      │
-│    3  urgent                 0.3  1 open i ││                                                                        │
-│                                            ││ Breakdown:                                                             │
-│                                            ││   Open:     2                                                          │
-│                                            ││   Blocked:  0                                                          │
-│                                            ││   Stale:    0                                                          │
-│                                            ││                                                                        │
-│                                            ││ Factors:                                                               │
-│                                            ││   PageRank sum:     0.6667                                             │
-│                                            ││   Staleness factor: 1.00                                               │
-│                                            ││   Block impact:     0.0                                                │
-│                                            ││   Velocity factor:  1.00                                               │
-│                                            ││                                                                        │
-│                                            ││ Reason: 2 open issue(s)                                                │
-│                                            ││                                                                        │
-│                                            ││ Open issues (2):                                                       │
-│                                            ││   A                                                                    │
-│                                            ││   B                                                                    │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Attention: 3 labels ranked │ j/k navigate │ Tab focus │ !/Esc back
+  Rank | Label              | Attention  | Reason
+┃ 1    | backend            | 0.67       | pr=0.67 stale=1.00 block=0 closed30=0
+  2    | frontend           | 0.33       | pr=0.33 stale=1.00 block=0 closed30=0
+  3    | urgent             | 0.33       | pr=0.33 stale=1.00 block=0 closed30=0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 📋 ALL  ○3 ◉3 ◈0 ●0                                 3 issues  j/k nav │ 1-9 filter │ ⏎ filter │ tab detail │ esc close
 
 --- Step 7: attention_detail ---
-bvr 1 Main b Board i Insights g Graph H History ! Attention | mode=Attention | focus=detail | issues=3/3 | filter=all |
-┌Label Attention─────────────────────────────┐┌Label Detail [focus]────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Rank  Label                 Score  Reason  ││ Label: frontend                                                        │
-│ ────────────────────────────────────────── ││ Rank: #2                                                               │
-│    1  backend                0.7  2 open i ││ Attention Score: 0.333                                                 │
-│ ▸  2  frontend               0.3  1 open i ││ Normalized: 0.000                                                      │
-│    3  urgent                 0.3  1 open i ││                                                                        │
-│                                            ││ Breakdown:                                                             │
-│                                            ││   Open:     1                                                          │
-│                                            ││   Blocked:  0                                                          │
-│                                            ││   Stale:    0                                                          │
-│                                            ││                                                                        │
-│                                            ││ Factors:                                                               │
-│                                            ││   PageRank sum:     0.3333                                             │
-│                                            ││   Staleness factor: 1.00                                               │
-│                                            ││   Block impact:     0.0                                                │
-│                                            ││   Velocity factor:  1.00                                               │
-│                                            ││                                                                        │
-│                                            ││ Reason: 1 open issue(s)                                                │
-│                                            ││                                                                        │
-│                                            ││ Open issues (1):                                                       │
-│                                            ││   C                                                                    │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Attention: 3 labels ranked │ j/k navigate │ Tab focus │ !/Esc back
+  Rank | Label              | Attention  | Reason                       ┌──────────────────────────────────────────────┐
+  1    | backend            | 0.67       | pr=0.67 stale=1.00 block=0 c…│ Label: frontend                              │
+┃ 2    | frontend           | 0.33       | pr=0.33 stale=1.00 block=0 c…│ Rank: #2                                     │
+  3    | urgent             | 0.33       | pr=0.33 stale=1.00 block=0 c…│ Attention Score: 0.333                       │
+                                                                        │ Normalized: 0.000                            │
+                                                                        │                                              │
+                                                                        │ Breakdown:                                   │
+                                                                        │   Open:     1                                │
+                                                                        │   Blocked:  0                                │
+                                                                        │   Stale:    0                                │
+                                                                        │                                              │
+                                                                        │ Factors:                                     │
+                                                                        │   PageRank sum:     0.3333                   │
+                                                                        │   Staleness factor: 1.00                     │
+                                                                        │   Block impact:     0.0                      │
+                                                                        │   Velocity factor:  1.00                     │
+                                                                        │                                              │
+                                                                        │ Reason: 1 open issue(s)                      │
+                                                                        │                                              │
+                                                                        │ Open issues (1):                             │
+                                                                        │   C                                          │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        │                                              │
+                                                                        └──────────────────────────────────────────────┘
+ 📋 ALL  ○3 ◉3 ◈0 ●0                   3 issues  ^j/k scroll │ j/k nav │ 1-9 filter │ ⏎ filter │ tab detail │ esc close
 
 --- Step 8: main_return ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Main | focus=list | issues=3/3 | filter=all | sort=default |
-┌Issues [focus]──────────────────────────────┐┌Details─────────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────┐┌────────────────────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID                   ││ ✨ Feature work                                                        │
+│▸ ✨ P1 OPEN A Feature work                 ││                                                                        │
+│  🐛 P2 OPEN B Bug fix                      ││ ┌────┬────────┬──────────┬──────────┬─────────┐                        │
+│  📋 P3 OPEN C UI polish                    ││ │ ID │ Status │ Priority │ Assignee │ Created │                        │
+│                                            ││ ├────┼────────┼──────────┼──────────┼─────────┤                        │
+│                                            ││ │ A  │ OPEN   │ ⚡ P1    │ —        │ —       │                        │
+│                                            ││ └────┴────────┴──────────┴──────────┴─────────┘                        │
 │                                            ││                                                                        │
-│ Focus: list owns selection, / s…           ││ ────────────────────────────────────────────────                       │
-│ scope=all | label=any | repo=any | pos=1/3 ││ Summary  ready to execute                                              │
-│ Guide: / search-as-you-type | o/c/r/B/I qu ││ F A  Feature work  (C copy id)                                         │
-│                                            ││ Status: open | Priority: p1 | Type: feature | State: ready             │
-│ ▸ #01 ready P1 A Feature work              ││ Action: Pull now | Downstream impact: 0 | Critical depth: 1            │
-│   #02 ready P2 B Bug fix                   ││ Assignee: unassigned | Repo: local | Estimate: n/a  (w repo filter)    │
-│   #03 ready P3 C UI polish                 ││ Closed: n/a | Labels: [backend] [urgent]  (L label filter)             │
-│                                            ││ Created: n/a | Updated: n/a | Due: n/a  (t time-travel)                │
+│                                            ││ Labels: backend, urgent                                                │
+│                                            ││ C copy id • L label filter • w repo filter • t time-travel             │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Signals  rank and graph pressure                                       │
-│                                            ││ Depth 1 | k-core 0 | slack 0.0000 | cut-point no                       │
-│                                            ││ PR ██████ 0.33  BW ░░░░░░ 0.00                                         │
-│                                            ││ EV ██████ 0.58  blockers=0 | unblocks=0                                │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Dependencies  upstream, gates, downstream                              │
-│                                            ││ Upstream: none                                                         │
-│                                            ││ Open Gate: none                                                        │
-│                                            ││ Downstream: none                                                       │
+│                                            ││ Graph Analysis                                                         │
+│                                            ││ • Impact Depth: 1 (downstream chain length)                            │
+│                                            ││ • Centrality: PR 0.3333 • BW 0.0000 • EV 0.5774                        │
+│                                            ││ • Flow Role: Hub 0.0000 • Authority 0.0000                             │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ History Summary (1 events)                                             │
-│                                            ││   + n/a Issue A created                                                │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│               Page 1 of 1 (items 1-3 of 3) ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize │ ^0 reset split
+ 📋 ALL  L:labels • h:detail  ○3 ◉3 ◈0 ●0                   3 issues  tab focus │ C copy │ x export │ / search │ ? help

@@ -68,6 +68,11 @@ fn run_failing(args: &[&str], dir: &Path) -> String {
 fn run_git(dir: &Path, args: &[&str], date: Option<&str>) {
     let mut cmd = ProcessCommand::new("git");
     cmd.current_dir(dir);
+    // Isolate the test repository from the user's git configuration: a user
+    // ignore file (e.g. one listing `.bv/`) would make `git add .bv` fail.
+    cmd.args(["-c", "core.excludesFile=/dev/null"]);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.args(args);
     cmd.env("GIT_AUTHOR_NAME", "Test");
     cmd.env("GIT_AUTHOR_EMAIL", "test@test.com");
@@ -143,6 +148,533 @@ fn setup_workspace_with_discovery(root: &Path, layout: &[(&str, &str)]) -> PathB
     }
 
     bv_dir.join("workspace.yaml")
+}
+
+// ===================================================================
+// SQLITE INPUT BOUNDARIES
+// ===================================================================
+
+#[test]
+fn sqlite_robot_rejects_query_backed_tracker_objects_without_stale_fallback() {
+    for (table, projection) in [
+        ("issues", "CAST(n AS TEXT) AS id, 'recursive' AS title"),
+        ("labels", "'SAFE-1' AS issue_id, CAST(n AS TEXT) AS label"),
+        (
+            "dependencies",
+            "'SAFE-1' AS issue_id, CAST(n AS TEXT) AS depends_on_id",
+        ),
+        (
+            "comments",
+            "n AS id, 'SAFE-1' AS issue_id, CAST(n AS TEXT) AS text",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("SQLite fixture");
+        let beads = dir.path().join(".beads");
+        fs::create_dir(&beads).expect("tracker directory");
+        let database = beads.join("beads.db");
+        let conn = rusqlite::Connection::open(&database).expect("fixture database");
+        if table != "issues" {
+            conn.execute_batch(
+                "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT);
+                 INSERT INTO issues VALUES ('SAFE-1', 'Stored issue');",
+            )
+            .expect("stored issues");
+        }
+        conn.execute_batch(&format!(
+            "CREATE VIEW {table} AS
+             WITH RECURSIVE tally(n) AS (
+                 VALUES(1) UNION ALL SELECT n + 1 FROM tally WHERE n < 100000000
+             ) SELECT {projection} FROM tally;"
+        ))
+        .expect("recursive tracker view");
+        drop(conn);
+        fs::write(
+            beads.join("metadata.json"),
+            r#"{"backend":"sqlite","database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("SQLite metadata");
+        let stale = issue_line("STALE-1", "Saved export", "open", 1);
+        fs::write(beads.join("issues.jsonl"), &stale).expect("compatibility snapshot");
+        let before = fs::read(&database).expect("database bytes before read");
+
+        // Check both public entry points. The declared SQLite source must not
+        // hide a rejected schema by publishing the saved JSONL snapshot.
+        for source in [&database, &beads] {
+            let output = bvr()
+                .current_dir(dir.path())
+                .env_remove("BEADS_DIR")
+                .env_remove("BEADS_DB")
+                .env_remove("BD_DB")
+                .env("BV_DATA_SOURCE", "sqlite")
+                .arg("--db")
+                .arg(source)
+                .arg("--robot-triage")
+                .timeout(std::time::Duration::from_secs(5))
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            assert_eq!(
+                output.stdout, b"",
+                "rejected {table} must not publish issues"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!("{table} must be a stored table")),
+                "{table} must fail schema validation rather than hang: {stderr}"
+            );
+            assert_eq!(fs::read(&database).expect("database still present"), before);
+            assert_eq!(
+                fs::read_to_string(beads.join("issues.jsonl")).expect("snapshot still present"),
+                stale
+            );
+        }
+    }
+}
+
+#[test]
+fn sqlite_robot_loads_stored_tables_with_unrelated_views_and_virtual_tables() {
+    let dir = tempfile::tempdir().expect("SQLite fixture");
+    let database = dir.path().join("beads.db");
+    let conn = rusqlite::Connection::open(&database).expect("fixture database");
+    conn.execute_batch(
+        "CREATE TABLE Issues (id TEXT PRIMARY KEY, title TEXT) WITHOUT ROWID;
+         INSERT INTO Issues VALUES ('SAFE-1', 'Stored issue');
+         CREATE TABLE Labels (issue_id TEXT, label TEXT);
+         INSERT INTO Labels VALUES ('SAFE-1', 'ready');
+         CREATE VIRTUAL TABLE unrelated_search USING fts5(content);
+         CREATE VIEW unrelated_recursive_view AS
+         WITH RECURSIVE tally(n) AS (
+             VALUES(1) UNION ALL SELECT n + 1 FROM tally WHERE n < 100000000
+         ) SELECT n FROM tally;",
+    )
+    .expect("stored tables and unrelated schema objects");
+    drop(conn);
+    let before = fs::read(&database).expect("database bytes before read");
+    let output = bvr()
+        .current_dir(dir.path())
+        .arg("--db")
+        .arg(&database)
+        .arg("--robot-triage")
+        .timeout(std::time::Duration::from_secs(5))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("valid robot output");
+    assert_eq!(json["triage"]["quick_ref"]["total_open"], 1);
+    assert_eq!(json["triage"]["recommendations"][0]["id"], "SAFE-1");
+    assert_eq!(
+        json["triage"]["recommendations"][0]["title"],
+        "Stored issue"
+    );
+    assert_eq!(fs::read(&database).expect("database still present"), before);
+}
+
+mod sqlite_integrity {
+    use super::*;
+
+    fn command(root: &Path) -> Command {
+        let mut command = bvr();
+        command
+            .current_dir(root)
+            .env_remove("BEADS_DIR")
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("BV_DATA_SOURCE")
+            .env_remove("BV_ROBOT")
+            .timeout(std::time::Duration::from_secs(10));
+        command
+    }
+
+    fn write_source(root: &Path) -> PathBuf {
+        let beads = root.join(".beads");
+        fs::create_dir_all(&beads).expect("tracker directory");
+        fs::write(
+            beads.join("metadata.json"),
+            r#"{"backend":"sqlite","database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("SQLite metadata");
+        let snapshot = beads.join("issues.jsonl");
+        fs::write(
+            &snapshot,
+            issue_line("SAVED-1", "Saved snapshot", "open", 1),
+        )
+        .expect("saved JSONL export");
+        let database = beads.join("beads.db");
+        let conn = rusqlite::Connection::open(&database).expect("fixture database");
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, priority INTEGER);
+             INSERT INTO issues VALUES ('PREREQ-1', 'Open prerequisite', 'open', 2);
+             INSERT INTO issues VALUES ('CHILD-1', 'Blocked urgent child', 'open', 0);
+             CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT, created_by TEXT);
+             INSERT INTO dependencies VALUES ('CHILD-1', 'PREREQ-1', 'blocks', 'fixture');
+             CREATE TABLE labels (issue_id TEXT, label TEXT);
+             INSERT INTO labels VALUES ('PREREQ-1', 'ready');
+             CREATE TABLE comments (id INTEGER, issue_id TEXT, text TEXT);
+             INSERT INTO comments VALUES (1, 'PREREQ-1', 'A valid comment');",
+        )
+        .expect("stored tracker rows");
+        drop(conn);
+
+        // Select SQLite deterministically without a filesystem timestamp race.
+        for (path, seconds) in [(&snapshot, 1_000_000), (&database, 2_000_000)] {
+            fs::File::open(path)
+                .expect("fixture file")
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                ))
+                .expect("fixture modification time");
+        }
+        database
+    }
+
+    fn assert_source_failure(command: &mut Command, source: &Path, detail: &str) {
+        let output = command.assert().failure().get_output().clone();
+        assert!(
+            output.stdout.is_empty(),
+            "a failed source must not publish a partial robot response: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(source.to_string_lossy().as_ref()),
+            "source path missing from diagnostic: {stderr}"
+        );
+        assert!(
+            stderr.contains(detail),
+            "expected {detail:?} in diagnostic: {stderr}"
+        );
+    }
+
+    #[test]
+    fn valid_sqlite_rows_keep_the_urgent_child_blocked() {
+        let dir = tempfile::tempdir().expect("SQLite fixture");
+        let database = write_source(dir.path());
+        let before = fs::read(&database).expect("database before read");
+        let output = command(dir.path())
+            .arg("--db")
+            .arg(&database)
+            .arg("--robot-next")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let next: Value = serde_json::from_slice(&output).expect("next recommendation");
+        assert_eq!(next["id"], "PREREQ-1");
+        let output = command(dir.path())
+            .arg("--db")
+            .arg(&database)
+            .arg("--robot-graph")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let graph: Value = serde_json::from_slice(&output).expect("graph response");
+        assert_eq!(graph["edges"], 1);
+        assert_eq!(fs::read(&database).expect("database after read"), before);
+    }
+
+    #[test]
+    fn malformed_sqlite_rows_cannot_publish_partial_robot_results() {
+        for (table, mutation) in [
+            (
+                "dependencies",
+                "UPDATE dependencies SET type = X'626c6f636b73'",
+            ),
+            (
+                "dependencies",
+                "UPDATE dependencies SET created_by = X'66697874757265'",
+            ),
+            (
+                "labels",
+                "INSERT INTO labels VALUES ('CHILD-1', X'757267656e74')",
+            ),
+            (
+                "comments",
+                "INSERT INTO comments VALUES (2, 'CHILD-1', X'636f6d6d656e74')",
+            ),
+            (
+                "issues",
+                "UPDATE issues SET title = '' WHERE id = 'PREREQ-1'",
+            ),
+            (
+                "issues",
+                "UPDATE issues SET priority = 4294967296 WHERE id = 'CHILD-1'",
+            ),
+            (
+                "issues",
+                "ALTER TABLE issues ADD COLUMN defer_until TEXT;
+                 UPDATE issues SET defer_until = 'not-a-date' WHERE id = 'PREREQ-1'",
+            ),
+            (
+                "issues",
+                "ALTER TABLE issues ADD COLUMN deleted_at TEXT;
+                 UPDATE issues SET deleted_at = 'not-a-date' WHERE id = 'PREREQ-1'",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("SQLite fixture");
+            let database = write_source(dir.path());
+            rusqlite::Connection::open(&database)
+                .expect("fixture connection")
+                .execute_batch(mutation)
+                .expect("malformed stored data");
+            let before = fs::read(&database).expect("database before read");
+            let snapshot = dir.path().join(".beads/issues.jsonl");
+            let saved = fs::read(&snapshot).expect("snapshot before read");
+
+            for source in [&database, &dir.path().join(".beads")] {
+                assert_source_failure(
+                    command(dir.path())
+                        .env("BV_DATA_SOURCE", "sqlite")
+                        .arg("--db")
+                        .arg(source)
+                        .arg("--robot-next"),
+                    &database,
+                    table,
+                );
+            }
+            assert_eq!(fs::read(&database).expect("database after read"), before);
+            assert_eq!(fs::read(&snapshot).expect("snapshot after read"), saved);
+        }
+    }
+
+    #[test]
+    fn automatic_sqlite_failure_requires_explicit_robot_snapshot_recovery() {
+        for malformed_rows in [false, true] {
+            let dir = tempfile::tempdir().expect("SQLite fixture");
+            let database = write_source(dir.path());
+            if malformed_rows {
+                rusqlite::Connection::open(&database)
+                    .expect("fixture connection")
+                    .execute_batch("UPDATE dependencies SET type = X'626c6f636b73'")
+                    .expect("malformed blocking dependency");
+            } else {
+                fs::write(&database, "not a SQLite database").expect("corrupt fixture");
+            }
+            let before = fs::read(&database).expect("database before read");
+            let snapshot = dir.path().join(".beads/issues.jsonl");
+            let saved = fs::read(&snapshot).expect("snapshot before read");
+            for explicit_auto in [false, true] {
+                let mut cmd = command(dir.path());
+                if explicit_auto {
+                    cmd.env("BV_DATA_SOURCE", "auto");
+                }
+                cmd.arg("--robot-triage");
+                assert_source_failure(&mut cmd, &database, "BV_DATA_SOURCE=jsonl");
+            }
+
+            let output = command(dir.path())
+                .env("BV_DATA_SOURCE", "jsonl")
+                .arg("--robot-next")
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let next: Value = serde_json::from_slice(&output).expect("saved recommendation");
+            assert_eq!(next["id"], "SAVED-1");
+            assert_eq!(fs::read(&database).expect("database after read"), before);
+            assert_eq!(fs::read(&snapshot).expect("snapshot after read"), saved);
+        }
+    }
+
+    #[test]
+    fn workspace_sqlite_failures_cannot_omit_a_configured_repository() {
+        for missing_database in [false, true] {
+            let dir = tempfile::tempdir().expect("SQLite workspace");
+            let workspace = setup_workspace(dir.path(), &[("good", ""), ("bad", "")]);
+            let healthy = write_source(&dir.path().join("good"));
+            let failed = write_source(&dir.path().join("bad"));
+            let healthy_before = fs::read(&healthy).expect("healthy database before read");
+            if missing_database {
+                fs::write(
+                    dir.path().join("bad/.beads/metadata.json"),
+                    r#"{"database":"missing.db","jsonl_export":"issues.jsonl"}"#,
+                )
+                .expect("unavailable declared database");
+            } else {
+                fs::write(&failed, "not a SQLite database").expect("corrupt database");
+            }
+            let failed_before = fs::read(&failed).expect("failed database before read");
+            let saved =
+                fs::read(dir.path().join("bad/.beads/issues.jsonl")).expect("snapshot before read");
+
+            assert_source_failure(
+                command(dir.path())
+                    .env("BV_DATA_SOURCE", "sqlite")
+                    .arg("--workspace")
+                    .arg(&workspace)
+                    .arg("--robot-triage"),
+                &dir.path().join("bad/.beads"),
+                if missing_database {
+                    "declared database"
+                } else {
+                    "sqlite"
+                },
+            );
+            if !missing_database {
+                assert_source_failure(
+                    command(dir.path())
+                        .arg("--workspace")
+                        .arg(&workspace)
+                        .arg("--robot-triage"),
+                    &failed,
+                    "BV_DATA_SOURCE=jsonl",
+                );
+            }
+
+            let output = command(dir.path())
+                .env("BV_DATA_SOURCE", "jsonl")
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--robot-triage")
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let recovered: Value = serde_json::from_slice(&output).expect("saved workspace");
+            assert_eq!(recovered["triage"]["quick_ref"]["total_open"], 2);
+            assert_eq!(
+                fs::read(&healthy).expect("healthy database after read"),
+                healthy_before
+            );
+            assert_eq!(
+                fs::read(&failed).expect("failed database after read"),
+                failed_before
+            );
+            assert_eq!(
+                fs::read(dir.path().join("bad/.beads/issues.jsonl")).expect("snapshot after read"),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_sqlite_workspace_remains_complete() {
+        let dir = tempfile::tempdir().expect("SQLite workspace");
+        let workspace = setup_workspace(dir.path(), &[("api", ""), ("web", "")]);
+        write_source(&dir.path().join("api"));
+        write_source(&dir.path().join("web"));
+        let output = command(dir.path())
+            .env("BV_DATA_SOURCE", "sqlite")
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--robot-triage")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let triage: Value = serde_json::from_slice(&output).expect("complete workspace");
+        assert_eq!(triage["triage"]["quick_ref"]["total_open"], 4);
+        let picks = triage["triage"]["quick_ref"]["top_picks"]
+            .as_array()
+            .expect("ready picks");
+        for prefix in ["api", "web"] {
+            assert!(
+                picks
+                    .iter()
+                    .any(|pick| pick["id"] == format!("{prefix}-PREREQ-1"))
+            );
+            assert!(
+                picks
+                    .iter()
+                    .all(|pick| pick["id"] != format!("{prefix}-CHILD-1"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_jsonl_workspace_selection_cannot_skip_a_missing_source() {
+        let dir = tempfile::tempdir().expect("workspace fixture");
+        write_source(&dir.path().join("good"));
+        let missing = dir.path().join("missing/.beads");
+        fs::create_dir_all(&missing).expect("unconfigured tracker directory");
+        let workspace = dir.path().join(".bv/workspace.yaml");
+        fs::create_dir_all(workspace.parent().expect("configuration directory"))
+            .expect("workspace configuration directory");
+        fs::write(
+            &workspace,
+            "repos:\n  - name: good\n    path: good\n    prefix: good-\n  - name: missing\n    path: missing\n    prefix: missing-\n",
+        )
+        .expect("workspace config");
+
+        // Optional unconfigured repositories remain tolerable in automatic
+        // mode; an explicit source choice must apply to every enabled repo.
+        let output = command(dir.path())
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--robot-triage")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let automatic: Value = serde_json::from_slice(&output).expect("automatic workspace");
+        assert_eq!(automatic["triage"]["quick_ref"]["total_open"], 2);
+        assert_source_failure(
+            command(dir.path())
+                .env("BV_DATA_SOURCE", "jsonl")
+                .arg("--workspace")
+                .arg(&workspace)
+                .arg("--robot-triage"),
+            &missing,
+            "JSONL",
+        );
+    }
+
+    #[test]
+    fn automatic_export_fallback_warns_and_mandatory_failure_preserves_dashboard() {
+        let dir = tempfile::tempdir().expect("SQLite export fixture");
+        let database = write_source(dir.path());
+        fs::write(&database, "not a SQLite database").expect("corrupt fixture");
+        let before = fs::read(&database).expect("database before export");
+        let dashboard = dir.path().join("dashboard");
+        let output = command(dir.path())
+            .arg("--export-pages")
+            .arg(&dashboard)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("falling back to the JSONL export"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(database.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        let exported = fs::read(dashboard.join("data/issues.json")).expect("exported snapshot");
+        let issues: Value = serde_json::from_slice(&exported).expect("exported issues");
+        assert_eq!(issues.as_array().expect("issues array").len(), 1);
+        assert_eq!(issues[0]["id"], "SAVED-1");
+        let index = fs::read(dashboard.join("index.html")).expect("dashboard HTML");
+
+        assert_source_failure(
+            command(dir.path())
+                .env("BV_DATA_SOURCE", "sqlite")
+                .arg("--export-pages")
+                .arg(&dashboard),
+            &database,
+            "sqlite",
+        );
+        assert_eq!(
+            fs::read(dashboard.join("data/issues.json")).expect("retained data"),
+            exported
+        );
+        assert_eq!(
+            fs::read(dashboard.join("index.html")).expect("retained HTML"),
+            index
+        );
+        assert_eq!(fs::read(&database).expect("database after export"), before);
+    }
 }
 
 // ===================================================================
@@ -791,6 +1323,546 @@ fn workspace_duplicate_repo_alias_returns_error() {
 // HISTORY E2E
 // ===================================================================
 
+mod historical_snapshot_integrity {
+    use super::*;
+
+    fn command(root: &Path) -> Command {
+        let mut command = bvr();
+        command
+            .current_dir(root)
+            .env_remove("BEADS_DIR")
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("BV_DATA_SOURCE")
+            .timeout(std::time::Duration::from_secs(10));
+        command
+    }
+
+    fn initialize(root: &Path) {
+        run_git(root, &["init"], None);
+        fs::create_dir_all(root.join(".beads")).expect("historical tracker directory");
+    }
+
+    fn commit(root: &Path, message: &str) {
+        run_git(root, &["add", "."], None);
+        run_git(root, &["commit", "-m", message], None);
+    }
+
+    fn damage_loose_object(path: &Path, content: &[u8]) {
+        let mut permissions = fs::metadata(path)
+            .expect("owned fixture object")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).expect("make owned fixture object writable");
+        fs::write(path, content).expect("damage isolated fixture object");
+    }
+
+    fn json(root: &Path, args: &[&str]) -> Value {
+        let output = command(root)
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).expect("one complete robot JSON value")
+    }
+
+    fn assert_revision_rejected(
+        root: &Path,
+        revision: &str,
+        expected: &[&str],
+        source: Option<&Path>,
+    ) {
+        for args in [
+            ["--robot-triage", "--as-of", revision],
+            ["--robot-diff", "--diff-since", revision],
+        ] {
+            let mut command = command(root);
+            command.args(args);
+            if let Some(source) = source {
+                command.arg("--db").arg(source);
+            }
+            let output = command.assert().failure().get_output().clone();
+            assert!(
+                output.stdout.is_empty(),
+                "{args:?} must not publish a fabricated or partial snapshot"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(revision), "missing revision: {stderr}");
+            for fragment in expected {
+                assert!(stderr.contains(fragment), "missing {fragment:?}: {stderr}");
+            }
+        }
+    }
+
+    fn assert_rejected(root: &Path, expected: &[&str], source: Option<&Path>) {
+        assert_revision_rejected(root, "HEAD~1", expected, source);
+    }
+
+    #[test]
+    fn revision_metadata_selects_the_authoritative_snapshot_for_as_of_and_diff() {
+        let directory = tempfile::tempdir().expect("history fixture");
+        let root = directory.path();
+        initialize(root);
+        fs::write(
+            root.join(".beads/metadata.json"),
+            r#"{"jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("old metadata");
+        fs::write(
+            root.join(".beads/beads.jsonl"),
+            issue_line("STALE-1", "Unrelated export", "open", 1),
+        )
+        .expect("stale alternative");
+        fs::write(
+            root.join(".beads/issues.jsonl"),
+            issue_line("AUTH-1", "Historical title", "open", 1),
+        )
+        .expect("historical authoritative snapshot");
+        commit(root, "historical export declaration");
+
+        fs::create_dir(root.join("archive")).expect("new export directory");
+        fs::write(
+            root.join(".beads/metadata.json"),
+            r#"{"jsonl_export":"../archive/current issues.jsonl"}"#,
+        )
+        .expect("current metadata");
+        fs::write(
+            root.join("archive/current issues.jsonl"),
+            issue_line("AUTH-1", "Current title", "open", 1),
+        )
+        .expect("current authoritative snapshot");
+        commit(root, "move authoritative export");
+
+        for (revision, title) in [("HEAD~1", "Historical title"), ("HEAD", "Current title")] {
+            let output = json(root, &["--robot-triage", "--as-of", revision]);
+            let recommendations = output["triage"]["recommendations"]
+                .as_array()
+                .expect("recommendations");
+            assert_eq!(recommendations.len(), 1);
+            assert_eq!(recommendations[0]["id"], "AUTH-1");
+            assert_eq!(recommendations[0]["title"], title);
+        }
+        let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
+        assert_eq!(diff["diff"]["summary"]["issues_added"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_removed"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_modified"], 1);
+        let modified = &diff["diff"]["modified_issues"][0];
+        assert_eq!(modified["issue_id"], "AUTH-1");
+        assert!(
+            modified["changes"]
+                .as_array()
+                .expect("changes")
+                .iter()
+                .any(|change| {
+                    change["field"] == "title"
+                        && change["old_value"] == "Historical title"
+                        && change["new_value"] == "Current title"
+                })
+        );
+    }
+
+    #[test]
+    fn authoritative_empty_snapshots_do_not_resurrect_stale_alternatives() {
+        for empty in ["", "\u{feff}\n \t\n"] {
+            let directory = tempfile::tempdir().expect("empty history fixture");
+            let root = directory.path();
+            initialize(root);
+            fs::write(
+                root.join(".beads/metadata.json"),
+                r#"{"jsonl_export":"issues.jsonl"}"#,
+            )
+            .expect("metadata");
+            fs::write(root.join(".beads/issues.jsonl"), empty)
+                .expect("empty authoritative snapshot");
+            fs::write(
+                root.join(".beads/beads.jsonl"),
+                issue_line("STALE-1", "Stale issue", "open", 1),
+            )
+            .expect("nonempty alternative");
+            commit(root, "empty authoritative baseline");
+            fs::write(
+                root.join(".beads/issues.jsonl"),
+                issue_line("NEW-1", "First issue", "open", 1),
+            )
+            .expect("new issue");
+            commit(root, "create first authoritative issue");
+
+            // --db <directory> must use the same historical authority as
+            // automatic repository discovery.
+            for source in [None, Some(root.join(".beads"))] {
+                let mut command = command(root);
+                command.args(["--robot-triage", "--as-of", "HEAD~1"]);
+                if let Some(source) = source {
+                    command.arg("--db").arg(source);
+                }
+                let output = command.assert().success().get_output().stdout.clone();
+                let value: Value =
+                    serde_json::from_slice(&output).expect("empty historical triage");
+                assert_eq!(value["triage"]["quick_ref"]["total_open"], 0);
+            }
+            let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
+            assert_eq!(diff["diff"]["summary"]["issues_added"], 1);
+            assert_eq!(diff["diff"]["new_issues"][0]["id"], "NEW-1");
+            assert_eq!(diff["diff"]["summary"]["issues_removed"], 0);
+        }
+    }
+
+    #[test]
+    fn corrupt_snapshots_are_rejected_for_git_and_file_baselines() {
+        let valid = issue_line("SAFE-1", "Current issue", "open", 1);
+        let conflicts = format!("<<<<<<< HEAD\n{valid}\n=======\n{valid}\n>>>>>>> incoming\n");
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "lfs",
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:0123\nsize 123\n".to_vec(),
+                "Git LFS pointer",
+            ),
+            ("conflict", conflicts.into_bytes(), "merge conflict marker"),
+            ("nul", format!("{valid}\n\0\n").into_bytes(), "NUL"),
+            (
+                "utf8",
+                b"{\"id\":\"BAD-1\",\"title\":\"invalid \xff\",\"status\":\"open\"}\n".to_vec(),
+                "UTF-8",
+            ),
+            (
+                "malformed",
+                b"this is not JSONL\n".to_vec(),
+                "no valid issue records",
+            ),
+            (
+                "invalid-issue",
+                b"{\"title\":\"missing ID\"}\n".to_vec(),
+                "no valid issue records",
+            ),
+            (
+                "custom-only",
+                issue_line("CUSTOM-1", "Unrecognized", "reference", 1).into_bytes(),
+                "no valid issue records",
+            ),
+        ];
+        for (name, bytes, diagnostic) in cases {
+            let directory = tempfile::tempdir().expect("corrupt history fixture");
+            let root = directory.path();
+            initialize(root);
+            let issues = root.join(".beads/issues.jsonl");
+            fs::write(&issues, &bytes).expect("corrupt historical snapshot");
+            fs::write(
+                root.join(".beads/metadata.json"),
+                r#"{"jsonl_export":"issues.jsonl"}"#,
+            )
+            .expect("metadata");
+            commit(root, name);
+            fs::write(&issues, &valid).expect("valid current snapshot");
+            commit(root, "repair current snapshot");
+
+            assert_rejected(root, &[".beads/issues.jsonl", diagnostic], None);
+            assert_rejected(root, &[".beads/issues.jsonl", diagnostic], Some(&issues));
+
+            let baseline = root.join("baseline.jsonl");
+            fs::write(&baseline, &bytes).expect("corrupt file baseline");
+            let output = command(root)
+                .args(["--robot-diff", "--diff-since"])
+                .arg(&baseline)
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            assert!(
+                output.stdout.is_empty(),
+                "corrupt {name} file must not publish a diff"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("baseline.jsonl") && stderr.contains(diagnostic),
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_unreadable_metadata_authority_cannot_fall_back() {
+        for (metadata, diagnostic) in [
+            ("{not json", "metadata.json"),
+            (r#"{"jsonl_export":"missing.jsonl"}"#, "missing.jsonl"),
+            (
+                r#"{"jsonl_export":"../../outside.jsonl"}"#,
+                "escapes the historical repository",
+            ),
+            (r#"{"jsonl_export":"directory"}"#, "complete Git blob"),
+        ] {
+            let directory = tempfile::tempdir().expect("metadata fixture");
+            let root = directory.path();
+            initialize(root);
+            fs::write(root.join(".beads/metadata.json"), metadata).expect("historical metadata");
+            fs::write(
+                root.join(".beads/beads.jsonl"),
+                issue_line("STALE-1", "Stale alternative", "open", 1),
+            )
+            .expect("stale alternative");
+            fs::create_dir(root.join(".beads/directory")).expect("non-blob declaration");
+            fs::write(root.join(".beads/directory/entry"), "tracked tree entry")
+                .expect("tree contents");
+            commit(root, "invalid historical authority");
+            fs::write(
+                root.join(".beads/metadata.json"),
+                r#"{"jsonl_export":"issues.jsonl"}"#,
+            )
+            .expect("current metadata");
+            fs::write(
+                root.join(".beads/issues.jsonl"),
+                issue_line("CURRENT-1", "Current issue", "open", 1),
+            )
+            .expect("current issue");
+            commit(root, "repair authority");
+            assert_rejected(root, &[diagnostic], None);
+        }
+    }
+
+    #[test]
+    fn damaged_committed_objects_are_not_classified_as_absent_history() {
+        for path in [".beads/metadata.json", ".beads/issues.jsonl"] {
+            let directory = tempfile::tempdir().expect("damaged Git object fixture");
+            let root = directory.path();
+            initialize(root);
+            fs::write(
+                root.join(".beads/metadata.json"),
+                r#"{"jsonl_export":"issues.jsonl"}"#,
+            )
+            .expect("metadata");
+            fs::write(
+                root.join(".beads/issues.jsonl"),
+                issue_line("OLD-1", "Historical issue", "open", 1),
+            )
+            .expect("historical issue");
+            fs::write(
+                root.join(".beads/beads.jsonl"),
+                issue_line("STALE-1", "Stale fallback", "open", 1),
+            )
+            .expect("stale fallback");
+            commit(root, "historical objects");
+            fs::write(
+                root.join(".beads/issues.jsonl"),
+                issue_line("CURRENT-1", "Current issue", "open", 1),
+            )
+            .expect("current issue");
+            commit(root, "current objects");
+
+            let output = ProcessCommand::new("git")
+                .current_dir(root)
+                .args(["rev-parse", &format!("HEAD~1:{path}")])
+                .output()
+                .expect("historical object ID");
+            assert!(output.status.success());
+            let oid = String::from_utf8(output.stdout).expect("object ID");
+            let (prefix, suffix) = oid.trim().split_at(2);
+            let object = root.join(".git/objects").join(prefix).join(suffix);
+            assert!(object.is_file(), "fixture should use a loose object");
+            damage_loose_object(&object, b"damaged object data");
+
+            assert_rejected(root, &[path, "unreadable"], None);
+        }
+    }
+
+    #[test]
+    fn explicit_directory_history_resolves_the_same_redirect_as_live_loading() {
+        let directory = tempfile::tempdir().expect("redirected history fixture");
+        let root = directory.path();
+        initialize(root);
+        let target = root.join("shared/.beads");
+        fs::create_dir_all(&target).expect("redirect target");
+        fs::write(root.join(".beads/redirect"), "../shared/.beads\n").expect("redirect");
+        fs::write(
+            root.join(".beads/beads.jsonl"),
+            issue_line("STALE-1", "Local stale export", "open", 1),
+        )
+        .expect("stale local export");
+        fs::write(
+            target.join("metadata.json"),
+            r#"{"jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("target metadata");
+        fs::write(
+            target.join("issues.jsonl"),
+            issue_line("AUTH-1", "Historical target", "open", 1),
+        )
+        .expect("historical target");
+        commit(root, "redirected baseline");
+        fs::write(
+            target.join("issues.jsonl"),
+            issue_line("AUTH-1", "Current target", "open", 1),
+        )
+        .expect("current target");
+        commit(root, "update redirected target");
+
+        let output = command(root)
+            .arg("--db")
+            .arg(root.join(".beads"))
+            .args(["--robot-triage", "--as-of", "HEAD~1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let historical: Value = serde_json::from_slice(&output).expect("historical target triage");
+        assert_eq!(historical["triage"]["recommendations"][0]["id"], "AUTH-1");
+        assert_eq!(
+            historical["triage"]["recommendations"][0]["title"],
+            "Historical target"
+        );
+        let output = command(root)
+            .arg("--db")
+            .arg(root.join(".beads"))
+            .args(["--robot-diff", "--diff-since", "HEAD~1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let diff: Value = serde_json::from_slice(&output).expect("redirected target diff");
+        assert_eq!(diff["diff"]["summary"]["issues_added"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_removed"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_modified"], 1);
+
+        fs::create_dir(root.join(".bv")).expect("workspace directory");
+        fs::write(
+            root.join(".bv/workspace.yaml"),
+            "repos:\n  - path: .\n    prefix: project-\n",
+        )
+        .expect("single-repository workspace");
+        let historical = json(root, &["--robot-triage", "--as-of", "HEAD~1"]);
+        assert_eq!(
+            historical["triage"]["recommendations"][0]["title"],
+            "Historical target"
+        );
+        let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
+        assert_eq!(diff["diff"]["summary"]["issues_added"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_removed"], 0);
+        assert_eq!(diff["diff"]["summary"]["issues_modified"], 1);
+    }
+
+    #[test]
+    fn corrupt_intermediate_commits_cannot_hide_existing_workspace_members() {
+        let directory = tempfile::tempdir().expect("damaged ancestor fixture");
+        let root = directory.path();
+        let good = issue_line("GOOD-1", "Good issue", "open", 1);
+        let bad = issue_line("BAD-1", "Affected issue", "open", 1);
+        setup_workspace(root, &[("good", &good), ("bad", &bad)]);
+        for member in ["good", "bad"] {
+            let repo = root.join(member);
+            run_git(&repo, &["init"], None);
+            commit(&repo, "initial snapshot");
+            fs::write(repo.join("change.txt"), "first change").expect("intermediate content");
+            commit(&repo, "intermediate commit");
+            fs::write(repo.join("change.txt"), "second change").expect("latest content");
+            commit(&repo, "latest commit");
+        }
+        let repo = root.join("bad");
+        let output = ProcessCommand::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD~1"])
+            .output()
+            .expect("intermediate commit ID");
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).expect("commit ID");
+        let (prefix, suffix) = oid.trim().split_at(2);
+        let object = repo.join(".git/objects").join(prefix).join(suffix);
+        assert!(object.is_file(), "fixture should use a loose commit");
+        damage_loose_object(&object, b"damaged intermediate commit");
+        assert_revision_rejected(root, "HEAD~2", &["workspace repo 'bad'", "corrupt"], None);
+    }
+
+    #[test]
+    fn mixed_record_tolerance_keeps_only_the_last_valid_record_per_id() {
+        let directory = tempfile::tempdir().expect("duplicate history fixture");
+        let root = directory.path();
+        initialize(root);
+        let final_record = issue_line("DUP-1", "Final title", "closed", 1);
+        let baseline = format!(
+            "\u{feff}{}\n{}\nnot json\n{final_record}\n",
+            issue_line("DUP-1", "Old title", "open", 1),
+            issue_line("CUSTOM-1", "Custom status", "reference", 1),
+        );
+        fs::write(root.join(".beads/issues.jsonl"), &baseline).expect("mixed baseline");
+        commit(root, "append duplicate update among tolerated records");
+        fs::write(root.join(".beads/issues.jsonl"), &final_record)
+            .expect("compacted current snapshot");
+        commit(root, "compact valid records");
+
+        let historical = json(root, &["--robot-triage", "--as-of", "HEAD~1"]);
+        let current = json(root, &["--robot-triage"]);
+        assert_eq!(historical["triage"]["quick_ref"]["total_open"], 0);
+        assert_eq!(historical["data_hash"], current["data_hash"]);
+        let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
+        assert_eq!(diff["diff"]["summary"]["total_changes"], 0);
+        assert_eq!(diff["from_data_hash"], diff["data_hash"]);
+
+        fs::write(root.join("baseline.jsonl"), &baseline).expect("mixed file baseline");
+        let file_diff = json(root, &["--robot-diff", "--diff-since", "baseline.jsonl"]);
+        assert_eq!(file_diff["diff"]["summary"]["total_changes"], 0);
+        assert_eq!(file_diff["from_data_hash"], diff["from_data_hash"]);
+    }
+
+    #[test]
+    fn corrupt_existing_workspace_members_do_not_disappear_from_history() {
+        let directory = tempfile::tempdir().expect("workspace history fixture");
+        let root = directory.path();
+        let good = issue_line("GOOD-1", "Good issue", "open", 1);
+        setup_workspace(root, &[("good", &good), ("bad", "not JSONL\n")]);
+        run_git(root, &["init"], None);
+        commit(root, "corrupt member baseline");
+        write_beads(
+            &root.join("bad"),
+            &issue_line("BAD-1", "Repaired issue", "open", 1),
+        );
+        commit(root, "repair member");
+
+        assert_rejected(
+            root,
+            &[
+                "workspace repo 'bad'",
+                "bad/.beads/beads.jsonl",
+                "no valid issue records",
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn members_added_after_the_baseline_remain_supported_with_empty_or_nonempty_peers() {
+        for good in [
+            String::new(),
+            issue_line("GOOD-1", "Existing issue", "open", 1),
+        ] {
+            let directory = tempfile::tempdir().expect("new workspace member fixture");
+            let root = directory.path();
+            let added = issue_line("NEW-1", "New member issue", "open", 1);
+            setup_workspace(root, &[("good", &good), ("new", &added)]);
+            run_git(root, &["init"], None);
+            run_git(root, &["add", ".bv", "good"], None);
+            run_git(root, &["commit", "-m", "before new member"], None);
+            commit(root, "add new member snapshot");
+
+            let historical = json(root, &["--robot-triage", "--as-of", "HEAD~1"]);
+            assert_eq!(
+                historical["triage"]["quick_ref"]["total_open"],
+                usize::from(!good.is_empty())
+            );
+            let diff = json(root, &["--robot-diff", "--diff-since", "HEAD~1"]);
+            assert_eq!(diff["diff"]["summary"]["issues_added"], 1);
+            assert_eq!(diff["diff"]["new_issues"][0]["title"], "New member issue");
+            assert_eq!(diff["diff"]["summary"]["issues_removed"], 0);
+        }
+    }
+}
+
 fn setup_git_repo_with_history(root: &Path) {
     run_git(root, &["init"], None);
     fs::create_dir_all(root.join(".beads")).expect("mkdir .beads");
@@ -1356,4 +2428,586 @@ fn workspace_robot_graph_shows_cross_repo_edges() {
 
     let edges = json["edges"].as_u64().unwrap_or(0);
     assert!(edges >= 1, "should have cross-repo edge, got {edges}");
+}
+
+// A fake backend is scoped to each child process. These tests must never invoke
+// an installed bd or change the process-wide environment of parallel tests.
+#[cfg(unix)]
+mod dolt_backend {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct FakeDoltRepo {
+        directory: tempfile::TempDir,
+    }
+
+    impl FakeDoltRepo {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("Dolt fixture directory");
+            let root = directory.path();
+            fs::create_dir_all(root.join(".beads/dolt")).expect("Dolt marker directory");
+            fs::create_dir(root.join("bin")).expect("fake executable directory");
+            fs::write(root.join(".beads/metadata.json"), r#"{"backend":"dolt"}"#)
+                .expect("Dolt metadata");
+            fs::write(root.join("live.jsonl"), "").expect("initial live snapshot");
+            let executable = root.join("bin/bd");
+            fs::write(
+                &executable,
+                r#"#!/bin/sh
+beads_db=unset
+if [ -n "$BEADS_DB" ]; then beads_db="$BEADS_DB"; fi
+bd_db=unset
+if [ -n "$BD_DB" ]; then bd_db="$BD_DB"; fi
+printf '%s|%s|%s|%s|%s\n' "$*" "$PWD" "$BEADS_DIR" "$beads_db" "$bd_db" >> "$BVR_TEST_BD_CALLS"
+if [ "$#" -ne 1 ] || [ "$1" != export ]; then
+    printf 'expected a read-only bd export on stdout\n' >&2
+    exit 64
+fi
+payload="$BEADS_DIR/../live.jsonl"
+if [ -n "$BVR_TEST_BD_PAYLOAD" ]; then payload="$BVR_TEST_BD_PAYLOAD"; fi
+case "$BVR_TEST_BD_MODE" in
+    fail)
+        /bin/cat "$payload"
+        printf 'fake bd export failed after partial output\n' >&2
+        exit 7
+        ;;
+    hang)
+        printf '%s\n' "$$" > "$BVR_TEST_BD_PID"
+        exec /bin/sleep 30
+        ;;
+    hold-open)
+        /bin/sleep 30 &
+        printf '%s\n' "$!" > "$BVR_TEST_BD_DESCENDANT_PID"
+        ;;
+    noisy)
+        n=0
+        while [ "$n" -lt 4096 ]; do
+            printf 'fake bd diagnostic: enough stderr to exceed the capacity of an unread output pipe\n' >&2
+            n=$((n + 1))
+        done
+        ;;
+    oversized-stdout)
+        exec /bin/dd if=/dev/zero bs=1048576 count=129
+        ;;
+    oversized-stderr)
+        exec /bin/dd if=/dev/zero bs=1048576 count=2 >&2
+        ;;
+esac
+/bin/cat "$payload"
+"#,
+            )
+            .expect("fake bd executable");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                .expect("make fake bd executable");
+            Self { directory }
+        }
+
+        fn root(&self) -> &Path {
+            self.directory.path()
+        }
+
+        fn command(&self) -> Command {
+            let mut command = bvr();
+            command
+                .current_dir(self.root())
+                .env_remove("BEADS_DIR")
+                .env_remove("BEADS_DB")
+                .env_remove("BD_DB")
+                .env_remove("BV_DATA_SOURCE")
+                .env_remove("BVR_TEST_BD_MODE")
+                .env_remove("BVR_TEST_BD_PAYLOAD")
+                .env("PATH", self.root().join("bin"))
+                .env("BVR_TEST_BD_CALLS", self.root().join("calls.log"))
+                .env("BVR_TEST_BD_PID", self.root().join("child.pid"))
+                .env(
+                    "BVR_TEST_BD_DESCENDANT_PID",
+                    self.root().join("descendant.pid"),
+                )
+                .timeout(Duration::from_secs(12));
+            command
+        }
+
+        fn write_live(&self, content: &str) {
+            fs::write(self.root().join("live.jsonl"), content).expect("live backend snapshot");
+        }
+
+        fn write_compatibility_snapshot(&self) -> String {
+            let content = format!("{}\n", issue_line("STALE-1", "Stale snapshot", "open", 1));
+            fs::write(self.root().join(".beads/issues.jsonl"), &content)
+                .expect("compatibility snapshot");
+            content
+        }
+
+        fn assert_compatibility_snapshot(&self, expected: &str) {
+            assert_eq!(
+                fs::read_to_string(self.root().join(".beads/issues.jsonl"))
+                    .expect("compatibility snapshot still exists"),
+                expected,
+                "live reads must not modify the compatibility export"
+            );
+        }
+
+        fn calls(&self) -> String {
+            fs::read_to_string(self.root().join("calls.log")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for FakeDoltRepo {
+        fn drop(&mut self) {
+            // Only the hold-open case records a still-live descendant. The
+            // direct child in the timeout case is reaped and never killed again.
+            if let Ok(pid) = fs::read_to_string(self.root().join("descendant.pid")) {
+                let _ = ProcessCommand::new("/bin/kill")
+                    .args(["-KILL", pid.trim()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    fn robot_value(command: &mut Command) -> Value {
+        let output = command
+            .arg("--robot-triage")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        serde_json::from_slice(&output.stdout)
+            .expect("stdout contains exactly one robot JSON value")
+    }
+
+    fn assert_top_pick(value: &Value, id: &str) {
+        assert!(
+            value["triage"]["quick_ref"]["top_picks"]
+                .as_array()
+                .expect("triage top picks")
+                .iter()
+                .any(|pick| pick["id"] == id),
+            "expected live issue {id} in {value}"
+        );
+    }
+
+    #[test]
+    fn dolt_reads_live_stdout_over_stale_jsonl_on_every_new_process() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        fixture.write_live(&issue_line("LIVE-1", "First live state", "open", 1));
+        assert_top_pick(&robot_value(&mut fixture.command()), "LIVE-1");
+
+        fixture.write_live(&issue_line("LIVE-2", "Second live state", "open", 1));
+        let value = robot_value(fixture.command().args(["--db", ".beads"]));
+        assert_top_pick(&value, "LIVE-2");
+        assert!(!value.to_string().contains("STALE-1"));
+        assert_eq!(fixture.calls().lines().count(), 2);
+        fixture.assert_compatibility_snapshot(&stale);
+    }
+
+    #[test]
+    fn dolt_needs_no_compatibility_file_and_accepts_an_empty_live_database() {
+        let fixture = FakeDoltRepo::new();
+        fixture.write_live(&issue_line("LIVE-1", "Live only", "open", 1));
+        assert_top_pick(&robot_value(&mut fixture.command()), "LIVE-1");
+        assert!(!fixture.root().join(".beads/issues.jsonl").exists());
+
+        let stale = fixture.write_compatibility_snapshot();
+        fixture.write_live("");
+        let value = robot_value(&mut fixture.command());
+        assert_eq!(value["triage"]["quick_ref"]["total_open"], 0);
+        assert!(
+            value["triage"]["quick_ref"]["top_picks"]
+                .as_array()
+                .expect("empty-store top picks")
+                .is_empty()
+        );
+        fixture.assert_compatibility_snapshot(&stale);
+    }
+
+    #[test]
+    fn dolt_skips_only_explicit_memory_records() {
+        let fixture = FakeDoltRepo::new();
+        fixture.write_live(&format!(
+            "{{\"_type\":\"memory\",\"key\":\"context\",\"value\":\"not an issue\"}}\n{}\n",
+            issue_line("LIVE-1", "Real issue", "open", 1)
+        ));
+        let value = robot_value(&mut fixture.command());
+        assert_top_pick(&value, "LIVE-1");
+        assert_eq!(value["triage"]["quick_ref"]["total_open"], 1);
+    }
+
+    #[test]
+    fn dolt_rejects_corrupt_partial_invalid_and_unknown_records_without_stale_fallback() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        let valid = issue_line("LIVE-1", "Valid prefix", "open", 1);
+        for payload in [
+            "not JSON\n".to_string(),
+            format!("{valid}\n{{unfinished\n"),
+            r#"{"id":"INVALID","title":"","status":"open","issue_type":"task"}"#.to_string(),
+            concat!(
+                r#"{"_type":"unknown","id":"UNKNOWN","title":"Unknown record kind","#,
+                r#""status":"open","issue_type":"task"}"#,
+            )
+            .to_string(),
+        ] {
+            fixture.write_live(&payload);
+            let output = fixture
+                .command()
+                .arg("--robot-triage")
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            assert!(
+                output.stdout.is_empty(),
+                "failed live reads must not emit partial robot JSON"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("bd export"),
+                "the live backend error must remain visible in robot mode: {stderr}"
+            );
+            fixture.assert_compatibility_snapshot(&stale);
+        }
+    }
+
+    #[test]
+    fn dolt_nonzero_exit_is_visible_in_robot_mode_and_preserves_the_snapshot() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        fixture.write_live(&issue_line("PARTIAL-1", "Partial result", "open", 1));
+        let output = fixture
+            .command()
+            .env("BVR_TEST_BD_MODE", "fail")
+            .env("BV_ROBOT", "1")
+            .arg("--robot-triage")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("bd export"),
+            "backend error must be visible: {stderr}"
+        );
+        assert!(
+            stderr.contains("BV_DATA_SOURCE=jsonl"),
+            "error should explain the explicit offline option: {stderr}"
+        );
+        fixture.assert_compatibility_snapshot(&stale);
+    }
+
+    #[test]
+    fn dolt_missing_executable_fails_instead_of_returning_stale_data() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        let empty_bin = fixture.root().join("empty-bin");
+        fs::create_dir(&empty_bin).expect("empty executable search path");
+        let output = fixture
+            .command()
+            .env("PATH", &empty_bin)
+            .arg("--robot-triage")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("bd export"));
+        assert!(fixture.calls().is_empty());
+        fixture.assert_compatibility_snapshot(&stale);
+    }
+
+    #[test]
+    fn dolt_hung_export_is_bounded_and_the_child_is_reaped() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        let started = Instant::now();
+        let output = fixture
+            .command()
+            .env("BVR_TEST_BD_MODE", "hang")
+            .arg("--robot-triage")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "backend timeout should precede the outer test deadline"
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("bd export") && stderr.contains("timed out"),
+            "expected a visible bounded timeout: {stderr}"
+        );
+        let pid = fs::read_to_string(fixture.root().join("child.pid")).expect("fake child pid");
+        assert!(
+            !ProcessCommand::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("check fake child lifetime")
+                .success(),
+            "the timed-out fake backend must not remain running or unreaped"
+        );
+        fixture.assert_compatibility_snapshot(&stale);
+    }
+
+    #[test]
+    fn dolt_large_stderr_cannot_deadlock_or_corrupt_robot_stdout() {
+        let fixture = FakeDoltRepo::new();
+        fixture.write_live(&issue_line("LIVE-1", "Noisy backend", "open", 1));
+        let value = robot_value(fixture.command().env("BVR_TEST_BD_MODE", "noisy"));
+        assert_top_pick(&value, "LIVE-1");
+        assert!(!value.to_string().contains("fake bd diagnostic"));
+    }
+
+    #[test]
+    fn dolt_output_size_caps_reject_oversized_streams_without_stale_fallback() {
+        // Fixed-size writes exercise the total stream limits without relying
+        // on timeouts or an unbounded producer. A parser error is not a pass.
+        for (mode, expected_error) in [
+            ("oversized-stdout", "stdout exceeded 134217728 bytes"),
+            ("oversized-stderr", "stderr exceeded 1048576 bytes"),
+        ] {
+            let fixture = FakeDoltRepo::new();
+            let stale = fixture.write_compatibility_snapshot();
+            let output = fixture
+                .command()
+                .env("BVR_TEST_BD_MODE", mode)
+                .arg("--robot-triage")
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            assert!(
+                output.stdout.is_empty(),
+                "an oversized backend stream must not contaminate robot stdout"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(expected_error),
+                "{mode} must fail at its byte cap, got: {stderr}"
+            );
+            assert_eq!(fixture.calls().lines().count(), 1);
+            fixture.assert_compatibility_snapshot(&stale);
+        }
+    }
+
+    #[test]
+    fn dolt_success_does_not_wait_for_descendants_holding_output_descriptors() {
+        let fixture = FakeDoltRepo::new();
+        fixture.write_live(&issue_line("LIVE-1", "Exited exporter", "open", 1));
+        let started = Instant::now();
+        let value = robot_value(fixture.command().env("BVR_TEST_BD_MODE", "hold-open"));
+        assert_top_pick(&value, "LIVE-1");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "an exited exporter must not wait for inherited output descriptors"
+        );
+    }
+
+    #[test]
+    fn dolt_explicit_jsonl_sources_bypass_the_backend() {
+        let fixture = FakeDoltRepo::new();
+        let stale = fixture.write_compatibility_snapshot();
+        for flag in ["--beads-file", "--db"] {
+            let value = robot_value(fixture.command().args([flag, ".beads/issues.jsonl"]));
+            assert_top_pick(&value, "STALE-1");
+        }
+        let value = robot_value(
+            fixture
+                .command()
+                .env("BEADS_DB", fixture.root().join(".beads/issues.jsonl")),
+        );
+        assert_top_pick(&value, "STALE-1");
+        let value = robot_value(fixture.command().env("BV_DATA_SOURCE", "jsonl"));
+        assert_top_pick(&value, "STALE-1");
+        assert!(
+            fixture.calls().is_empty(),
+            "explicit file reads must not invoke bd"
+        );
+        fixture.assert_compatibility_snapshot(&stale);
+
+        let missing = FakeDoltRepo::new();
+        fs::write(missing.root().join(".beads/beads.jsonl"), &stale)
+            .expect("unrelated compatibility filename");
+        missing
+            .command()
+            .env("BV_DATA_SOURCE", "jsonl")
+            .arg("--robot-triage")
+            .assert()
+            .failure();
+        assert!(missing.calls().is_empty());
+    }
+
+    #[test]
+    fn dolt_redirect_uses_the_resolved_workspace_and_removes_database_overrides() {
+        let fixture = FakeDoltRepo::new();
+        fixture.write_live(&issue_line("LIVE-1", "Redirected live issue", "open", 1));
+        let linked = fixture.root().join("linked");
+        fs::create_dir_all(linked.join(".beads")).expect("redirected checkout");
+        let resolved =
+            fs::canonicalize(fixture.root().join(".beads")).expect("canonical beads path");
+        fs::write(
+            linked.join(".beads/redirect"),
+            resolved.to_string_lossy().as_bytes(),
+        )
+        .expect("beads redirect");
+        let value = robot_value(
+            fixture
+                .command()
+                .current_dir(&linked)
+                .arg("--db")
+                .arg(linked.join(".beads"))
+                .env("BEADS_DB", linked.join("missing.db"))
+                .env("BD_DB", linked.join("missing-bd.db")),
+        );
+        assert_top_pick(&value, "LIVE-1");
+        assert_eq!(
+            fixture.calls(),
+            format!(
+                "export|{}|{}|unset|unset\n",
+                resolved.parent().expect("repo root").display(),
+                resolved.display()
+            )
+        );
+    }
+
+    #[test]
+    fn dolt_workspace_cache_keeps_independent_repositories_separate() {
+        let fixture = FakeDoltRepo::new();
+        let ws_path = setup_workspace(fixture.root(), &[("api", ""), ("web", "")]);
+        // A shared native ID with distinct content detects cross-workspace
+        // cache reuse even when namespacing would keep the issue count at two.
+        for repo in ["api", "web"] {
+            let repo_path = fixture.root().join(repo);
+            fs::write(
+                repo_path.join(".beads/metadata.json"),
+                r#"{"backend":"dolt"}"#,
+            )
+            .expect("workspace Dolt metadata");
+            fs::write(
+                repo_path.join("live.jsonl"),
+                issue_line("LIVE-1", repo, "open", 1),
+            )
+            .expect("independent live database");
+        }
+        let value = robot_value(fixture.command().arg("--workspace").arg(ws_path));
+        let recommendations = value["triage"]["recommendations"]
+            .as_array()
+            .expect("workspace recommendations");
+        let calls = fixture.calls();
+        for repo in ["api", "web"] {
+            let id = format!("{repo}-LIVE-1");
+            assert_top_pick(&value, &id);
+            let recommendation = recommendations
+                .iter()
+                .find(|issue| issue["id"] == id)
+                .expect("independent workspace issue");
+            assert_eq!(recommendation["title"], repo);
+            let repo_path = fs::canonicalize(fixture.root().join(repo))
+                .expect("canonical workspace repository");
+            let quoted_path = bvr::model::shell_quote(&repo_path.to_string_lossy());
+            assert_eq!(
+                recommendation["claim_command"],
+                format!("cd {quoted_path} && br update LIVE-1 --status=in_progress")
+            );
+            assert_eq!(
+                recommendation["show_command"],
+                format!("cd {quoted_path} && br show LIVE-1")
+            );
+            assert!(
+                calls.lines().any(|call| call
+                    == format!(
+                        "export|{}|{}|unset|unset",
+                        repo_path.display(),
+                        repo_path.join(".beads").display()
+                    )),
+                "each independent workspace must invoke its own live backend: {calls}"
+            );
+        }
+        assert_eq!(value["triage"]["quick_ref"]["total_open"], 2);
+        assert_eq!(calls.lines().count(), 2);
+    }
+
+    #[test]
+    fn dolt_workspace_fails_instead_of_emitting_partial_live_data() {
+        // Exercise both strict-record rejection and a backend process failure.
+        for failed_payload in [Some("not JSON\n"), None] {
+            let fixture = FakeDoltRepo::new();
+            let ws_path = setup_workspace(fixture.root(), &[("api", ""), ("web", "")]);
+            for repo in ["api", "web"] {
+                fs::write(
+                    fixture.root().join(repo).join(".beads/metadata.json"),
+                    r#"{"backend":"dolt"}"#,
+                )
+                .expect("workspace Dolt metadata");
+            }
+            fs::write(
+                fixture.root().join("api/live.jsonl"),
+                issue_line("API-1", "Valid live issue", "open", 1),
+            )
+            .expect("valid first live repository");
+            if let Some(payload) = failed_payload {
+                fs::write(fixture.root().join("web/live.jsonl"), payload)
+                    .expect("malformed second live repository");
+            }
+            // Otherwise the absent file makes the second fake bd exit nonzero.
+            let output = fixture
+                .command()
+                .arg("--workspace")
+                .arg(ws_path)
+                .arg("--robot-triage")
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            assert!(
+                output.stdout.is_empty(),
+                "a workspace must not publish only its successful live repositories"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("bd export") && stderr.contains("web"),
+                "the failed live repository must remain visible to the caller: {stderr}"
+            );
+            assert_eq!(
+                fixture.calls().lines().count(),
+                2,
+                "the fixture must load one valid repository before the live failure"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_metadata_outvotes_leftover_dolt_directory_and_explicit_sqlite_stays_direct() {
+        let fixture = FakeDoltRepo::new();
+        let database = fixture.root().join(".beads/beads.db");
+        rusqlite::Connection::open(&database)
+            .expect("fixture SQLite database")
+            .execute_batch(
+                "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT);
+                 INSERT INTO issues VALUES ('SQLITE-1', 'Current SQLite issue');",
+            )
+            .expect("seed SQLite fixture");
+        fs::write(
+            fixture.root().join(".beads/metadata.json"),
+            r#"{"backend":"sqlite","database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("authoritative SQLite metadata");
+        assert_top_pick(&robot_value(&mut fixture.command()), "SQLITE-1");
+        assert_top_pick(
+            &robot_value(fixture.command().arg("--beads-file").arg(database)),
+            "SQLITE-1",
+        );
+        assert!(
+            fixture.calls().is_empty(),
+            "SQLite must not invoke a leftover Dolt backend"
+        );
+    }
 }

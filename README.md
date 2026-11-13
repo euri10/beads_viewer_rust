@@ -290,16 +290,19 @@ cargo install --path .
 
 ```bash
 bvr --check-update   # non-mutating: report whether a newer version exists
-bvr upgrade          # install the latest release via `cargo install beads_viewer_rust --locked`
+bvr upgrade          # show the install command and ask for confirmation
+bvr upgrade --yes    # explicitly authorize installation without prompting
 bvr upgrade --dry-run  # show what would be installed without changing anything
 ```
 
 `bvr upgrade` resolves the latest version from crates.io (falling back to GitHub releases/tags) and reinstalls through cargo, so it works for any cargo-based install above. It requires the Rust toolchain to be present — the same prerequisite as installing in the first place.
 
+Installation requires an explicit `y` or `yes` answer in an interactive terminal. For scripts or other non-interactive use, pass `--yes` (or `-y`); piped input cannot approve an upgrade. `--dry-run` never runs the installer. The legacy `--update` and `--update-dry-run` aliases follow the same rules, and update commands cannot be combined with robot, export, or other unrelated actions.
+
 ### Toolchain
 
 - Rust edition: `2024`
-- Minimum Rust version: `1.85`
+- Minimum Rust version: `1.88`
 - Binary name: `bvr`
 
 ## Quick Start
@@ -359,13 +362,19 @@ bvr --preview-pages ./bv-pages
 
 ### Default data sources
 
-`bvr` loads issues from `.beads` by default, with compatibility for:
+`bvr` loads issues from `.beads` by default:
 
-- `beads.jsonl`
-- `issues.jsonl`
-- `beads.base.jsonl`
+- **br workspaces** declare their store in `.beads/metadata.json` (`database` and `jsonl_export`). `bvr` reads whichever is fresher: the SQLite database (read-only, including un-flushed writes in its `-wal` file) or the JSONL export (for example right after a `git pull`, before `br sync --import-only`). In automatic mode, a failed SQLite read stops robot commands with an error; set `BV_DATA_SOURCE=jsonl` to explicitly use the saved export. Interactive views and Pages exports can still fall back automatically with a visible warning. Set `BV_DATA_SOURCE=sqlite|jsonl` to require one source in every mode. Explicit SQLite metadata takes precedence over leftover Dolt directories.
+- **Without metadata**, it reads the first non-empty file among `beads.jsonl`, `issues.jsonl`, and `beads.base.jsonl`.
+- **bd (Dolt) workspaces** (`.beads/dolt/`, `.beads/embeddeddolt/`, or `backend: dolt`) are read from live `bd export` output. Each export has a five-second process deadline; successful snapshots are shared for two seconds within the process, and failures back off for 30 seconds. Output size and JSONL records are checked before the snapshot is accepted. A failed export reports an error, including in robot mode, instead of silently loading stale or partial data. `bvr` does not create or replace `.beads/issues.jsonl`; `bd` itself may perform its normal backend startup or maintenance. Set `BV_DATA_SOURCE=jsonl` to read an existing `issues.jsonl` without invoking `bd`. Other JSONL files in a Dolt directory are never substituted. TUI background reload and `--watch-export` refresh live snapshots and detect description/comment edits even when timestamps do not change; a failed refresh preserves the last displayed or exported snapshot.
+- **`.beads/redirect`** chains are followed the same way `br where` follows them.
+- **`BEADS_DB`** (a database or JSONL file, or a `.beads` directory) takes priority over `BEADS_DIR`. `--db` accepts the same kinds of path.
 
-It can also aggregate repositories via `.bv/workspace.yaml`.
+Scheduler deferrals (`defer_until`) are respected: a deferred bead is kept out of ready work and triage picks until the deferral passes, as in `br ready`.
+
+SQLite loads use one read-only snapshot for issues, labels, dependencies, and comments. Malformed rows, invalid issue data, unsupported required table columns, and invalid nonempty timestamps reject the entire SQLite load. Optional tables and supported older schemas remain accepted. A blocking dependency cannot silently disappear because its row failed to decode.
+
+It can also aggregate repositories via `.bv/workspace.yaml`. A SQLite or live Dolt source failure aborts the workspace load instead of omitting that repository. An explicit `BV_DATA_SOURCE=sqlite|jsonl` choice is mandatory for every enabled repository; automatic discovery can still skip repositories without a configured, readable tracker. The automatic nonrobot SQLite fallback described above also applies within workspaces.
 
 ### Output formats
 
@@ -449,6 +458,12 @@ The bundle includes:
 - static-host helper files such as `_headers`
 - a deploy-facing bundle README
 
+The dashboard's Ready and Blocked filters, actionable counts, Quick Wins, and Top Picks use the Rust engine's decisions recorded in the export. Readiness includes every blocking dependency type, inherited parent blockers, issue status, and `defer_until`. Quick Wins and Top Picks also exclude already assigned work, work in progress, epics, and parents with open children. These decisions remain available when the optional browser graph engine cannot load. They describe the exported snapshot; export again to reflect source changes or elapsed deferrals.
+
+Dependency details retain completed prerequisites for context. Their links, `h`/`l` navigation, and diagrams preserve exact issue IDs and consistently distinguish prerequisites from dependents. Existing schema v2 dashboard databases upgrade to v3 automatically on re-export.
+
+The viewer verifies database byte lengths and SHA-256 checksums against `beads.sqlite3.config.json` before opening SQLite. This covers downloads, each chunk, the assembled database, and browser-cached copies. A corrupt cache is replaced by a verified download; a missing or malformed manifest or mismatched download stops loading with an error. Publish the complete export, including its manifest and chunks, and serve it over HTTPS or localhost so [Web Crypto](https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest) is available. The checks establish consistency with the published manifest; whole-bundle publication and independent JSON sidecars remain separate concerns.
+
 ### Why pages export exists
 
 It solves a different problem than robot mode:
@@ -487,13 +502,23 @@ bvr --robot-overview
 bvr --robot-triage
 bvr --robot-triage-by-track
 bvr --robot-triage-by-label
+bvr --robot-triage --brief                          # compact, decision-only payload
+bvr --robot-triage --graph-root bd-epic             # scope triage to an epic's work tree
+bvr --robot-next --robot-not-ready-labels needs-design,waiting-external
 bvr --robot-plan
 bvr --robot-priority
 bvr --robot-alerts
 bvr --robot-suggest
+bvr --robot-capabilities                            # one-call manifest of the robot surface
 ```
 
 Use these when you want a fast orientation snapshot, ranked recommendations, quick wins, blockers to clear, grouped tracks, or priority mismatch detection.
+
+Agent-style invocations are accepted too and rewritten onto these flags: `bvr triage --json`, `bvr robot-next`, `bvr forecast all`, `bvr search "oauth login" --limit 5`, `bvr graph mermaid`, `bvr docs env`, `bvr schema triage`. `--json`, `--toon`, and `-o <fmt>` map to `--format`. `--limit` maps to the command's own limit flag. `--json` with no other command runs `--robot-triage`.
+
+Triage counts use strict semantics, as in legacy `bv` (#165). `quick_ref.open_count` and `blocked_count` (and `project_health.counts.open`/`blocked`) count issues whose status is exactly `open` or `blocked`, so they always match `counts.by_status`. The aggregates have their own fields: `not_closed_count` (= `total_open` = `counts.not_closed`) and `not_actionable_count` (= `counts.dependency_blocked`), with `not_closed_count == actionable_count + not_actionable_count`.
+
+Top picks (`--robot-next`, `quick_ref.top_picks`, per-track and per-label `top_pick`) only include beads that can be claimed now. A claimable bead is `open`, unassigned, not an epic, not a parent with open children, not deferred, and has none of the not-ready labels (`--robot-not-ready-labels` or `BV_ROBOT_NOT_READY_LABELS`).
 
 ### Graph analysis and forecasting
 
@@ -526,6 +551,10 @@ bvr --robot-correlation-stats
 
 Use these when you want git-aware change tracking, baseline comparisons, or a feedback loop for commit-to-bead correlations.
 
+Interactive History loads Git data in the background, so you can navigate while it runs. Failed loads remain visible and can be retried by closing and reopening History with `H`. Git scans have a 30-second deadline, a 10-second limit for the commit log, a 5-second limit for each probe or diff, and bounded output. A failed or oversized scan reports an error instead of returning partial correlations. For a smaller robot scan, use `--robot-history --history-limit 100` or narrow the range with `--history-since`.
+
+Local backup snapshots under `.beads/.br_history` remain visible in commit file lists but do not create issue field changes or count as live issue metadata.
+
 ### Label, search, and file intelligence
 
 ```bash
@@ -551,9 +580,12 @@ Use these when you need label health, workspace search, orphan detection, file-t
 
 ```bash
 bvr --export-md /tmp/report.md
+bvr --export /tmp/report.json --export-format json      # markdown|json|csv|mermaid
+bvr --export /tmp/issues.csv --export-format csv --export-include-graph=false
 bvr --priority-brief /tmp/priority-brief.md
 bvr --agent-brief /tmp/agent-brief
 bvr --export-graph /tmp/deps.json
+bvr --export-graph /tmp/deps.html                        # self-contained interactive force graph
 bvr --export-pages ./bv-pages
 bvr --preview-pages ./bv-pages
 bvr --export-pages ./bv-pages --watch-export
@@ -566,6 +598,7 @@ These commands generate static artifacts, local previews, and operator-facing de
 
 ```bash
 bvr
+bvr --theme light                                   # light|dark|auto (COLORFGBG)
 bvr --debug-render graph --debug-width 160 --debug-height 50
 bvr --profile-startup
 bvr --profile-startup --profile-json
@@ -600,10 +633,10 @@ Bare `bvr` launches the interactive terminal UI. For automation, do not run the 
 | `g` | Graph | Dependency graph and edge inspection |
 | `H` | History | Bead/git timeline and file tree |
 | `a` | Actionable | Parallel execution tracks |
-| `!` | Attention | Label attention ranking |
-| `T` | Tree | Dependency tree |
+| `]` | Attention | Label attention ranking |
+| `T` / `E` | Tree | Dependency tree |
 | `[` | Labels | Label health dashboard |
-| `]` | Flow | Cross-label flow matrix |
+| `f` | Flow | Cross-label flow matrix |
 | `t` | Time Travel | Diff-against-ref view |
 | `S` | Sprint | Sprint planning/detail view |
 
@@ -616,6 +649,9 @@ Bare `bvr` launches the interactive terminal UI. For automation, do not run the 
 | `Esc` | Back, clear, or quit confirm |
 | `j` / `k` | Move within the focused pane |
 | `/` | Search in supported views |
+| `!` | Alerts panel: j/k navigate, Enter jumps to the issue, `d` dismisses |
+| `;` / `F2` | Shortcuts sidebar for the current view (Ctrl+j/k scroll) |
+| `` ` `` / `Ctrl+T` | Interactive tutorial (←/→ pages, `t` contents) |
 
 ## TUI Design Goals
 
@@ -663,6 +699,7 @@ experimental:
 
 | Variable | Purpose |
 |---|---|
+| `BV_DATA_SOURCE` | Source selection: `auto` (live Dolt or freshest declared br store), `jsonl`, or `sqlite` |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` |
 | `TOON_DEFAULT_FORMAT` | Fallback output format if `BV_OUTPUT_FORMAT` is unset |
 | `TOON_STATS` | Print JSON vs TOON token estimates on stderr |

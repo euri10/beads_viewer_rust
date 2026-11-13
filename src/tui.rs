@@ -1,23 +1,23 @@
 use std::cell::Cell;
-use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
 use crate::analysis::Analyzer;
 use crate::analysis::git_history::{
-    GitCommitRecord, HistoryBeadCompat, HistoryCommitCompat, HistoryMilestonesCompat,
-    build_workspace_id_aliases, correlate_histories_with_git_aliases, finalize_history_entries,
-    load_git_commits,
+    GitCommitRecord, GitHistoryCancellation, GitHistoryScan, HistoryBeadCompat,
+    HistoryCommitCompat, HistoryMilestonesCompat, build_workspace_id_aliases,
+    finalize_history_entries,
 };
 use crate::analysis::history::IssueHistory;
 use crate::analysis::triage::TriageOptions;
 use crate::loader;
 use crate::model::{Issue, Sprint};
 #[cfg(not(test))]
-use crate::robot::compute_data_hash;
+use crate::robot::compute_snapshot_hash;
 use crate::{BvrError, Result};
 use chrono::{DateTime, Utc};
 use ftui::core::event::{
@@ -36,6 +36,7 @@ use ftui::text::{
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::{PackedRgba, Style};
 
 #[cfg(not(test))]
 use std::sync::{
@@ -71,7 +72,7 @@ impl BackgroundModeConfig {
     #[cfg(not(test))]
     fn load_issues(&self) -> Result<Vec<Issue>> {
         let issues = if let Some(path) = self.beads_file.as_deref() {
-            loader::load_issues_from_file(path)?
+            loader::load_issues_from_path(path)?
         } else if let Some(path) = self.workspace_config.as_deref() {
             loader::load_workspace_issues(path)?
         } else {
@@ -138,7 +139,7 @@ struct BackgroundRuntimeState {
     config: BackgroundModeConfig,
     in_flight: bool,
     cancel_requested: Arc<AtomicBool>,
-    last_data_hash: String,
+    last_snapshot_hash: [u8; 32],
     timeline: VecDeque<String>,
 }
 
@@ -161,8 +162,8 @@ fn decide_background_tick(cancel_requested: bool, in_flight: bool) -> Background
 
 fn should_apply_background_reload(
     cancel_requested: bool,
-    new_hash: &str,
-    previous_hash: &str,
+    new_hash: &[u8; 32],
+    previous_hash: &[u8; 32],
 ) -> bool {
     !cancel_requested && new_hash != previous_hash
 }
@@ -436,6 +437,13 @@ thread_local! {
     static LAST_VIEW_WIDTH: Cell<u16> = const { Cell::new(80) };
     static LAST_VIEW_HEIGHT: Cell<u16> = const { Cell::new(24) };
     static LAST_DETAIL_CONTENT_AREA: Cell<Rect> = const { Cell::new(Rect::new(0, 0, 0, 0)) };
+    static LAST_MAIN_LIST_AREA: Cell<Rect> = const { Cell::new(Rect::new(0, 0, 0, 0)) };
+    /// Full terminal width of the last frame (the view size shrinks by the
+    /// shortcuts sidebar's column while it is shown).
+    static LAST_TERMINAL_WIDTH: Cell<u16> = const { Cell::new(0) };
+    /// Alert counts for the status bar, keyed by the loaded issue set
+    /// (vector address and length) so they are computed once per load.
+    static ALERT_COUNTS: Cell<Option<(u64, usize, usize, usize)>> = const { Cell::new(None) };
     static PANE_SPLIT_STATE: Cell<PaneSplitState> = const { Cell::new(PaneSplitState {
         narrow_list_pct: 35.0,
         medium_list_pct: 42.0,
@@ -453,6 +461,14 @@ fn record_view_size(width: u16, height: u16) {
 
 fn record_detail_content_area(area: Rect) {
     LAST_DETAIL_CONTENT_AREA.with(|cell| cell.set(area));
+}
+
+fn record_main_list_area(area: Rect) {
+    LAST_MAIN_LIST_AREA.with(|cell| cell.set(area));
+}
+
+fn cached_main_list_area() -> Rect {
+    LAST_MAIN_LIST_AREA.with(Cell::get)
 }
 
 fn cached_detail_content_area() -> Rect {
@@ -506,19 +522,67 @@ fn splitter_rect_between(left: Rect, right: Rect) -> Rect {
     Rect::new(x, left.y, width.max(1), left.height)
 }
 
+/// Rows used by the top mode-tab header. The Go bv views (main, board,
+/// insights, graph) have none — their own titles and the status bar carry
+/// the chrome, as in Go; the Rust-only modes keep the tab strip.
+fn header_height(app: &BvrApp) -> u16 {
+    u16::from(!matches!(
+        app.mode,
+        ViewMode::Main
+            | ViewMode::Board
+            | ViewMode::Insights
+            | ViewMode::Graph
+            | ViewMode::Actionable
+            | ViewMode::History
+            | ViewMode::Tree
+            | ViewMode::LabelDashboard
+            | ViewMode::Attention
+            | ViewMode::FlowMatrix
+            | ViewMode::Sprint
+    ))
+}
+
+fn history_body_rect(area: Rect) -> Rect {
+    let header_rows = area.height.min(4);
+    Rect::new(
+        area.x,
+        area.y.saturating_add(header_rows),
+        area.width,
+        area.height.saturating_sub(header_rows),
+    )
+}
+
 fn splitter_hit_boxes(app: &BvrApp, width: u16, height: u16) -> Vec<SplitterHitBox> {
     let full = Rect::from_size(width, height);
     let rows = Flex::vertical()
         .constraints([
-            Constraint::Fixed(1),
+            Constraint::Fixed(header_height(app)),
             Constraint::Min(3),
             Constraint::Fixed(1),
         ])
         .split(full);
-    let body = rows[1];
     let bp = Breakpoint::from_width(width);
+    // Only these renderers use PaneSplitState. The other dashboards choose
+    // their own fixed columns or show one full-width view, so a generic
+    // two-pane hit box would resize an invisible split over live content.
+    let resizable = match app.mode {
+        ViewMode::Main | ViewMode::Graph => !matches!(bp, Breakpoint::Narrow),
+        ViewMode::Insights => app.insights_heatmap.is_some(),
+        ViewMode::History | ViewMode::TimeTravelDiff => true,
+        _ => false,
+    };
+    if !resizable {
+        return Vec::new();
+    }
+    let body = if matches!(app.mode, ViewMode::History) {
+        history_body_rect(rows[1])
+    } else {
+        rows[1]
+    };
+    if body.height < 3 || body.width < 2 {
+        return Vec::new();
+    }
     let split_state = pane_split_state();
-    let graph_single_pane = matches!(app.mode, ViewMode::Graph) && matches!(bp, Breakpoint::Narrow);
     let history_layout = if matches!(app.mode, ViewMode::History) {
         HistoryLayout::from_width(body.width)
     } else {
@@ -526,10 +590,6 @@ fn splitter_hit_boxes(app: &BvrApp, width: u16, height: u16) -> Vec<SplitterHitB
     };
     let history_multi_pane =
         matches!(app.mode, ViewMode::History) && history_layout.has_middle_pane();
-
-    if graph_single_pane {
-        return Vec::new();
-    }
 
     if history_multi_pane {
         if matches!(history_layout, HistoryLayout::Wide)
@@ -717,13 +777,48 @@ mod tokens {
         Light,
     }
 
-    /// Detect theme from `BV_THEME` env var.  Falls back to dark.
+    /// Theme chosen on the command line (`--theme`); wins over `BV_THEME`.
+    pub(super) static THEME_OVERRIDE: std::sync::OnceLock<ThemeMode> = std::sync::OnceLock::new();
+
+    /// Parse a theme preference: `light`, `dark`, or `auto` (terminal
+    /// background detection). Unknown values yield `None`.
+    pub fn parse_theme_preference(value: &str, colorfgbg: Option<&str>) -> Option<ThemeMode> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            "auto" | "" => Some(detect_from_colorfgbg(colorfgbg)),
+            _ => None,
+        }
+    }
+
+    /// Infer the terminal background from `COLORFGBG` (`fg;bg` or
+    /// `fg;default;bg`, set by rxvt, Konsole, iTerm2 and others). ANSI
+    /// background 7 (white) or 9-15 (bright colours) means a light
+    /// background; anything else, or an absent variable, means dark.
+    pub fn detect_from_colorfgbg(colorfgbg: Option<&str>) -> ThemeMode {
+        let bg = colorfgbg
+            .and_then(|value| value.rsplit(';').next())
+            .and_then(|bg| bg.trim().parse::<u8>().ok());
+        match bg {
+            Some(7 | 9..=15) => ThemeMode::Light,
+            _ => ThemeMode::Dark,
+        }
+    }
+
+    /// Resolve the theme: `--theme` override, then `BV_THEME`
+    /// (`light`/`dark`/`auto`), then `COLORFGBG` auto-detection.
     /// Result is cached for the lifetime of the process.
     pub fn detect_theme() -> ThemeMode {
+        if let Some(mode) = THEME_OVERRIDE.get() {
+            return *mode;
+        }
         static CACHED: std::sync::OnceLock<ThemeMode> = std::sync::OnceLock::new();
-        *CACHED.get_or_init(|| match std::env::var("BV_THEME").as_deref() {
-            Ok("light") => ThemeMode::Light,
-            _ => ThemeMode::Dark,
+        *CACHED.get_or_init(|| {
+            let colorfgbg = std::env::var("COLORFGBG").ok();
+            std::env::var("BV_THEME")
+                .ok()
+                .and_then(|value| parse_theme_preference(&value, colorfgbg.as_deref()))
+                .unwrap_or_else(|| detect_from_colorfgbg(colorfgbg.as_deref()))
         })
     }
 
@@ -889,6 +984,116 @@ mod tokens {
     }
 
     // ── Footer tokens (4 distinct styles matching Go bv) ─────────────
+
+    // ── Go bv main-view chrome ───────────────────────────────────────
+
+    /// Column header bar of the issue list (primary background, dark bold
+    /// text), as in Go bv's `renderListWithHeader`.
+    pub fn list_column_header() -> Style {
+        Style::new()
+            .fg(p(
+                PackedRgba::rgb(255, 255, 255),
+                PackedRgba::rgb(40, 42, 54),
+            ))
+            .bg(p(FG_ACCENT_LIGHT, FG_ACCENT))
+            .bold()
+    }
+
+    /// Background of the selected list row.
+    pub fn row_highlight_bg() -> PackedRgba {
+        p(BG_HIGHLIGHT_LIGHT, BG_HIGHLIGHT)
+    }
+
+    /// Issue ID text in list rows (secondary).
+    pub fn row_id() -> Style {
+        Style::new().fg(p(FG_SUBTEXT_LIGHT, FG_MUTED))
+    }
+
+    /// Issue title text in list rows; primary + bold when selected.
+    pub fn row_title(selected: bool) -> Style {
+        if selected {
+            Style::new().fg(p(FG_ACCENT_LIGHT, FG_ACCENT)).bold()
+        } else {
+            Style::new().fg(p(
+                PackedRgba::rgb(51, 51, 51),
+                PackedRgba::rgb(232, 232, 232),
+            ))
+        }
+    }
+
+    /// Selection caret / primary bold accent.
+    pub fn primary_bold() -> Style {
+        Style::new().fg(p(FG_ACCENT_LIGHT, FG_ACCENT)).bold()
+    }
+
+    /// Muted text (ages, page info).
+    pub fn muted_text() -> Style {
+        Style::new().fg(p(FG_MUTED_LIGHT, FG_MUTED))
+    }
+
+    /// Info text (comment counts).
+    pub fn info_text() -> Style {
+        Style::new().fg(p(FG_INFO_LIGHT, FG_INFO))
+    }
+
+    /// Success text (Go bv's `Open` green: additions, high confidence).
+    pub fn success_text() -> Style {
+        Style::new().fg(p(FG_SUCCESS_LIGHT, FG_SUCCESS))
+    }
+
+    /// Triage marker for a blocker that unblocks work.
+    pub fn triage_unblocks() -> Style {
+        Style::new().fg(p(FG_WARNING_LIGHT, FG_WARNING)).bold()
+    }
+
+    /// Status-bar filter badge (primary background).
+    pub fn status_filter_badge() -> Style {
+        Style::new()
+            .fg(p(
+                PackedRgba::rgb(26, 26, 26),
+                PackedRgba::rgb(248, 248, 242),
+            ))
+            .bg(p(FG_ACCENT_LIGHT, FG_ACCENT))
+            .bold()
+    }
+
+    /// Status-bar stats section background.
+    pub fn status_stats_bg() -> PackedRgba {
+        p(BG_HIGHLIGHT_LIGHT, BG_HIGHLIGHT)
+    }
+
+    /// Status-bar one-shot message (success / error).
+    pub fn status_message(error: bool) -> Style {
+        if error {
+            Style::new()
+                .fg(p(FG_ERROR_LIGHT, FG_ERROR))
+                .bg(p(BG_SURFACE_DANGER_L, BG_SURFACE_DANGER))
+                .bold()
+        } else {
+            Style::new()
+                .fg(p(FG_SUCCESS_LIGHT, FG_SUCCESS))
+                .bg(p(BG_SURFACE_SUCCESS_L, BG_SURFACE_SUCCESS))
+                .bold()
+        }
+    }
+
+    /// Markdown theme for the detail pane, matching Go bv's glamour styling
+    /// (purple headings, cyan inline code, muted quotes).
+    pub fn detail_markdown_theme() -> ftui_extras::markdown::MarkdownTheme {
+        let accent = p(FG_ACCENT_LIGHT, FG_ACCENT);
+        ftui_extras::markdown::MarkdownTheme {
+            h1: Style::new().fg(accent).bold(),
+            h2: Style::new().fg(accent).bold(),
+            h3: Style::new().fg(accent).bold(),
+            h4: Style::new().fg(accent).bold(),
+            code_inline: Style::new().fg(p(FG_INFO_LIGHT, FG_INFO)),
+            code_block: Style::new().fg(p(FG_SUBTEXT_LIGHT, FG_SUBTEXT)),
+            blockquote: Style::new().fg(p(FG_MUTED_LIGHT, FG_MUTED)).italic(),
+            strong: Style::new().fg(p(FG_WARNING_LIGHT, FG_WARNING)).bold(),
+            list_bullet: Style::new().fg(accent),
+            ..ftui_extras::markdown::MarkdownTheme::default()
+        }
+    }
 
     /// Footer keybinding label (bright, bold).
     pub fn footer_key() -> Style {
@@ -1572,6 +1777,459 @@ fn issue_label_summary(issue: &crate::model::Issue) -> Option<String> {
     })
 }
 
+/// A full-width colored bar: `text` then explicit padding in the same style,
+/// so the background spans the line even where trailing blanks get trimmed.
+fn padded_bar(text: &str, width: usize, style: Style) -> RichLine {
+    let pad = width.saturating_sub(display_width(text));
+    RichLine::from_spans([
+        RichSpan::styled(text.to_string(), style),
+        RichSpan::styled(" ".repeat(pad), style),
+    ])
+}
+
+/// Go bv's issue-type glyphs (`GetTypeIcon`).
+fn go_type_icon(issue_type: &str) -> &'static str {
+    match issue_type.trim().to_ascii_lowercase().as_str() {
+        "bug" => "🐛",
+        "feature" => "✨",
+        "task" => "📋",
+        "epic" => "🚀",
+        "chore" => "🧹",
+        "docs" => "📝",
+        "question" => "❓",
+        _ => "• ",
+    }
+}
+
+/// Go bv's priority glyphs for the detail table (`GetPriorityIcon`).
+fn go_priority_icon(priority: i32) -> &'static str {
+    match priority {
+        0 => "🔥 P0",
+        1 => "⚡ P1",
+        2 => "🔹 P2",
+        3 => "☕ P3",
+        _ => "💤 P4",
+    }
+}
+
+/// Clock for relative ages in the TUI. Pinned under test so rendered
+/// snapshots do not drift with wall time.
+fn tui_now() -> DateTime<Utc> {
+    #[cfg(test)]
+    {
+        DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now())
+    }
+    #[cfg(not(test))]
+    {
+        Utc::now()
+    }
+}
+
+/// Go bv's relative age (`FormatTimeRel`): now, 5m ago, 3h ago, 2d ago,
+/// 1w ago, 4mo ago.
+fn go_time_rel(time: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(time) = time else {
+        return "unknown".to_string();
+    };
+    let delta = now - time;
+    let minutes = delta.num_minutes();
+    let hours = delta.num_hours();
+    let days = delta.num_days();
+    if minutes < 1 {
+        "now".to_string()
+    } else if hours < 1 {
+        format!("{minutes}m ago")
+    } else if days < 1 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else if days < 30 {
+        format!("{}w ago", days / 7)
+    } else {
+        format!("{}mo ago", days / 30)
+    }
+}
+
+/// A lifecycle event as Go bv's history view shows it, normalized from the
+/// git-correlated history or, without git, from the bead's own timestamps.
+struct GoHistoryEvent {
+    kind: String,
+    at: Option<DateTime<Utc>>,
+    author: String,
+}
+
+fn parse_history_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Go bv's `activeSprintIndex`: the sprint whose window contains `now`
+/// (latest start wins), else the most recent by end then start date, else
+/// the last; 0 when there are none.
+fn go_active_sprint_index(sprints: &[Sprint], now: DateTime<Utc>) -> usize {
+    let active = sprints
+        .iter()
+        .enumerate()
+        .filter(|(_, sprint)| sprint.is_active_at(now))
+        .max_by(|(ia, a), (ib, b)| a.start_date.cmp(&b.start_date).then(ib.cmp(ia)));
+    if let Some((idx, _)) = active {
+        return idx;
+    }
+    let mut best = sprints.len().saturating_sub(1);
+    for (idx, sprint) in sprints.iter().enumerate() {
+        let current = &sprints[best];
+        if sprint.end_date > current.end_date
+            || (sprint.end_date == current.end_date && sprint.start_date > current.start_date)
+        {
+            best = idx;
+        }
+    }
+    best
+}
+
+/// Per-label totals behind Go bv's flow dashboard.
+#[derive(Debug, Clone)]
+struct GoFlowLabelStat {
+    label: String,
+    /// Cross-label blocking edges out of this label (it blocks others).
+    outgoing: usize,
+    /// Cross-label blocking edges into this label (others block it).
+    incoming: usize,
+    outgoing_labels: Vec<String>,
+    incoming_labels: Vec<String>,
+    /// Outgoing count normalized by the busiest label.
+    score: f64,
+    is_bottleneck: bool,
+}
+
+/// Go bv's `computeStats`: row sums are what a label blocks, column sums
+/// what blocks it; labels sort by blocking power, then name.
+fn go_flow_label_stats(
+    flow: &crate::analysis::label_intel::CrossLabelFlow,
+) -> Vec<GoFlowLabelStat> {
+    let n = flow.labels.len();
+    if flow.flow_matrix.len() < n || flow.flow_matrix.iter().any(|row| row.len() < n) {
+        return Vec::new();
+    }
+    let cell = |i: usize, j: usize| usize::try_from(flow.flow_matrix[i][j]).unwrap_or(0);
+    let mut stats: Vec<GoFlowLabelStat> = (0..n)
+        .map(|i| {
+            let others = (0..n).filter(|&j| j != i);
+            GoFlowLabelStat {
+                label: flow.labels[i].clone(),
+                outgoing: others.clone().map(|j| cell(i, j)).sum(),
+                incoming: others.clone().map(|j| cell(j, i)).sum(),
+                outgoing_labels: others
+                    .clone()
+                    .filter(|&j| cell(i, j) > 0)
+                    .map(|j| flow.labels[j].clone())
+                    .collect(),
+                incoming_labels: others
+                    .filter(|&j| cell(j, i) > 0)
+                    .map(|j| flow.labels[j].clone())
+                    .collect(),
+                score: 0.0,
+                is_bottleneck: flow.bottleneck_labels.contains(&flow.labels[i]),
+            }
+        })
+        .collect();
+    let max_out = stats.iter().map(|stat| stat.outgoing).max().unwrap_or(0);
+    if max_out > 0 {
+        for stat in &mut stats {
+            stat.score = stat.outgoing as f64 / max_out as f64;
+        }
+    }
+    stats.sort_by(|a, b| {
+        b.outgoing
+            .cmp(&a.outgoing)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    stats
+}
+
+/// Go bv's flow `miniBar`: up to `width` ■ colored by count (red at 5+,
+/// orange at 2+, yellow below), padded with ·.
+fn go_flow_mini_bar(count: usize, width: usize) -> (RichSpan<'static>, String) {
+    if count == 0 {
+        return (RichSpan::raw(""), "·".repeat(width));
+    }
+    let filled = count.min(width);
+    let color = if count >= 5 {
+        tokens::status_fg("blocked")
+    } else if count >= 2 {
+        tokens::FG_WARNING
+    } else {
+        tokens::PRIO_P2
+    };
+    (
+        RichSpan::styled("■".repeat(filled), Style::new().fg(color)),
+        "·".repeat(width - filled),
+    )
+}
+
+/// Go bv's shortcuts sidebar: fixed width, gap to the body, and the
+/// narrowest body it leaves room for.
+const SHORTCUTS_SIDEBAR_WIDTH: u16 = 34;
+const SHORTCUTS_SIDEBAR_GAP: u16 = 2;
+const SHORTCUTS_MIN_BODY_WIDTH: u16 = 20;
+
+/// Go bv's attention view shows the top ten labels; 1-9 jump to a rank.
+const ATTENTION_ROW_LIMIT: usize = 10;
+
+/// Go bv's tree ordering (`sortNodes`): priority (P0 first), then type
+/// (epic, feature, task, bug, chore, other), then oldest created; the ID
+/// breaks remaining ties so the order is total.
+fn go_tree_order(a: &Issue, b: &Issue) -> std::cmp::Ordering {
+    let type_rank = |issue: &Issue| match issue.issue_type.trim().to_ascii_lowercase().as_str() {
+        "epic" => 0,
+        "feature" => 1,
+        "task" => 2,
+        "bug" => 3,
+        "chore" => 4,
+        _ => 5,
+    };
+    a.priority
+        .cmp(&b.priority)
+        .then_with(|| type_rank(a).cmp(&type_rank(b)))
+        .then_with(|| match (a.created_at, b.created_at) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// Go bv's colored status dot (`GetStatusIcon`).
+fn go_status_dot(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "open" => "🟢",
+        "in_progress" => "🔵",
+        "blocked" => "🔴",
+        "closed" => "⚫",
+        _ => "⚪",
+    }
+}
+
+/// Go bv's history status glyph: ✓ closed, ● in progress, ○ otherwise.
+fn go_history_status_icon(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "closed" => "✓",
+        "in_progress" => "●",
+        _ => "○",
+    }
+}
+
+/// Go bv's history `relativeTime`: just now, 5m ago, 3h ago, 2d ago,
+/// 1w ago, 4mo ago, 2y ago.
+fn go_history_relative_time(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(at) = at else {
+        return "unknown".to_string();
+    };
+    let diff = now - at;
+    if diff < chrono::Duration::zero() {
+        return "in future".to_string();
+    }
+    let hours = diff.num_hours();
+    let days = diff.num_days();
+    if diff.num_minutes() < 1 {
+        "just now".to_string()
+    } else if hours < 1 {
+        format!("{}m ago", diff.num_minutes())
+    } else if days < 1 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else if days < 30 {
+        format!("{}w ago", days / 7)
+    } else if days < 365 {
+        format!("{}mo ago", days / 30)
+    } else {
+        format!("{}y ago", days / 365)
+    }
+}
+
+/// Go bv's `authorInitials`: first letters of the first and last name, or
+/// the first two letters of a single name.
+fn go_author_initials(name: &str) -> String {
+    let parts: Vec<&str> = name.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => "??".to_string(),
+        [single] => single
+            .chars()
+            .take(2)
+            .flat_map(char::to_uppercase)
+            .collect(),
+        [first, .., last] => first
+            .chars()
+            .take(1)
+            .chain(last.chars().take(1))
+            .flat_map(char::to_uppercase)
+            .collect(),
+    }
+}
+
+/// Go bv's `cycleTime` badge: minutes, hours, days, or weeks.
+fn go_format_cycle_time(days: f64) -> String {
+    if days < 1.0 {
+        let hours = days * 24.0;
+        if hours < 1.0 {
+            format!("{:.0}m", hours * 60.0)
+        } else {
+            format!("{hours:.1}h")
+        }
+    } else if days < 7.0 {
+        format!("{days:.1}d")
+    } else {
+        format!("{:.1}w", days / 7.0)
+    }
+}
+
+/// A commit subject parsed as a conventional commit (`type(scope)!: subject`).
+struct GoConventionalCommit {
+    kind: Option<&'static str>,
+    scope: String,
+    breaking: bool,
+    subject: String,
+}
+
+fn go_parse_conventional_commit(message: &str) -> GoConventionalCommit {
+    const TYPES: [&str; 12] = [
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert", "wip",
+    ];
+    let first_line = message.lines().next().unwrap_or_default().trim();
+    let lower = first_line.to_ascii_lowercase();
+    for kind in TYPES {
+        if !lower.starts_with(kind) {
+            continue;
+        }
+        let mut rest = &first_line[kind.len()..];
+        let mut scope = String::new();
+        if let Some(inner) = rest.strip_prefix('(') {
+            if let Some(end) = inner.find(')') {
+                if end > 0 {
+                    scope = inner[..end].to_string();
+                    rest = &inner[end + 1..];
+                }
+            }
+        }
+        let breaking = rest.starts_with('!');
+        if breaking {
+            rest = &rest[1..];
+        }
+        if let Some(subject) = rest.strip_prefix(':') {
+            return GoConventionalCommit {
+                kind: Some(kind),
+                scope,
+                breaking,
+                subject: subject.trim().to_string(),
+            };
+        }
+    }
+    GoConventionalCommit {
+        kind: None,
+        scope: String::new(),
+        breaking: false,
+        subject: first_line.to_string(),
+    }
+}
+
+/// Go bv's `commitTypeIndicator` glyph for a commit message.
+fn go_commit_type_indicator(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.starts_with("merge ") {
+        return "⊕";
+    }
+    if lower.starts_with("revert ") {
+        return "↩";
+    }
+    match go_parse_conventional_commit(message).kind {
+        Some("feat") => "✨",
+        Some("fix") => "🐛",
+        Some("docs") => "📝",
+        Some("refactor") => "♻",
+        Some("perf") => "⚡",
+        Some("test") => "🧪",
+        Some("chore") => "🔧",
+        Some("ci") => "🔄",
+        Some("build") => "📦",
+        Some("style") => "💄",
+        _ => "",
+    }
+}
+
+/// Go bv's correlation-method label.
+fn go_correlation_method_label(method: &str) -> &'static str {
+    match method {
+        "co_committed" => "(co-committed)",
+        "explicit_id" => "(explicit ID)",
+        "temporal_author" => "(temporal)",
+        _ => "",
+    }
+}
+
+/// Go bv's file-action glyph and color for a commit's changed file.
+fn go_file_action(action: &str) -> (&'static str, Style) {
+    match action {
+        "A" => ("+", tokens::success_text()),
+        "D" => ("-", tokens::muted_text()),
+        "M" => ("~", tokens::info_text()),
+        "R" => ("→", tokens::row_id()),
+        _ => ("?", tokens::muted_text()),
+    }
+}
+
+/// Go bv's lifecycle-event glyph and color.
+fn go_history_event_icon(kind: &str) -> (&'static str, Style) {
+    match kind {
+        "created" => ("🆕", tokens::primary_bold()),
+        "claimed" => ("👤", tokens::info_text()),
+        "closed" => ("✓", tokens::success_text()),
+        "reopened" => ("↺", tokens::row_id()),
+        "modified" | "updated" => ("✎", tokens::muted_text()),
+        _ => ("•", tokens::muted_text()),
+    }
+}
+
+/// Confidence coloring shared by the history detail: green at 80%+,
+/// secondary at 50%+, muted below.
+fn go_confidence_style(confidence: f64) -> Style {
+    if confidence >= 0.8 {
+        tokens::success_text()
+    } else if confidence >= 0.5 {
+        tokens::row_id()
+    } else {
+        tokens::muted_text()
+    }
+}
+
+/// Pad a line of spans with blanks to `width` and paint it with the
+/// selected-row background.
+fn go_highlight_row(spans: Vec<RichSpan<'static>>, width: usize) -> RichLine {
+    let used: usize = spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum();
+    RichLine::from_spans(
+        spans
+            .into_iter()
+            .chain(std::iter::once(RichSpan::raw(
+                " ".repeat(width.saturating_sub(used)),
+            )))
+            .map(|span| {
+                let style = span
+                    .style
+                    .unwrap_or_default()
+                    .bg(tokens::row_highlight_bg());
+                span.with_style(style)
+            }),
+    )
+}
+
 /// Issue scan line: dense single-line summary for list views.
 /// Format adapts by width to surface rank, state, ownership, freshness, and scope.
 #[cfg(test)]
@@ -1883,10 +2541,10 @@ impl ViewMode {
             Self::Graph => "g",
             Self::History => "H",
             Self::Actionable => "a",
-            Self::Attention => "!",
+            Self::Attention => "]",
             Self::Tree => "T",
             Self::LabelDashboard => "[",
-            Self::FlowMatrix => "]",
+            Self::FlowMatrix => "f",
             Self::TimeTravelDiff => "t",
             Self::Sprint => "S",
         }
@@ -2317,6 +2975,81 @@ struct HistoryGitCache {
     commit_bead_confidence: BTreeMap<String, Vec<(String, f64)>>,
 }
 
+impl HistoryGitCache {
+    fn load(
+        repo_root: &std::path::Path,
+        issues: &[Issue],
+        scan: &mut GitHistoryScan,
+    ) -> Result<Self> {
+        let resolved_root = scan.repository_root(repo_root)?;
+        let repo_root = resolved_root.as_deref().unwrap_or(repo_root);
+        let commits = scan.load_commits(repo_root, 500, None)?;
+        let mut histories = issues
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.clone(),
+                    HistoryBeadCompat {
+                        bead_id: issue.id.clone(),
+                        title: issue.title.clone(),
+                        status: issue.status.clone(),
+                        events: Vec::new(),
+                        milestones: HistoryMilestonesCompat::default(),
+                        commits: None,
+                        cycle_time: None,
+                        last_author: String::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut commit_index = BTreeMap::new();
+        let mut method_distribution = BTreeMap::new();
+        scan.correlate_histories(
+            repo_root,
+            &commits,
+            &mut histories,
+            &mut commit_index,
+            &mut method_distribution,
+            &build_workspace_id_aliases(issues),
+        )?;
+        finalize_history_entries(&mut histories);
+
+        let mut commit_bead_confidence = BTreeMap::<String, Vec<(String, f64)>>::new();
+        for history in histories.values() {
+            for commit in history.commits.as_deref().unwrap_or_default() {
+                commit_bead_confidence
+                    .entry(commit.sha.clone())
+                    .or_default()
+                    .push((history.bead_id.clone(), commit.confidence));
+            }
+        }
+        for pairs in commit_bead_confidence.values_mut() {
+            pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+        Ok(Self {
+            commits,
+            histories,
+            commit_bead_confidence,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct HistoryLoadState {
+    generation: u64,
+    requested: bool,
+    cancellation: Option<GitHistoryCancellation>,
+    error: Option<String>,
+}
+
+impl Drop for HistoryLoadState {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Modal overlays
 // ---------------------------------------------------------------------------
@@ -2324,8 +3057,8 @@ struct HistoryGitCache {
 /// Modal overlays that take over the full screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModalOverlay {
-    /// Welcome / first-run tutorial.
-    Tutorial,
+    /// Go bv's interactive tutorial (`` ` `` / Ctrl+T).
+    Tutorial(TutorialState),
     /// Reusable Y/N confirmation dialog.
     Confirm {
         title: String,
@@ -2351,6 +3084,51 @@ enum ModalOverlay {
         cursor: usize,
         filter: String,
     },
+    /// Go bv's alerts panel (`!`): active (non-dismissed) alerts with
+    /// jump-to-issue and dismiss.
+    Alerts { rows: Vec<AlertRow>, cursor: usize },
+}
+
+/// Navigation state of the interactive tutorial modal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TutorialState {
+    /// Index into [`crate::tutorial::pages`].
+    page: usize,
+    /// Content scroll within the page.
+    scroll: usize,
+    toc_visible: bool,
+    toc_focus: bool,
+    toc_cursor: usize,
+    /// Pages seen in this session (drives the progress percentage).
+    viewed: BTreeSet<usize>,
+}
+
+impl TutorialState {
+    fn new() -> Self {
+        Self {
+            viewed: BTreeSet::from([0]),
+            ..Self::default()
+        }
+    }
+
+    fn jump(&mut self, page: usize) {
+        let last = crate::tutorial::pages().len().saturating_sub(1);
+        self.page = page.min(last);
+        self.scroll = 0;
+        self.viewed.insert(self.page);
+    }
+}
+
+/// One alert as the alerts panel lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlertRow {
+    /// Dismissal key: `type:severity:issue`, as Go bv's `alertKey`.
+    key: String,
+    severity: crate::analysis::alerts::AlertSeverity,
+    message: String,
+    issue_id: Option<String>,
+    unblocks: Option<usize>,
+    priority_sum: Option<i32>,
 }
 
 /// State for the multi-step pages export wizard.
@@ -2420,6 +3198,11 @@ struct TreeFlatNode {
 enum Msg {
     KeyPress(KeyCode, Modifiers),
     Mouse(MouseEvent),
+    Paste(String),
+    HistoryLoaded {
+        generation: u64,
+        result: std::result::Result<HistoryGitCache, String>,
+    },
     #[cfg(not(test))]
     Tick,
     #[cfg(not(test))]
@@ -2437,11 +3220,27 @@ impl From<Event> for Msg {
                 ..
             }) => Self::KeyPress(code, modifiers),
             Event::Mouse(event) => Self::Mouse(event),
+            Event::Paste(paste) => Self::Paste(paste.text),
             #[cfg(not(test))]
             Event::Tick => Self::Tick,
             _ => Self::Noop,
         }
     }
+}
+
+/// Text from a terminal paste, prepared for a one-line input field: a trailing
+/// line break is dropped, other line breaks and tabs become spaces, and the
+/// remaining control characters are removed.
+fn single_line_paste(text: &str) -> String {
+    text.trim_end_matches(['\r', '\n'])
+        .replace("\r\n", "\n")
+        .chars()
+        .filter_map(|ch| match ch {
+            '\n' | '\r' | '\t' => Some(' '),
+            ch if ch.is_control() => None,
+            ch => Some(ch),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2470,6 +3269,7 @@ struct BvrApp {
     history_related_bead_cursor: usize,
     history_bead_commit_cursor: usize,
     history_git_cache: Option<HistoryGitCache>,
+    history_load: HistoryLoadState,
     history_search_active: bool,
     history_search_query: String,
     history_search_match_cursor: usize,
@@ -2523,6 +3323,15 @@ struct BvrApp {
     flow_matrix: Option<crate::analysis::label_intel::CrossLabelFlow>,
     flow_matrix_row_cursor: usize,
     flow_matrix_col_cursor: usize,
+    /// Go bv's flow drilldown: the endpoint cursor over the selected
+    /// label's blocker/blocked pairs, `None` while the dashboard shows.
+    flow_drilldown: Option<usize>,
+    /// Alerts dismissed in the alerts panel (`d`), by `AlertRow::key`;
+    /// cleared when the data reloads.
+    dismissed_alerts: HashSet<String>,
+    /// Go bv's shortcuts sidebar (`;`/F2) and its scroll offset.
+    show_shortcuts_sidebar: bool,
+    shortcuts_sidebar_scroll: usize,
     sprint_data: Vec<Sprint>,
     sprint_cursor: usize,
     sprint_issue_cursor: usize,
@@ -2563,18 +3372,18 @@ impl Model for BvrApp {
     type Message = Msg;
 
     fn init(&mut self) -> Cmd<Self::Message> {
+        if self.mode == ViewMode::History {
+            self.ensure_git_history_loaded();
+        }
         #[cfg(not(test))]
-        {
-            self.background_tick_command()
-        }
+        let cmd = self.background_tick_command();
         #[cfg(test)]
-        {
-            Cmd::None
-        }
+        let cmd = Cmd::None;
+        self.finish_command(cmd)
     }
 
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
-        match msg {
+        let cmd = match msg {
             Msg::KeyPress(code, modifiers) => {
                 let mode_before = self.mode;
                 let cmd = self.handle_key(code, modifiers);
@@ -2589,50 +3398,57 @@ impl Model for BvrApp {
                     selected: self.selected,
                     filter: self.list_filter,
                 });
-                #[cfg(not(test))]
-                {
-                    return self.wrap_quit_with_background_cancel(cmd);
-                }
-                #[cfg(test)]
-                {
-                    return cmd;
-                }
+                cmd
             }
-            Msg::Mouse(event) => return self.handle_mouse(event),
+            Msg::Mouse(event) => self.handle_mouse(event),
+            Msg::Paste(text) => self.handle_paste(&text),
+            Msg::HistoryLoaded { generation, result } => {
+                self.handle_history_load_result(generation, result);
+                Cmd::None
+            }
             #[cfg(not(test))]
-            Msg::Tick => return self.handle_background_tick(),
+            Msg::Tick => self.handle_background_tick(),
             #[cfg(not(test))]
             Msg::BackgroundReloaded(result) => {
                 self.handle_background_reload_result(result);
-                return Cmd::None;
+                Cmd::None
             }
-            Msg::Noop => {}
-        }
-
-        Cmd::None
+            Msg::Noop => Cmd::None,
+        };
+        self.finish_command(cmd)
     }
 
     fn view(&self, frame: &mut Frame) {
         let full = Rect::from_size(frame.buffer.width(), frame.buffer.height());
         record_view_size(full.width, full.height);
+        LAST_TERMINAL_WIDTH.with(|cell| cell.set(full.width));
         record_detail_content_area(Rect::default());
-        let bp = Breakpoint::from_width(full.width);
 
         let rows = Flex::vertical()
             .constraints([
-                Constraint::Fixed(1),
+                Constraint::Fixed(header_height(self)),
                 Constraint::Min(3),
                 Constraint::Fixed(1),
             ])
             .split(full);
 
         // -- Header ----------------------------------------------------------
-        let header_text = build_header_text(self, full.width);
-        Paragraph::new(header_text)
-            .style(tokens::header_bg())
-            .render(rows[0], frame);
+        if rows[0].height > 0 {
+            let header_text = build_header_text(self, full.width);
+            Paragraph::new(header_text)
+                .style(tokens::header_bg())
+                .render(rows[0], frame);
+        }
 
         // -- Help overlay ----------------------------------------------------
+        if self.show_help && self.render_go_help(frame, rows[1]) {
+            Paragraph::new(RichText::from_lines([RichLine::from_spans([
+                RichSpan::styled(" ? / Esc ", tokens::status_filter_badge()),
+                RichSpan::styled("  close help", tokens::footer_hint()),
+            ])]))
+            .render(rows[2], frame);
+            return;
+        }
         if self.show_help {
             let inner_width = rows[1].width.saturating_sub(2) as usize;
             let full_help = self.help_overlay_text(inner_width);
@@ -2683,20 +3499,10 @@ impl Model for BvrApp {
         // -- Modal overlays --------------------------------------------------
         if let Some(ref overlay) = self.modal_overlay {
             match overlay {
-                ModalOverlay::Tutorial => {
-                    let text = concat!(
-                        "Welcome to bvr!\n\n",
-                        "Modes:  b=board  i=insights  g=graph  h=history\n",
-                        "Filter: o=open   c=closed    r=ready  a=all\n",
-                        "Nav:    j/k=up/down  Tab=focus  /=search  n/N=cycle\n",
-                        "Other:  ?=help   s=sort  Enter=select  Esc=back  q=quit\n\n",
-                        "Press any key to dismiss."
-                    );
-                    Paragraph::new(text)
-                        .block(semantic_panel_block("Tutorial", true, SemanticTone::Accent))
-                        .render(rows[1], frame);
-                    Paragraph::new("Press any key to continue.")
-                        .style(tokens::footer())
+                ModalOverlay::Tutorial(state) => {
+                    let area = Rect::new(full.x, full.y, full.width, full.height.saturating_sub(1));
+                    render_tutorial(frame, area, state);
+                    Paragraph::new(RichText::from_lines([tutorial_footer(state)]))
                         .render(rows[2], frame);
                     return;
                 }
@@ -2802,6 +3608,17 @@ impl Model for BvrApp {
                         .render(rows[2], frame);
                     return;
                 }
+                ModalOverlay::Alerts {
+                    rows: alert_rows,
+                    cursor,
+                } => {
+                    self.render_go_alerts_panel(frame, rows[1], alert_rows, *cursor);
+                    Paragraph::new(RichText::from_lines([
+                        self.main_go_status_bar(rows[2].width)
+                    ]))
+                    .render(rows[2], frame);
+                    return;
+                }
                 ModalOverlay::RepoPicker {
                     items,
                     cursor,
@@ -2846,7 +3663,36 @@ impl Model for BvrApp {
         }
 
         // -- Body: mode-aware panes with breakpoint-aware widths --------------
-        let body = rows[1];
+        // The shortcuts sidebar reserves its column on the right; the views
+        // lay out into the remaining width (overlays above use it all).
+        let body = if self.shortcuts_sidebar_visible() {
+            let reserved = SHORTCUTS_SIDEBAR_WIDTH + SHORTCUTS_SIDEBAR_GAP;
+            let sidebar = Rect::new(
+                rows[1].x + rows[1].width - SHORTCUTS_SIDEBAR_WIDTH,
+                rows[1].y,
+                SHORTCUTS_SIDEBAR_WIDTH,
+                rows[1].height,
+            );
+            self.render_shortcuts_sidebar(frame, sidebar);
+            record_view_size(full.width - reserved, full.height);
+            Rect::new(
+                rows[1].x,
+                rows[1].y,
+                rows[1].width - reserved,
+                rows[1].height,
+            )
+        } else {
+            rows[1]
+        };
+        let bp = Breakpoint::from_width(body.width);
+        if matches!(self.mode, ViewMode::History) {
+            self.render_go_history(frame, body);
+            Paragraph::new(RichText::from_lines([
+                self.main_go_status_bar(rows[2].width)
+            ]))
+            .render(rows[2], frame);
+            return;
+        }
         let graph_single_pane =
             matches!(self.mode, ViewMode::Graph) && matches!(bp, Breakpoint::Narrow);
         let history_layout = if matches!(self.mode, ViewMode::History) {
@@ -3013,6 +3859,101 @@ impl Model for BvrApp {
                 ])
                 .split(body);
 
+            if matches!(self.mode, ViewMode::Insights) && self.insights_heatmap.is_none() {
+                self.render_go_insights(frame, body);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(
+                self.mode,
+                ViewMode::LabelDashboard | ViewMode::Attention | ViewMode::FlowMatrix
+            ) {
+                match self.mode {
+                    ViewMode::LabelDashboard => self.render_go_label_dashboard(frame, body),
+                    ViewMode::Attention => self.render_go_attention(frame, body),
+                    _ => self.render_go_flow_matrix(frame, body),
+                }
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(self.mode, ViewMode::Sprint) {
+                self.render_go_sprint(frame, body);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(self.mode, ViewMode::Tree) {
+                self.render_go_tree(frame, body);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(self.mode, ViewMode::Actionable) {
+                self.render_go_actionable(frame, body);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(self.mode, ViewMode::Board) {
+                self.render_go_board(frame, body);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
+            if matches!(self.mode, ViewMode::Main) {
+                let list_focused = self.focus == FocusPane::List;
+                // Narrow terminals get one full-width pane, as in Go bv: the
+                // list, or the detail when it has focus.
+                let panes = if matches!(bp, Breakpoint::Narrow) {
+                    let hidden = Rect::new(body.x, body.y, 0, 0);
+                    if list_focused {
+                        [body, hidden]
+                    } else {
+                        [hidden, body]
+                    }
+                } else {
+                    [panes[0], panes[1]]
+                };
+                let list_inner = block_inner_rect(panes[0]);
+                semantic_panel_block("", list_focused, SemanticTone::Accent)
+                    .render(panes[0], frame);
+                Paragraph::new(self.main_go_list_text(list_inner.width, list_inner.height))
+                    .render(list_inner, frame);
+                record_main_list_area(list_inner);
+                let detail_inner = block_inner_rect(panes[1]);
+                semantic_panel_block("", !list_focused, SemanticTone::Accent)
+                    .render(panes[1], frame);
+                let detail_body = Rect::new(
+                    detail_inner.x.saturating_add(1),
+                    detail_inner.y,
+                    detail_inner.width.saturating_sub(2),
+                    detail_inner.height,
+                );
+                Paragraph::new(self.main_go_detail_text(detail_body.width))
+                    .wrap(ftui::text::WrapMode::WordChar)
+                    .scroll((saturating_scroll_offset(self.detail_scroll_offset), 0))
+                    .render(detail_body, frame);
+                record_detail_content_area(detail_inner);
+                Paragraph::new(RichText::from_lines([
+                    self.main_go_status_bar(rows[2].width)
+                ]))
+                .render(rows[2], frame);
+                return;
+            }
             let list_text = self.list_panel_render_text(panes[0].width);
             let list_title = match self.mode {
                 ViewMode::Board => "Board Lanes",
@@ -3293,7 +4234,7 @@ impl Model for BvrApp {
                             desc: "focus",
                         },
                         CommandHint {
-                            key: "!/Esc",
+                            key: "]/Esc",
                             desc: "back",
                         },
                     ],
@@ -3368,7 +4309,7 @@ impl Model for BvrApp {
                             desc: "focus",
                         },
                         CommandHint {
-                            key: "]/Esc",
+                            key: "f/Esc",
                             desc: "back",
                         },
                     ],
@@ -3458,10 +4399,7 @@ impl Model for BvrApp {
                 let hints = self.main_footer_command_hints();
                 wrap_command_hints(&hints, rows[2].width.saturating_sub(1) as usize)
             }
-            ViewMode::Graph => {
-                let hints = self.graph_footer_command_hints();
-                wrap_command_hints(&hints, rows[2].width.saturating_sub(1) as usize)
-            }
+            ViewMode::Graph => RichText::from_lines([self.main_go_status_bar(rows[2].width)]),
             ViewMode::History => {
                 if self.history_file_tree_focus {
                     let mut hints = vec![
@@ -3719,27 +4657,26 @@ impl BvrApp {
             return None;
         }
 
+        if header_height(self) == 0 {
+            return None;
+        }
         let mode = self.header_mode_tab_at(event.x, event.y)?;
         self.activate_mode_tab(mode);
         Some(Cmd::None)
     }
 
     fn adjust_active_pane_split(&mut self, delta_pct: f32) -> bool {
+        if splitter_hit_boxes(self, cached_view_width(), cached_view_height()).is_empty() {
+            return false;
+        }
         let mut state = pane_split_state();
-        let changed = if matches!(self.mode, ViewMode::History) {
+        let changed = if self.history_has_middle_pane() {
             state.adjust_history(
                 self.history_layout(),
                 self.history_view_mode,
                 self.focus,
                 delta_pct,
             )
-        } else if matches!(self.mode, ViewMode::Graph)
-            && matches!(
-                Breakpoint::from_width(cached_view_width()),
-                Breakpoint::Narrow
-            )
-        {
-            false
         } else {
             state.adjust_two_pane(Breakpoint::from_width(cached_view_width()), delta_pct)
         };
@@ -3795,14 +4732,23 @@ impl BvrApp {
         true
     }
 
-    #[cfg(not(test))]
-    fn wrap_quit_with_background_cancel(&self, cmd: Cmd<Msg>) -> Cmd<Msg> {
-        if matches!(cmd, Cmd::Quit)
-            && let Some(runtime) = self.background_runtime.as_ref()
-        {
-            runtime.cancel_requested.store(true, Ordering::Relaxed);
+    fn finish_command(&mut self, cmd: Cmd<Msg>) -> Cmd<Msg> {
+        if matches!(cmd, Cmd::Quit) {
+            self.cancel_history_load();
+            #[cfg(not(test))]
+            if let Some(runtime) = self.background_runtime.as_ref() {
+                runtime.cancel_requested.store(true, Ordering::Relaxed);
+            }
+            return cmd;
         }
-        cmd
+        let history_cmd = self.history_load_command();
+        if matches!(history_cmd, Cmd::None) {
+            cmd
+        } else if matches!(cmd, Cmd::None) {
+            history_cmd
+        } else {
+            Cmd::batch(vec![cmd, history_cmd])
+        }
     }
 
     #[cfg(not(test))]
@@ -3887,13 +4833,13 @@ impl BvrApp {
 
             match result {
                 Ok(issues) => {
-                    let hash = compute_data_hash(&issues);
+                    let hash = compute_snapshot_hash(&issues);
                     if should_apply_background_reload(
                         cancel_requested,
                         &hash,
-                        &runtime.last_data_hash,
+                        &runtime.last_snapshot_hash,
                     ) {
-                        runtime.last_data_hash = hash;
+                        runtime.last_snapshot_hash = hash;
                         status_update = push_background_timeline(
                             runtime,
                             "reload applied: issue snapshot changed",
@@ -3949,7 +4895,7 @@ impl BvrApp {
                 self.slow_metrics_rx = None;
             }
         }
-        self.history_git_cache = None;
+        self.invalidate_git_history();
         self.detail_dep_cursor = 0;
         self.board_detail_scroll_offset = 0;
         self.detail_scroll_offset = 0;
@@ -4029,6 +4975,7 @@ impl BvrApp {
             max_recommendations: self.analyzer.issues.len().max(50),
             ..TriageOptions::default()
         });
+        let ready_ids = self.ready_ids_for_filter();
 
         for recommendation in recommendations.result.recommendations {
             let Some(issue) = self
@@ -4040,7 +4987,7 @@ impl BvrApp {
                 continue;
             };
 
-            if !issue.is_open_like() || !self.issue_matches_filter(issue) {
+            if !issue.is_open_like() || !self.issue_matches_filter(issue, &ready_ids) {
                 continue;
             }
 
@@ -4239,6 +5186,20 @@ impl BvrApp {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> Cmd<Msg> {
+        // Mouse input belongs to the visible overlay, just like keyboard
+        // input. A wheel must not dismiss quit confirmation as an arbitrary
+        // key would; other overlays keep their existing Up/Down navigation.
+        if self.show_quit_confirm {
+            return Cmd::None;
+        }
+        if self.show_help || self.modal_overlay.is_some() {
+            return match event.kind {
+                MouseEventKind::ScrollUp => self.handle_key(KeyCode::Up, Modifiers::NONE),
+                MouseEventKind::ScrollDown => self.handle_key(KeyCode::Down, Modifiers::NONE),
+                _ => Cmd::None,
+            };
+        }
+
         if let Some(cmd) = self.handle_header_mouse_click(event) {
             return cmd;
         }
@@ -4255,6 +5216,11 @@ impl BvrApp {
             MouseEventKind::ScrollUp => self.handle_key(KeyCode::Up, Modifiers::NONE),
             MouseEventKind::ScrollDown => self.handle_key(KeyCode::Down, Modifiers::NONE),
             MouseEventKind::Down(MouseButton::Left)
+                if self.mouse_select_main_row(event.x, event.y) =>
+            {
+                Cmd::None
+            }
+            MouseEventKind::Down(MouseButton::Left)
                 if self.mouse_open_detail_link(event.x, event.y) =>
             {
                 Cmd::None
@@ -4266,6 +5232,65 @@ impl BvrApp {
             }
             _ => Cmd::None,
         }
+    }
+
+    /// Inserts pasted text into the input field that has focus: an active
+    /// search, the label or repo picker filter, a Pages wizard text step, or
+    /// the time-travel ref. The terminal delivers a paste as one event, not
+    /// as key presses, so pasted text is never taken as shortcuts (`n` in a
+    /// search, `q` in a list); outside an input field it is ignored.
+    fn handle_paste(&mut self, text: &str) -> Cmd<Msg> {
+        let text = single_line_paste(text);
+        if text.is_empty() || self.show_quit_confirm || self.show_help {
+            return Cmd::None;
+        }
+
+        if let Some(overlay) = &mut self.modal_overlay {
+            match overlay {
+                ModalOverlay::LabelPicker { filter, cursor, .. }
+                | ModalOverlay::RepoPicker { filter, cursor, .. } => {
+                    filter.push_str(&text);
+                    *cursor = 0;
+                }
+                ModalOverlay::PagesWizard(wiz) if wiz.step == 0 => wiz.export_dir.push_str(&text),
+                ModalOverlay::PagesWizard(wiz) if wiz.step == 1 => wiz.title.push_str(&text),
+                _ => {}
+            }
+            return Cmd::None;
+        }
+
+        let list_focus = self.focus == FocusPane::List;
+        if matches!(self.mode, ViewMode::Main) && list_focus && self.main_search_active {
+            self.main_search_query.push_str(&text);
+            self.main_search_match_cursor = 0;
+            self.select_current_main_search_match();
+        } else if self.board_shortcut_focus() && self.board_search_active {
+            self.board_search_query.push_str(&text);
+            self.board_search_match_cursor = 0;
+            self.select_current_board_search_match();
+        } else if matches!(self.mode, ViewMode::History) && list_focus && self.history_search_active
+        {
+            self.history_search_query.push_str(&text);
+            self.refresh_history_search_selection();
+        } else if matches!(self.mode, ViewMode::Graph) && list_focus && self.graph_search_active {
+            self.graph_search_query.push_str(&text);
+            self.graph_search_match_cursor = 0;
+            self.select_current_graph_search_match();
+        } else if matches!(self.mode, ViewMode::Insights)
+            && list_focus
+            && self.insights_search_active
+        {
+            self.insights_search_query.push_str(&text);
+            self.insights_search_match_cursor = 0;
+            self.select_current_insights_search_match();
+        } else if matches!(self.mode, ViewMode::Tree) && list_focus && self.tree_search_active {
+            self.tree_search_query.push_str(&text);
+            self.tree_search_match_cursor = 0;
+            self.select_current_tree_search_match();
+        } else if matches!(self.mode, ViewMode::TimeTravelDiff) && self.time_travel_input_active {
+            self.time_travel_ref_input.push_str(&text);
+        }
+        Cmd::None
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: Modifiers) -> Cmd<Msg> {
@@ -4318,9 +5343,8 @@ impl BvrApp {
         // -- Modal overlay handling ------------------------------------------
         if let Some(ref overlay) = self.modal_overlay.clone() {
             match overlay {
-                ModalOverlay::Tutorial => {
-                    // Any key dismisses tutorial
-                    self.modal_overlay = None;
+                ModalOverlay::Tutorial(state) => {
+                    self.handle_tutorial_key(code, modifiers, state.clone());
                     return Cmd::None;
                 }
                 ModalOverlay::Confirm { resume_overlay, .. } => {
@@ -4339,6 +5363,10 @@ impl BvrApp {
                 }
                 ModalOverlay::PagesWizard(wiz) => {
                     return self.handle_pages_wizard_key(code, wiz.clone());
+                }
+                ModalOverlay::Alerts { rows, cursor } => {
+                    self.handle_alerts_panel_key(code, rows, *cursor);
+                    return Cmd::None;
                 }
                 ModalOverlay::RecipePicker { items, cursor } => {
                     let len = items.len();
@@ -4717,6 +5745,21 @@ impl BvrApp {
         }
 
         match code {
+            KeyCode::Char(';') | KeyCode::F(2) => self.toggle_shortcuts_sidebar(),
+            KeyCode::Char('j') | KeyCode::Down
+                if modifiers.contains(Modifiers::CTRL)
+                    && self.shortcuts_sidebar_visible()
+                    && (self.focus != FocusPane::Detail || code == KeyCode::Down) =>
+            {
+                self.shortcuts_sidebar_scroll = self.shortcuts_sidebar_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if modifiers.contains(Modifiers::CTRL)
+                    && self.shortcuts_sidebar_visible()
+                    && (self.focus != FocusPane::Detail || code == KeyCode::Up) =>
+            {
+                self.shortcuts_sidebar_scroll = self.shortcuts_sidebar_scroll.saturating_sub(1);
+            }
             KeyCode::Char('H') => {
                 self.toggle_history_mode();
             }
@@ -4734,6 +5777,56 @@ impl BvrApp {
                     && matches!(self.focus, FocusPane::Middle) =>
             {
                 self.jump_from_history_bead_commit_to_git();
+            }
+            KeyCode::Enter if self.flow_matrix_shortcut_focus() => {
+                if self.flow_drilldown.is_some() {
+                    if let Some(id) = self.go_flow_drilldown_issue().map(|issue| issue.id.clone()) {
+                        self.flow_drilldown = None;
+                        self.select_issue_by_id(&id);
+                        self.mode = ViewMode::Main;
+                        self.focus = FocusPane::Detail;
+                    }
+                } else {
+                    self.flow_drilldown = Some(0);
+                }
+            }
+            KeyCode::Escape
+                if self.flow_matrix_shortcut_focus() && self.flow_drilldown.is_some() =>
+            {
+                self.flow_drilldown = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down
+                if self.flow_matrix_shortcut_focus() && self.flow_drilldown.is_some() =>
+            {
+                let endpoints = self.go_flow_drilldown_pairs().len() * 2;
+                if let Some(cursor) = self.flow_drilldown.as_mut() {
+                    *cursor = (*cursor + 1).min(endpoints.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if self.flow_matrix_shortcut_focus() && self.flow_drilldown.is_some() =>
+            {
+                if let Some(cursor) = self.flow_drilldown.as_mut() {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter if self.label_dashboard_shortcut_focus() => {
+                if let Some(label) = self.selected_dashboard_label() {
+                    self.filter_list_by_label_from_view(&label);
+                }
+            }
+            KeyCode::Enter if self.attention_shortcut_focus() => {
+                if let Some(label) = self.attention_label_at(self.attention_cursor) {
+                    self.filter_list_by_label_from_view(&label);
+                }
+            }
+            KeyCode::Char(digit @ '1'..='9') if self.attention_shortcut_focus() => {
+                let rank = usize::from(digit as u8 - b'1');
+                if let Some(label) = self.attention_label_at(rank) {
+                    self.filter_list_by_label_from_view(&label);
+                    self.status_msg =
+                        format!("Filtered to label {label} (attention #{})", rank + 1);
+                }
             }
             KeyCode::Enter
                 if !(matches!(self.mode, ViewMode::History) && self.history_file_tree_focus)
@@ -5300,11 +6393,16 @@ impl BvrApp {
             {
                 self.move_selection_relative(10);
             }
+            // Go bv: h/l step between insight panels (Tab still moves focus).
             KeyCode::Char('h') if matches!(self.mode, ViewMode::Insights) => {
+                self.insights_panel = self.insights_panel.prev();
                 self.focus = FocusPane::List;
+                self.reselect_insights_panel_context();
             }
             KeyCode::Char('l') if matches!(self.mode, ViewMode::Insights) => {
-                self.focus = FocusPane::Detail;
+                self.insights_panel = self.insights_panel.next();
+                self.focus = FocusPane::List;
+                self.reselect_insights_panel_context();
             }
             KeyCode::Char('c')
                 if matches!(self.mode, ViewMode::History) && !self.history_file_tree_focus =>
@@ -5640,7 +6738,8 @@ impl BvrApp {
                 self.detail_scroll_offset = 0;
                 self.focus = FocusPane::List;
             }
-            KeyCode::Char('!') => {
+            KeyCode::Char('!') => self.open_alerts_panel(),
+            KeyCode::Char(']') => {
                 self.mode = if matches!(self.mode, ViewMode::Attention) {
                     ViewMode::Main
                 } else {
@@ -5649,13 +6748,14 @@ impl BvrApp {
                 };
                 self.focus = FocusPane::List;
             }
-            KeyCode::Char('T') => {
+            KeyCode::Char('T' | 'E') => {
                 self.toggle_tree_mode();
                 self.focus = FocusPane::List;
             }
             KeyCode::Char('t') if modifiers.contains(Modifiers::CTRL) => {
                 self.open_tutorial();
             }
+            KeyCode::Char('`') => self.open_tutorial(),
             KeyCode::Char('t') => {
                 self.toggle_time_travel_mode();
             }
@@ -5663,7 +6763,7 @@ impl BvrApp {
                 self.toggle_label_dashboard();
                 self.focus = FocusPane::List;
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char('f') if !matches!(self.mode, ViewMode::History) => {
                 self.toggle_flow_matrix();
                 self.focus = FocusPane::List;
             }
@@ -5727,6 +6827,7 @@ impl BvrApp {
         self.history_file_tree_filter = None;
         self.history_file_tree_focus = false;
         self.history_status_msg.clear();
+        self.history_load.error = None;
         self.focus = FocusPane::List;
         self.ensure_git_history_loaded();
     }
@@ -5831,7 +6932,72 @@ impl BvrApp {
     }
 
     fn open_tutorial(&mut self) {
-        self.modal_overlay = Some(ModalOverlay::Tutorial);
+        self.modal_overlay = Some(ModalOverlay::Tutorial(TutorialState::new()));
+    }
+
+    /// Keys in the tutorial, as Go bv's `TutorialModel`: Esc/q close, t
+    /// toggles the table of contents, Tab switches focus to it (or turns the
+    /// page without it); in the content ←/→/h/l/n/p/Space turn pages, j/k and
+    /// Ctrl+d/u scroll, g/G jump, 1-9 pick a page; in the contents j/k move
+    /// and Enter opens.
+    fn handle_tutorial_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: Modifiers,
+        mut state: TutorialState,
+    ) {
+        let pages = crate::tutorial::pages().len();
+        let ctrl = modifiers.contains(Modifiers::CTRL);
+        match code {
+            KeyCode::Escape | KeyCode::Char('q') => {
+                self.modal_overlay = None;
+                return;
+            }
+            KeyCode::Char('t') if !ctrl => {
+                state.toc_visible = !state.toc_visible;
+                state.toc_focus = state.toc_visible;
+                state.toc_cursor = state.page;
+            }
+            KeyCode::Tab if state.toc_visible => {
+                state.toc_focus = !state.toc_focus;
+                state.toc_cursor = state.page;
+            }
+            KeyCode::Tab => state.jump(state.page + 1),
+            _ if state.toc_focus && state.toc_visible => match code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    state.toc_cursor = (state.toc_cursor + 1).min(pages.saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    state.toc_cursor = state.toc_cursor.saturating_sub(1);
+                }
+                KeyCode::Char('g') | KeyCode::Home => state.toc_cursor = 0,
+                KeyCode::Char('G') | KeyCode::End => state.toc_cursor = pages.saturating_sub(1),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    state.jump(state.toc_cursor);
+                    state.toc_focus = false;
+                }
+                KeyCode::Char('h') | KeyCode::Left => state.toc_focus = false,
+                _ => {}
+            },
+            KeyCode::Char('d') if ctrl => state.scroll = state.scroll.saturating_add(8),
+            KeyCode::Char('u') if ctrl => state.scroll = state.scroll.saturating_sub(8),
+            KeyCode::Right | KeyCode::Char('l' | 'n' | ' ') => state.jump(state.page + 1),
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h' | 'p') => {
+                state.jump(state.page.saturating_sub(1));
+            }
+            KeyCode::Char('j') | KeyCode::Down => state.scroll = state.scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => state.scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => state.scroll = usize::MAX / 2,
+            KeyCode::Char(digit @ '1'..='9') => {
+                let target = usize::from(digit as u8 - b'1');
+                if target < pages {
+                    state.jump(target);
+                }
+            }
+            _ => {}
+        }
+        self.modal_overlay = Some(ModalOverlay::Tutorial(state));
     }
 
     fn open_confirm_with_resume(
@@ -6196,73 +7362,102 @@ impl BvrApp {
     }
 
     fn ensure_git_history_loaded(&mut self) {
-        if self.history_git_cache.is_some() {
-            return;
+        if self.history_git_cache.is_none()
+            && self.history_load.cancellation.is_none()
+            && self.history_load.error.is_none()
+        {
+            self.history_load.requested = true;
         }
+    }
 
-        let repo_root = self
+    fn history_load_command(&mut self) -> Cmd<Msg> {
+        if !self.history_load.requested || self.history_load.cancellation.is_some() {
+            return Cmd::None;
+        }
+        self.history_load.requested = false;
+        let repo_root = match self
             .repo_root
             .clone()
-            .or_else(|| std::env::current_dir().ok());
-        let Some(repo_root) = repo_root else {
-            return;
-        };
-
-        let commits = load_git_commits(&repo_root, 500, None).unwrap_or_default();
-        let mut histories = self
-            .analyzer
-            .issues
-            .iter()
-            .map(|issue| {
-                (
-                    issue.id.clone(),
-                    HistoryBeadCompat {
-                        bead_id: issue.id.clone(),
-                        title: issue.title.clone(),
-                        status: issue.status.clone(),
-                        events: Vec::new(),
-                        milestones: HistoryMilestonesCompat::default(),
-                        commits: None,
-                        cycle_time: None,
-                        last_author: String::new(),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let mut commit_index = BTreeMap::<String, Vec<String>>::new();
-        let mut method_distribution = BTreeMap::<String, usize>::new();
-        let workspace_aliases = build_workspace_id_aliases(&self.analyzer.issues);
-
-        correlate_histories_with_git_aliases(
-            &repo_root,
-            &commits,
-            &mut histories,
-            &mut commit_index,
-            &mut method_distribution,
-            &workspace_aliases,
-        );
-
-        finalize_history_entries(&mut histories);
-
-        let mut commit_bead_confidence = BTreeMap::<String, Vec<(String, f64)>>::new();
-        for history in histories.values() {
-            for commit in history.commits.as_deref().unwrap_or_default() {
-                commit_bead_confidence
-                    .entry(commit.sha.clone())
-                    .or_default()
-                    .push((history.bead_id.clone(), commit.confidence));
+            .map_or_else(std::env::current_dir, Ok)
+        {
+            Ok(root) => root,
+            Err(error) => {
+                self.history_load.error = Some(error.to_string());
+                return Cmd::None;
             }
-        }
-        for pairs in commit_bead_confidence.values_mut() {
-            pairs.sort_by(|left, right| left.0.cmp(&right.0));
-        }
+        };
+        let mut scan = GitHistoryScan::default();
+        self.history_load.generation = self.history_load.generation.wrapping_add(1);
+        self.history_load.cancellation = Some(scan.cancellation_token());
+        let generation = self.history_load.generation;
+        let issues = self.analyzer.issues.clone();
+        Cmd::task_named("git-history-load", move || Msg::HistoryLoaded {
+            generation,
+            result: HistoryGitCache::load(&repo_root, &issues, &mut scan)
+                .map_err(|error| error.to_string()),
+        })
+    }
 
-        self.history_git_cache = Some(HistoryGitCache {
-            commits,
-            histories,
-            commit_bead_confidence,
-        });
+    fn handle_history_load_result(
+        &mut self,
+        generation: u64,
+        result: std::result::Result<HistoryGitCache, String>,
+    ) {
+        // Reloading issues or quitting invalidates an outstanding worker.
+        // Its late result must never replace a newer issue snapshot.
+        if generation != self.history_load.generation || self.history_load.cancellation.is_none() {
+            return;
+        }
+        self.history_load.cancellation = None;
+        match result {
+            Ok(cache) => {
+                self.history_git_cache = Some(cache);
+                if self.mode == ViewMode::History {
+                    if self.history_view_mode == HistoryViewMode::Bead {
+                        let visible = self.history_visible_issue_indices();
+                        if !visible.contains(&self.selected)
+                            && let Some(&first) = visible.first()
+                        {
+                            self.set_selected_index(first);
+                        }
+                    } else {
+                        self.history_event_cursor = self.history_event_cursor.min(
+                            self.history_git_visible_commit_indices()
+                                .len()
+                                .saturating_sub(1),
+                        );
+                    }
+                }
+            }
+            Err(error) => self.history_load.error = Some(error),
+        }
+    }
+
+    fn cancel_history_load(&mut self) {
+        if let Some(cancellation) = self.history_load.cancellation.take() {
+            cancellation.cancel();
+        }
+        self.history_load.requested = false;
+        self.history_load.generation = self.history_load.generation.wrapping_add(1);
+    }
+
+    fn invalidate_git_history(&mut self) {
+        self.cancel_history_load();
+        self.history_git_cache = None;
+        self.history_load.error = None;
+        if self.mode == ViewMode::History {
+            self.ensure_git_history_loaded();
+        }
+    }
+
+    fn history_load_message(&self) -> String {
+        if let Some(error) = &self.history_load.error {
+            format!("Git history failed: {error}. Close and reopen history (H) to retry.")
+        } else if self.history_load.requested || self.history_load.cancellation.is_some() {
+            "Loading Git history… Navigation remains available.".to_string()
+        } else {
+            "Git history not loaded".to_string()
+        }
     }
 
     fn history_git_visible_commit_indices(&self) -> Vec<usize> {
@@ -6607,16 +7802,28 @@ impl BvrApp {
         commits.get(slot).map(|commit| (*commit).clone())
     }
 
-    fn issue_matches_filter(&self, issue: &Issue) -> bool {
+    /// Compute readiness once for the whole filter pass, including inherited
+    /// blockers and scheduler deferrals, using the graph's canonical rules.
+    fn ready_ids_for_filter(&self) -> HashSet<String> {
+        if matches!(self.list_filter, ListFilter::Ready) {
+            self.analyzer
+                .graph
+                .actionable_ids_at(tui_now())
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        }
+    }
+
+    fn issue_matches_filter(&self, issue: &Issue, ready_ids: &HashSet<String>) -> bool {
         let base = match self.list_filter {
             ListFilter::All => true,
             ListFilter::Open => issue.is_open_like(),
             ListFilter::InProgress => issue.status.eq_ignore_ascii_case("in_progress"),
             ListFilter::Blocked => issue.status.eq_ignore_ascii_case("blocked"),
             ListFilter::Closed => issue.is_closed_like(),
-            ListFilter::Ready => {
-                issue.is_open_like() && self.analyzer.graph.open_blockers(&issue.id).is_empty()
-            }
+            ListFilter::Ready => ready_ids.contains(&issue.id),
         };
         if !base {
             return false;
@@ -6639,12 +7846,16 @@ impl BvrApp {
     }
 
     fn visible_issue_indices(&self) -> Vec<usize> {
+        let ready_ids = self.ready_ids_for_filter();
         let mut visible = self
             .analyzer
             .issues
             .iter()
             .enumerate()
-            .filter_map(|(index, issue)| self.issue_matches_filter(issue).then_some(index))
+            .filter_map(|(index, issue)| {
+                self.issue_matches_filter(issue, &ready_ids)
+                    .then_some(index)
+            })
             .collect::<Vec<_>>();
 
         {
@@ -7051,13 +8262,18 @@ impl BvrApp {
                     }
                 }
 
-                vec![
+                let mut lanes = vec![
                     ("open".to_string(), open),
                     ("in_progress".to_string(), in_progress),
                     ("blocked".to_string(), blocked),
                     ("closed".to_string(), closed),
-                    ("other".to_string(), other),
-                ]
+                ];
+                // Custom/parked statuses get a lane only when they exist; the
+                // four Go bv status columns are always the board's spine.
+                if !other.is_empty() {
+                    lanes.push(("other".to_string(), other));
+                }
+                lanes
             }
             BoardGrouping::Priority => {
                 let mut p0 = Vec::<usize>::new();
@@ -7381,23 +8597,13 @@ impl BvrApp {
             .position(|issue| issue.id == issue_id)
     }
 
-    fn insights_visible_issue_indices_for_list_nav(&self) -> Vec<usize> {
-        if let Some(state) = self.insights_heatmap.as_ref() {
-            let data = self.insights_heatmap_data();
-            let row = state
-                .row
-                .min(INSIGHTS_HEATMAP_DEPTH_LABELS.len().saturating_sub(1));
-            let col = state
-                .col
-                .min(INSIGHTS_HEATMAP_SCORE_LABELS.len().saturating_sub(1));
-            return data.issue_ids[row][col]
-                .iter()
-                .filter_map(|issue_id| self.issue_index_for_id(issue_id))
-                .collect();
-        }
-
-        let insights = self.analyzer.insights();
-        let ids = match self.insights_panel {
+    /// Issue IDs ranked by one insights panel's metric.
+    fn insights_panel_ids(
+        &self,
+        panel: InsightsPanel,
+        insights: &crate::analysis::Insights,
+    ) -> Vec<String> {
+        match panel {
             InsightsPanel::Bottlenecks => insights
                 .bottlenecks
                 .iter()
@@ -7461,7 +8667,26 @@ impl BvrApp {
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
             InsightsPanel::Cycles => Vec::new(),
-        };
+        }
+    }
+
+    fn insights_visible_issue_indices_for_list_nav(&self) -> Vec<usize> {
+        if let Some(state) = self.insights_heatmap.as_ref() {
+            let data = self.insights_heatmap_data();
+            let row = state
+                .row
+                .min(INSIGHTS_HEATMAP_DEPTH_LABELS.len().saturating_sub(1));
+            let col = state
+                .col
+                .min(INSIGHTS_HEATMAP_SCORE_LABELS.len().saturating_sub(1));
+            return data.issue_ids[row][col]
+                .iter()
+                .filter_map(|issue_id| self.issue_index_for_id(issue_id))
+                .collect();
+        }
+
+        let insights = self.analyzer.insights();
+        let ids = self.insights_panel_ids(self.insights_panel, &insights);
 
         let indices = ids
             .iter()
@@ -7775,85 +9000,6 @@ impl BvrApp {
         hints
     }
 
-    fn graph_footer_command_hints(&self) -> Vec<CommandHint<'static>> {
-        let mut hints = match self.focus {
-            FocusPane::List => vec![
-                CommandHint {
-                    key: "h/l",
-                    desc: "nodes",
-                },
-                CommandHint {
-                    key: "j/k",
-                    desc: "nodes",
-                },
-                CommandHint {
-                    key: "^u/L",
-                    desc: "jump",
-                },
-                CommandHint {
-                    key: "Tab",
-                    desc: "detail",
-                },
-                CommandHint {
-                    key: "/",
-                    desc: "search",
-                },
-                CommandHint {
-                    key: "Enter",
-                    desc: "open details",
-                },
-            ],
-            FocusPane::Detail | FocusPane::Middle => {
-                let mut hints = vec![
-                    CommandHint {
-                        key: "h/Tab",
-                        desc: "list",
-                    },
-                    CommandHint {
-                        key: "Enter",
-                        desc: "open details",
-                    },
-                ];
-                if !self.detail_dep_list().is_empty() {
-                    hints.push(CommandHint {
-                        key: "j/k",
-                        desc: "deps",
-                    });
-                }
-                hints.push(CommandHint {
-                    key: "^j/k",
-                    desc: "scroll",
-                });
-                hints
-            }
-        };
-        if self.selected_issue_external_ref_url().is_some()
-            && matches!(self.focus, FocusPane::Detail)
-        {
-            hints.push(CommandHint {
-                key: "o",
-                desc: "open link",
-            });
-            hints.push(CommandHint {
-                key: "y",
-                desc: "copy link",
-            });
-        }
-        hints.push(CommandHint {
-            key: "g/Esc",
-            desc: "back",
-        });
-        hints.push(CommandHint {
-            key: "^←/→",
-            desc: "resize",
-        });
-        hints.push(CommandHint {
-            key: "^0",
-            desc: "reset split",
-        });
-        hints
-    }
-
     fn should_open_selected_issue_external_ref(&self) -> bool {
         matches!(
             self.mode,
@@ -7902,29 +9048,41 @@ impl BvrApp {
             return None;
         }
 
+        let go_detail = matches!(self.mode, ViewMode::Main | ViewMode::Board)
+            || (matches!(self.mode, ViewMode::Insights) && self.insights_heatmap.is_none());
+        if go_detail {
+            // The Go-style detail pane word-wraps, so the link's visual row is
+            // the sum of the wrapped heights of the lines above it.
+            let detail_text = self.main_go_detail_text(area.width);
+            let width = usize::from(area.width).max(1);
+            let mut row = 0usize;
+            let mut link_line = None;
+            for line in detail_text.lines() {
+                if ftui::text::Line::spans(line)
+                    .iter()
+                    .any(|span| span.link.is_some())
+                {
+                    link_line = Some(line);
+                    break;
+                }
+                row += line
+                    .wrap(width, ftui::text::WrapMode::WordChar)
+                    .len()
+                    .max(1);
+            }
+            let line = link_line?;
+            let visible = row.checked_sub(self.go_detail_scroll_offset())?;
+            let y = area.y.saturating_add(saturating_scroll_offset(visible));
+            let line_width = u16::try_from(display_width(&line.to_plain_text()))
+                .unwrap_or(u16::MAX)
+                .min(area.width);
+            if line_width == 0 || y >= area.y.saturating_add(area.height) {
+                return None;
+            }
+            return Some(Rect::new(area.x, y, line_width, 1));
+        }
+
         let (detail_text, line_index, scroll_offset) = match self.mode {
-            ViewMode::Main => {
-                let detail_text = self.issue_detail_render_text();
-                let line_index = detail_text.lines().iter().position(|line| {
-                    ftui::text::Line::spans(line)
-                        .iter()
-                        .any(|span| span.link.is_some())
-                })?;
-                (
-                    detail_text,
-                    line_index,
-                    usize::from(saturating_scroll_offset(self.detail_scroll_offset)),
-                )
-            }
-            ViewMode::Board => {
-                let detail_text = self.board_detail_render_text();
-                let line_index = detail_text.lines().iter().position(|line| {
-                    ftui::text::Line::spans(line)
-                        .iter()
-                        .any(|span| span.link.is_some())
-                })?;
-                (detail_text, line_index, self.board_detail_scroll_offset)
-            }
             ViewMode::Insights => {
                 let detail_text = self.insights_detail_render_text();
                 let line_index = detail_text.lines().iter().position(|line| {
@@ -8156,130 +9314,10 @@ impl BvrApp {
     }
 
     fn help_overlay_text(&self, width: usize) -> String {
-        // Define keybinding sections.
-        struct Section {
-            title: &'static str,
-            bindings: Vec<(&'static str, &'static str)>,
-        }
-
-        let sections = vec![
-            Section {
-                title: "Navigation",
-                bindings: vec![
-                    ("j/k", "Move selection up/down"),
-                    ("arrows", "Move selection up/down"),
-                    ("h/l", "Lateral nav (lanes, peers)"),
-                    ("Ctrl+d/u", "Jump down/up by 10"),
-                    ("Ctrl+j/k", "Scroll detail pane"),
-                    ("Ctrl+←/→", "Resize active pane split"),
-                    ("Ctrl+0", "Reset pane splits"),
-                    ("PgUp/PgDn", "Jump by 10"),
-                    ("Home/End", "Jump to top/bottom"),
-                    ("gg", "Jump to top (any view)"),
-                    ("G", "Jump to bottom"),
-                    ("Ctrl+f/b", "Full page down/up"),
-                    ("Tab / Shift+Tab", "Toggle focus forward/back"),
-                    ("J/K", "Navigate deps in detail"),
-                    ("Enter", "Return to main / drill"),
-                    ("scroll", "Mouse wheel scrolls list"),
-                    ("splitter click/scroll", "Mouse-resize active divider"),
-                ],
-            },
-            Section {
-                title: "Views",
-                bindings: vec![
-                    ("a", "Toggle actionable mode"),
-                    ("b", "Toggle board mode"),
-                    ("i", "Toggle insights mode"),
-                    ("g", "Toggle graph mode"),
-                    ("H", "Toggle history mode"),
-                    ("!", "Toggle attention mode"),
-                    ("T", "Toggle tree view"),
-                    ("[", "Toggle label dashboard"),
-                    ("]", "Toggle flow matrix"),
-                    ("v", "History: bead/git toggle"),
-                ],
-            },
-            Section {
-                title: "Filters",
-                bindings: vec![
-                    ("o", "Filter: open only"),
-                    ("c", "Filter: closed only"),
-                    ("r", "Filter: ready only"),
-                    ("s", "Cycle sort/grouping/panel"),
-                ],
-            },
-            Section {
-                title: "Search",
-                bindings: vec![
-                    ("/", "Start search"),
-                    ("n/N", "Next/prev search match"),
-                    ("Tab", "Cycle search mode (in /)"),
-                    ("Esc", "Cancel search"),
-                    ("Enter", "Confirm search"),
-                ],
-            },
-            Section {
-                title: "Actions",
-                bindings: vec![
-                    ("p", "Toggle priority hints"),
-                    ("P", "Pages export wizard"),
-                    ("C", "Copy issue ID"),
-                    ("x", "Export issue markdown"),
-                    ("O", "Open in editor"),
-                    ("Ctrl+R/F5", "Refresh from disk"),
-                ],
-            },
-            Section {
-                title: "History",
-                bindings: vec![
-                    ("c", "Cycle confidence filter"),
-                    ("y", "Copy SHA/ID"),
-                    ("o", "Open commit in browser"),
-                    ("f", "Toggle file tree"),
-                ],
-            },
-            Section {
-                title: "Board",
-                bindings: vec![
-                    ("1-4", "Jump to lane"),
-                    ("L", "Jump to last lane"),
-                    ("0/$", "First/last in lane"),
-                    ("e", "Toggle empty lanes"),
-                ],
-            },
-            Section {
-                title: "Tree",
-                bindings: vec![
-                    ("Enter/za", "Toggle fold"),
-                    ("zo/zc", "Open/close fold"),
-                    ("zR/zM", "Open/close all folds"),
-                    ("zz", "Recenter cursor"),
-                ],
-            },
-            Section {
-                title: "Insights",
-                bindings: vec![
-                    ("s/S", "Cycle panel fwd/back"),
-                    ("m", "Toggle heatmap"),
-                    ("e", "Toggle explanations"),
-                    ("x", "Toggle calc-proof"),
-                ],
-            },
-            Section {
-                title: "Global",
-                bindings: vec![
-                    ("?/F1", "Toggle this help"),
-                    ("Esc", "Back / clear / quit"),
-                    ("q", "Quit / back to main"),
-                    ("Ctrl+T", "Tutorial"),
-                    ("Ctrl+C", "Quit immediately"),
-                ],
-            },
-        ];
+        let sections = help_sections();
 
         // Render each section as a block of lines.
-        let render_section = |sec: &Section| -> Vec<String> {
+        let render_section = |sec: &HelpSection| -> Vec<String> {
             let mut block = vec![format!("[{}]", sec.title)];
             for (key, desc) in &sec.bindings {
                 block.push(format!("  {:<12} {}", key, desc));
@@ -8391,6 +9429,4645 @@ impl BvrApp {
             ViewMode::Tree => self.tree_list_render_text(width),
             _ => RichText::raw(self.list_panel_text()),
         }
+    }
+
+    /// Go bv insight panel copy: (emoji, title, metric name, description).
+    fn go_insight_panel_meta(
+        panel: InsightsPanel,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        match panel {
+            InsightsPanel::Bottlenecks => (
+                "🚧",
+                "Bottlenecks",
+                "Betweenness Centrality",
+                "Measures how often a bead lies on shortest paths between other beads in the dependency graph.",
+            ),
+            InsightsPanel::Keystones => (
+                "🏛",
+                "Keystones",
+                "Impact Depth",
+                "Measures how deep in the dependency chain a bead sits (downstream chain length).",
+            ),
+            InsightsPanel::CriticalPath => (
+                "⚡",
+                "Critical Path",
+                "Longest dependency chain",
+                "The chain that sets the project's minimum duration; any slip here delays everything after it.",
+            ),
+            InsightsPanel::Influencers => (
+                "🌐",
+                "Influencers",
+                "Eigenvector Centrality",
+                "Scores beads by their connections to other well-connected beads.",
+            ),
+            InsightsPanel::Betweenness => (
+                "🔀",
+                "Betweenness",
+                "Shortest-path brokerage",
+                "Beads that broker the most shortest paths between other beads.",
+            ),
+            InsightsPanel::Hubs => (
+                "🛰",
+                "Hubs",
+                "HITS Hub Score",
+                "Beads that depend on many important authorities (aggregators).",
+            ),
+            InsightsPanel::Authorities => (
+                "📚",
+                "Authorities",
+                "HITS Authority Score",
+                "Beads that are depended upon by many important hubs (providers).",
+            ),
+            InsightsPanel::Cores => (
+                "🧠",
+                "Cores",
+                "k-core Cohesion",
+                "Nodes with highest k-core numbers (embedded in dense subgraphs).",
+            ),
+            InsightsPanel::CutPoints => (
+                "🪢",
+                "Cut Points",
+                "Articulation Vertices",
+                "Nodes whose removal disconnects the undirected graph.",
+            ),
+            InsightsPanel::Slack => (
+                "⏳",
+                "Slack",
+                "Longest-path slack",
+                "Distance from critical chain (0 = critical path; higher = parallel-friendly).",
+            ),
+            InsightsPanel::Cycles => (
+                "🔄",
+                "Cycles",
+                "Circular Dependencies",
+                "Groups of beads forming dependency loops (A→B→C→A).",
+            ),
+            InsightsPanel::Priority => (
+                "🎯",
+                "Priority",
+                "Agent-First Triage",
+                "Top claimable work by composite triage score.",
+            ),
+        }
+    }
+
+    /// The value badge an insight panel shows for one issue.
+    fn go_insight_value(&self, panel: InsightsPanel, id: &str) -> String {
+        let m = &self.analyzer.metrics;
+        let f = |map: &HashMap<String, f64>| map.get(id).copied().unwrap_or(0.0);
+        match panel {
+            InsightsPanel::Betweenness | InsightsPanel::Bottlenecks => {
+                let v = f(&m.betweenness);
+                if v >= 1.0 {
+                    format!("{v:.1}")
+                } else {
+                    format!("{v:.3}")
+                }
+            }
+            InsightsPanel::Keystones | InsightsPanel::CriticalPath => {
+                format!(
+                    "{:.1}",
+                    m.critical_depth.get(id).copied().unwrap_or(0) as f64
+                )
+            }
+            InsightsPanel::Influencers => format!("{:.3}", f(&m.eigenvector)),
+            InsightsPanel::Hubs => format!("{:.3}", f(&m.hubs)),
+            InsightsPanel::Authorities => format!("{:.3}", f(&m.authorities)),
+            InsightsPanel::Cores => format!("{:.1}", m.k_core.get(id).copied().unwrap_or(0)),
+            InsightsPanel::CutPoints => "cut".to_string(),
+            InsightsPanel::Slack => format!("{:.1}", f(&m.slack)),
+            InsightsPanel::Cycles | InsightsPanel::Priority => String::new(),
+        }
+    }
+
+    /// Render one bordered insight panel into `area`.
+    fn render_go_insight_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        panel: InsightsPanel,
+        insights: &crate::analysis::Insights,
+    ) {
+        let focused = self.insights_panel == panel;
+        let (emoji, title, metric, description) = Self::go_insight_panel_meta(panel);
+        let ids = self.insights_panel_ids(panel, insights);
+        let count = if matches!(panel, InsightsPanel::Cycles) {
+            insights.cycles.len()
+        } else {
+            ids.len()
+        };
+        Block::bordered()
+            .border_type(ftui::widgets::borders::BorderType::Rounded)
+            .border_style(Style::new().fg(if focused {
+                tokens::FG_ACCENT
+            } else {
+                tokens::FG_MUTED
+            }))
+            .render(area, frame);
+        let inner = Rect::new(
+            area.x + 2,
+            area.y + 1,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(2),
+        );
+        if inner.width < 8 || inner.height < 2 {
+            return;
+        }
+        let width = usize::from(inner.width);
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&format!("{emoji} {title} ({count})"), width, "…"),
+                tokens::primary_bold(),
+            )]),
+            RichLine::from_spans([RichSpan::styled(metric.to_string(), tokens::row_id())]),
+        ];
+        let desc_lines = RichLine::raw(description).wrap(width, ftui::text::WrapMode::Word);
+        let desc_budget = usize::from(inner.height).saturating_sub(5).clamp(1, 3);
+        lines.extend(desc_lines.into_iter().take(desc_budget));
+
+        if matches!(panel, InsightsPanel::Cycles) {
+            if insights.cycles.is_empty() {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    "✓ No cycles detected",
+                    Style::new().fg(tokens::FG_SUCCESS).bold(),
+                )]));
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    "Graph is acyclic (DAG)",
+                    tokens::row_id(),
+                )]));
+            } else {
+                for cycle in insights
+                    .cycles
+                    .iter()
+                    .take(usize::from(inner.height).saturating_sub(lines.len()))
+                {
+                    lines.push(RichLine::from_spans([RichSpan::styled(
+                        truncate_with_ellipsis(&format!("⟳ {}", cycle.join(" → ")), width, "…"),
+                        Style::new().fg(tokens::status_fg("blocked")),
+                    )]));
+                }
+            }
+            Paragraph::new(RichText::from_lines(lines)).render(inner, frame);
+            return;
+        }
+
+        let rows = usize::from(inner.height)
+            .saturating_sub(lines.len() + 1)
+            .max(1);
+        let selected_slot = ids
+            .iter()
+            .position(|id| self.selected_issue().is_some_and(|issue| &issue.id == id));
+        let cursor = if focused {
+            selected_slot.unwrap_or(0)
+        } else {
+            0
+        };
+        let start = cursor.saturating_sub(rows - 1);
+        for (slot, id) in ids.iter().enumerate().skip(start).take(rows) {
+            let Some(issue) = self.analyzer.graph.issue(id) else {
+                continue;
+            };
+            let selected = focused && Some(slot) == selected_slot;
+            // Bottlenecks rank by the composite bottleneck score; show it.
+            let value = if matches!(panel, InsightsPanel::Bottlenecks) {
+                insights
+                    .bottlenecks
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map_or_else(String::new, |item| format!("{:.3}", item.score))
+            } else {
+                self.go_insight_value(panel, id)
+            };
+            let status = issue.normalized_status();
+            let mut spans = vec![
+                RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                RichSpan::styled(
+                    format!(" {value:>6} "),
+                    Style::new()
+                        .fg(tokens::FG_INFO)
+                        .bg(tokens::BG_HIGHLIGHT)
+                        .bold(),
+                ),
+                RichSpan::raw(" "),
+                RichSpan::styled(
+                    go_type_icon(&issue.issue_type),
+                    Style::new().fg(tokens::type_fg(&issue.issue_type)),
+                ),
+                RichSpan::raw(" "),
+                RichSpan::styled("● ", Style::new().fg(tokens::status_fg(&status))),
+            ];
+            let used: usize = spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            spans.push(RichSpan::styled(
+                truncate_with_ellipsis(&issue.title, width.saturating_sub(used + 1), "…"),
+                tokens::row_title(selected),
+            ));
+            lines.push(RichLine::from_spans(spans));
+        }
+        if !ids.is_empty() {
+            let position = if focused { cursor + 1 } else { 1 };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                format!("{:^width$}", format!("↕ {position}/{}", ids.len())),
+                tokens::muted_text(),
+            )]));
+        }
+        Paragraph::new(RichText::from_lines(lines)).render(inner, frame);
+    }
+
+    /// The Go bv priority strip: up to three triage cards with score,
+    /// status, priority, title, PageRank/betweenness bars, and unblocks.
+    fn render_go_priority_strip(&self, frame: &mut Frame, area: Rect) {
+        let focused = matches!(self.insights_panel, InsightsPanel::Priority);
+        Block::bordered()
+            .border_type(ftui::widgets::borders::BorderType::Rounded)
+            .border_style(Style::new().fg(if focused {
+                tokens::FG_ACCENT
+            } else {
+                tokens::FG_MUTED
+            }))
+            .render(area, frame);
+        let recs = self.analyzer.priority(0.0, 3, None, None);
+        Paragraph::new(RichText::from_lines([RichLine::from_spans([
+            RichSpan::styled(
+                format!("🎯 Priority ({})", recs.len().min(3)),
+                tokens::primary_bold(),
+            ),
+            RichSpan::styled("   Agent-First Triage", tokens::row_id()),
+        ])]))
+        .render(
+            Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1),
+            frame,
+        );
+        if area.height < 6 || recs.is_empty() {
+            return;
+        }
+        let cards = u16::try_from(recs.len().min(3)).unwrap_or(1);
+        let card_width = area.width.saturating_sub(4) / 3;
+        let max_pr = self
+            .analyzer
+            .metrics
+            .pagerank
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(f64::EPSILON);
+        let max_bw = self
+            .analyzer
+            .metrics
+            .betweenness
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(f64::EPSILON);
+        for (slot, rec) in recs.iter().take(3).enumerate() {
+            let x = area.x + 2 + card_width * u16::try_from(slot).unwrap_or(0);
+            let card = Rect::new(
+                x,
+                area.y + 2,
+                card_width.saturating_sub(1),
+                area.height.saturating_sub(3),
+            );
+            let selected = focused
+                && self
+                    .selected_issue()
+                    .is_some_and(|issue| issue.id == rec.id);
+            Block::bordered()
+                .border_type(ftui::widgets::borders::BorderType::Rounded)
+                .border_style(Style::new().fg(if selected {
+                    tokens::FG_ACCENT
+                } else {
+                    tokens::FG_MUTED
+                }))
+                .render(card, frame);
+            let inner = Rect::new(
+                card.x + 2,
+                card.y + 1,
+                card.width.saturating_sub(4),
+                card.height.saturating_sub(2),
+            );
+            let width = usize::from(inner.width);
+            let bar = |value: f64, max: f64| {
+                let cells = ((value / max) * 16.0).round().clamp(0.0, 16.0) as usize;
+                format!("{}{}", "█".repeat(cells), "░".repeat(16 - cells))
+            };
+            let pr = self
+                .analyzer
+                .metrics
+                .pagerank
+                .get(&rec.id)
+                .copied()
+                .unwrap_or(0.0);
+            let bw = self
+                .analyzer
+                .metrics
+                .betweenness
+                .get(&rec.id)
+                .copied()
+                .unwrap_or(0.0);
+            let status = rec.status.to_ascii_lowercase();
+            let lines = vec![
+                RichLine::from_spans([RichSpan::styled(
+                    format!(" {:.2} ", rec.score),
+                    Style::new()
+                        .fg(tokens::FG_INFO)
+                        .bg(tokens::BG_HIGHLIGHT)
+                        .bold(),
+                )]),
+                RichLine::from_spans([
+                    RichSpan::styled(
+                        go_type_icon(&rec.issue_type),
+                        Style::new().fg(tokens::type_fg(&rec.issue_type)),
+                    ),
+                    RichSpan::raw(" "),
+                    RichSpan::styled(
+                        status.to_ascii_uppercase(),
+                        Style::new().fg(tokens::status_fg(&status)).bold(),
+                    ),
+                    RichSpan::styled(
+                        format!(" ⚡P{}", rec.priority.clamp(0, 4)),
+                        tokens::priority_style(u8::try_from(rec.priority.clamp(0, 4)).unwrap_or(4)),
+                    ),
+                ]),
+                RichLine::from_spans([RichSpan::styled(
+                    truncate_with_ellipsis(&rec.title, width, "…"),
+                    tokens::row_title(selected),
+                )]),
+                RichLine::from_spans([
+                    RichSpan::styled("PR:", tokens::row_id()),
+                    RichSpan::styled(bar(pr, max_pr), Style::new().fg(tokens::FG_SUCCESS)),
+                    RichSpan::styled(" BW:", tokens::row_id()),
+                    RichSpan::styled(bar(bw, max_bw), Style::new().fg(tokens::FG_INFO)),
+                ]),
+                RichLine::from_spans([RichSpan::styled(
+                    format!("↳ Unblocks {}", rec.unblocks),
+                    Style::new().fg(tokens::FG_SUCCESS).bold(),
+                )]),
+            ];
+            Paragraph::new(RichText::from_lines(lines)).render(inner, frame);
+        }
+        let _ = cards;
+    }
+
+    /// Go bv insights dashboard: a 3x3 panel grid, the priority strip, and
+    /// the Markdown detail of the selection on the right.
+    fn render_go_insights(&self, frame: &mut Frame, area: Rect) {
+        let insights = self.analyzer.insights();
+        // The side detail needs room; below 140 columns the grid takes the
+        // whole width and Tab shows the detail full-screen instead.
+        let side_detail = area.width >= 140;
+        if !side_detail && matches!(self.focus, FocusPane::Detail) {
+            self.render_go_board_detail(frame, area);
+            return;
+        }
+        let detail_width = if side_detail {
+            (area.width * 28 / 100).max(36)
+        } else {
+            0
+        };
+        let grid_width = area.width.saturating_sub(detail_width);
+        let strip_height = if area.height >= 24 { 10 } else { 0 };
+        let grid_height = area.height.saturating_sub(strip_height);
+
+        // Go's nine-panel layout; Rust-only panels take a cell when focused.
+        let mut cells = [
+            InsightsPanel::Bottlenecks,
+            InsightsPanel::Keystones,
+            InsightsPanel::Influencers,
+            InsightsPanel::Hubs,
+            InsightsPanel::Authorities,
+            InsightsPanel::Cores,
+            InsightsPanel::CutPoints,
+            InsightsPanel::Slack,
+            InsightsPanel::Cycles,
+        ];
+        match self.insights_panel {
+            InsightsPanel::Betweenness => cells[0] = InsightsPanel::Betweenness,
+            InsightsPanel::CriticalPath => cells[1] = InsightsPanel::CriticalPath,
+            _ => {}
+        }
+        let cell_w = grid_width / 3;
+        let cell_h = grid_height / 3;
+        for (index, panel) in cells.iter().enumerate() {
+            let col = u16::try_from(index % 3).unwrap_or(0);
+            let row = u16::try_from(index / 3).unwrap_or(0);
+            let rect = Rect::new(area.x + col * cell_w, area.y + row * cell_h, cell_w, cell_h);
+            self.render_go_insight_panel(frame, rect, *panel, &insights);
+        }
+        if strip_height > 0 {
+            self.render_go_priority_strip(
+                frame,
+                Rect::new(
+                    area.x,
+                    area.y + cell_h * 3,
+                    cell_w * 3,
+                    area.height - cell_h * 3,
+                ),
+            );
+        }
+        if detail_width > 0 {
+            self.render_go_board_detail(
+                frame,
+                Rect::new(area.x + grid_width, area.y, detail_width, area.height),
+            );
+        }
+    }
+
+    /// Go bv's actionable view: a banner, the recommendation bar, and one
+    /// lettered block per execution track with tree-drawn items. The cursor
+    /// item is highlighted with its unblock list beneath; the view scrolls to
+    /// keep it on screen.
+    fn render_go_actionable(&self, frame: &mut Frame, area: Rect) {
+        // One spare column: a line that exactly fills the width loses its
+        // trailing padding (and thus its background) to wrapping.
+        let width = usize::from(area.width).saturating_sub(1);
+        // The plan is cached when the view is entered; compute it on the fly
+        // when it is not (e.g. the app started in this view).
+        let computed;
+        let plan = if let Some(plan) = self.actionable_plan.as_ref() {
+            plan
+        } else {
+            let triage = self
+                .analyzer
+                .triage(crate::analysis::triage::TriageOptions::default());
+            computed = self.analyzer.plan(&triage.score_by_id);
+            &computed
+        };
+        let mut lines: Vec<RichLine> = Vec::new();
+        let banner = format!(
+            " ⚡ ACTIONABLE ITEMS  │  {} items in {} tracks",
+            plan.summary.actionable_count,
+            plan.tracks.len()
+        );
+        lines.push(padded_bar(&banner, width, tokens::list_column_header()));
+        lines.push(RichLine::raw(""));
+        if plan.tracks.is_empty() {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "✓ No actionable items. All tasks are either blocked or completed.",
+                Style::new().fg(tokens::FG_SUCCESS).bold(),
+            )]));
+            Paragraph::new(RichText::from_lines(lines)).render(area, frame);
+            return;
+        }
+        if let (Some(highest), Some(reason)) = (
+            plan.summary.highest_impact.as_deref(),
+            plan.summary.impact_reason.as_deref(),
+        ) {
+            let rec = format!(" 💡 RECOMMENDED: Start with {highest} → {reason}");
+            lines.push(padded_bar(
+                &truncate_with_ellipsis(&rec, width, "…"),
+                width,
+                Style::new()
+                    .fg(tokens::FG_SUCCESS)
+                    .bg(tokens::BG_HIGHLIGHT)
+                    .bold(),
+            ));
+            lines.push(RichLine::raw(""));
+        }
+
+        let mut cursor_line = 0usize;
+        for (track_idx, track) in plan.tracks.iter().enumerate() {
+            let letter = if track_idx < 26 {
+                char::from(b'A' + u8::try_from(track_idx).unwrap_or(0)).to_string()
+            } else {
+                (track_idx + 1).to_string()
+            };
+            lines.push(RichLine::from_spans([
+                RichSpan::styled(
+                    format!(" TRACK {letter} "),
+                    Style::new()
+                        .fg(PackedRgba::rgb(248, 248, 242))
+                        .bg(tokens::FG_MUTED)
+                        .bold(),
+                ),
+                RichSpan::raw(" "),
+                RichSpan::styled(
+                    truncate_with_ellipsis(&track.reason, width.saturating_sub(12), "…"),
+                    tokens::row_id(),
+                ),
+            ]));
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "┈".repeat(width.saturating_sub(2)),
+                tokens::muted_text(),
+            )]));
+            for (item_idx, item) in track.items.iter().enumerate() {
+                let selected = track_idx == self.actionable_track_cursor
+                    && item_idx == self.actionable_item_cursor;
+                if selected {
+                    cursor_line = lines.len();
+                }
+                let tree = if item_idx + 1 < track.items.len() {
+                    "├─"
+                } else {
+                    "└─"
+                };
+                let glyph = go_priority_icon(item.priority)
+                    .split(' ')
+                    .next()
+                    .unwrap_or("•");
+                let mut spans = vec![
+                    RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                    RichSpan::styled(format!("{tree} "), tokens::muted_text()),
+                    RichSpan::raw(format!("{glyph} ")),
+                    RichSpan::styled(format!("{} ", item.id), tokens::row_id()),
+                ];
+                let unblocks = if item.unblocks.is_empty() {
+                    String::new()
+                } else {
+                    format!(" →{}", item.unblocks.len())
+                };
+                let used: usize = spans
+                    .iter()
+                    .map(|span| display_width(span.content.as_ref()))
+                    .sum();
+                let title = truncate_with_ellipsis(
+                    &item.title,
+                    width.saturating_sub(used + display_width(&unblocks) + 1),
+                    "…",
+                );
+                spans.push(RichSpan::styled(title, tokens::row_title(selected)));
+                if !unblocks.is_empty() {
+                    spans.push(RichSpan::styled(
+                        unblocks,
+                        Style::new().fg(tokens::FG_SUCCESS).bold(),
+                    ));
+                }
+                if selected {
+                    let used: usize = spans
+                        .iter()
+                        .map(|span| display_width(span.content.as_ref()))
+                        .sum();
+                    spans.push(RichSpan::raw(" ".repeat(width.saturating_sub(used))));
+                    let highlighted: Vec<RichSpan<'static>> = spans
+                        .into_iter()
+                        .map(|span| {
+                            let style = span
+                                .style
+                                .unwrap_or_default()
+                                .bg(tokens::row_highlight_bg());
+                            RichSpan::styled(span.content.into_owned(), style)
+                        })
+                        .collect();
+                    lines.push(RichLine::from_spans(highlighted));
+                    if !item.unblocks.is_empty() {
+                        lines.push(RichLine::from_spans([RichSpan::styled(
+                            truncate_with_ellipsis(
+                                &format!("      ↳ Unblocks: {}", item.unblocks.join(", ")),
+                                width,
+                                "…",
+                            ),
+                            Style::new().fg(tokens::FG_WARNING),
+                        )]));
+                    }
+                } else {
+                    lines.push(RichLine::from_spans(spans));
+                }
+            }
+            lines.push(RichLine::raw(""));
+        }
+
+        // Keep the cursor visible, preferring to show the whole banner.
+        let height = usize::from(area.height);
+        let offset = cursor_line.saturating_sub(height.saturating_sub(4));
+        Paragraph::new(RichText::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .scroll((saturating_scroll_offset(offset), 0))
+            .render(area, frame);
+    }
+
+    /// Render the tree view as Go bv does: full-width hierarchy rows (tree
+    /// connectors, ▾/▸/• fold glyph, type icon, priority, ID, title, status
+    /// dot) with the selected row highlighted behind a primary bar, and a
+    /// `[start-end of total]` indicator when it scrolls. Tab opens the
+    /// selected issue's detail beside it, as the board does.
+    fn render_go_tree(&self, frame: &mut Frame, area: Rect) {
+        if self.tree_flat_nodes.is_empty() {
+            let lines = vec![
+                RichLine::from_spans([RichSpan::styled("Tree View", tokens::primary_bold())]),
+                RichLine::raw(""),
+                RichLine::from_spans([RichSpan::styled(
+                    "No issues to display.",
+                    tokens::muted_text(),
+                )]),
+                RichLine::raw(""),
+                RichLine::from_spans([RichSpan::styled(
+                    "To create hierarchy, add parent-child dependencies:",
+                    tokens::muted_text(),
+                )]),
+                RichLine::from_spans([RichSpan::styled(
+                    "  br dep add <child> parent-child:<parent>",
+                    tokens::muted_text(),
+                )]),
+                RichLine::raw(""),
+                RichLine::from_spans([RichSpan::styled(
+                    "Press T to return to list view.",
+                    tokens::muted_text(),
+                )]),
+            ];
+            Paragraph::new(RichText::from_lines(lines)).render(area, frame);
+            return;
+        }
+        let show_detail = matches!(self.focus, FocusPane::Detail);
+        let detail_width = if !show_detail {
+            0
+        } else if area.width >= 100 {
+            (area.width * 40 / 100).clamp(40, 90)
+        } else {
+            area.width
+        };
+        let tree_width = area.width.saturating_sub(detail_width);
+        if tree_width > 0 {
+            let tree_area = Rect::new(area.x, area.y, tree_width, area.height);
+            Paragraph::new(RichText::from_lines(
+                self.go_tree_lines(usize::from(tree_width), usize::from(area.height)),
+            ))
+            .wrap(ftui::text::WrapMode::None)
+            .render(tree_area, frame);
+        }
+        if detail_width > 0 {
+            let panel = Rect::new(area.x + tree_width, area.y, detail_width, area.height);
+            semantic_panel_block("", true, SemanticTone::Accent).render(panel, frame);
+            let inner = block_inner_rect(panel);
+            let body = Rect::new(
+                inner.x.saturating_add(1),
+                inner.y,
+                inner.width.saturating_sub(2),
+                inner.height,
+            );
+            let issue = self
+                .tree_flat_nodes
+                .get(self.tree_cursor)
+                .and_then(|node| self.analyzer.issues.get(node.issue_index));
+            Paragraph::new(self.go_issue_detail_text(issue, body.width))
+                .wrap(ftui::text::WrapMode::WordChar)
+                .scroll((saturating_scroll_offset(self.detail_scroll_offset), 0))
+                .render(body, frame);
+            record_detail_content_area(inner);
+        }
+    }
+
+    /// The visible tree rows (windowed around the cursor) plus Go's
+    /// position indicator when the tree is taller than the view.
+    fn go_tree_lines(&self, width: usize, height: usize) -> Vec<RichLine> {
+        let total = self.tree_flat_nodes.len();
+        let rows = if total > height {
+            height.saturating_sub(1)
+        } else {
+            height
+        };
+        let cursor = self.tree_cursor.min(total.saturating_sub(1));
+        let start = if rows == 0 || cursor < rows / 2 {
+            0
+        } else {
+            (cursor + 1 - rows / 2).min(total.saturating_sub(rows))
+        };
+        let end = (start + rows).min(total);
+        let search_hits: HashSet<usize> = self.tree_search_matches().into_iter().collect();
+        let mut lines = Vec::with_capacity(rows + 1);
+        for (idx, node) in self
+            .tree_flat_nodes
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+        {
+            let Some(issue) = self.analyzer.issues.get(node.issue_index) else {
+                continue;
+            };
+            let selected = idx == cursor;
+            let mut prefix = String::new();
+            if node.depth > 0 {
+                for &ancestor_was_last in node.ancestry_last.iter().skip(1) {
+                    prefix.push_str(if ancestor_was_last { "    " } else { "│   " });
+                }
+                prefix.push_str(if node.is_last_sibling {
+                    "└── "
+                } else {
+                    "├── "
+                });
+            }
+            let fold = if !node.has_children {
+                "•"
+            } else if node.is_collapsed {
+                "▸"
+            } else {
+                "▾"
+            };
+            let mut spans = vec![
+                if selected {
+                    RichSpan::styled("┃ ", tokens::primary_bold())
+                } else {
+                    RichSpan::raw("  ")
+                },
+                RichSpan::styled(prefix, tokens::muted_text()),
+                RichSpan::styled(format!("{fold} "), tokens::row_id()),
+                RichSpan::styled(
+                    format!("{} ", go_type_icon(&issue.issue_type).trim_end()),
+                    Style::new().fg(tokens::type_fg(&issue.issue_type)),
+                ),
+                RichSpan::styled(
+                    format!("P{} ", issue.priority),
+                    if issue.priority <= 1 {
+                        tokens::primary_bold()
+                    } else {
+                        tokens::muted_text().bold()
+                    },
+                ),
+                RichSpan::styled(format!("{} ", issue.id), tokens::row_id()),
+            ];
+            let mut suffix = vec![RichSpan::styled(
+                format!(" {}", go_status_dot(&issue.status)),
+                Style::new().fg(tokens::status_fg(&issue.status)),
+            )];
+            if self
+                .analyzer
+                .metrics
+                .cycles
+                .iter()
+                .any(|cycle| cycle.contains(&issue.id))
+            {
+                suffix.push(RichSpan::styled(" ⟳", tokens::status_message(true)));
+            }
+            if search_hits.contains(&idx) {
+                suffix.push(RichSpan::styled(" ◆", tokens::triage_unblocks()));
+            }
+            let used: usize = spans
+                .iter()
+                .chain(suffix.iter())
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            spans.push(RichSpan::styled(
+                truncate_with_ellipsis(&issue.title, width.saturating_sub(used + 1).max(8), "…"),
+                if selected {
+                    Style::new().bold()
+                } else {
+                    Style::new()
+                },
+            ));
+            spans.extend(suffix);
+            lines.push(if selected {
+                go_highlight_row(spans, width.saturating_sub(1))
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        if total > rows {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                format!(" [{}-{end} of {total}]", start + 1),
+                tokens::muted_text(),
+            )]));
+        }
+        lines
+    }
+
+    /// Lay out a Go-style full-width view with an optional detail panel on
+    /// the right (shown while the detail pane has focus, as on the board).
+    /// Returns the main area; the detail panel, when shown, is rendered from
+    /// `detail` inside a rounded frame.
+    fn go_split_with_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        detail: impl FnOnce() -> RichText,
+    ) -> Rect {
+        if !matches!(self.focus, FocusPane::Detail) {
+            return area;
+        }
+        let detail_width = if area.width >= 100 {
+            (area.width * 40 / 100).clamp(40, 90)
+        } else {
+            area.width
+        };
+        let main_width = area.width.saturating_sub(detail_width);
+        let panel = Rect::new(area.x + main_width, area.y, detail_width, area.height);
+        semantic_panel_block("", true, SemanticTone::Accent).render(panel, frame);
+        let inner = block_inner_rect(panel);
+        let body = Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        );
+        Paragraph::new(detail())
+            .wrap(ftui::text::WrapMode::WordChar)
+            .scroll((saturating_scroll_offset(self.detail_scroll_offset), 0))
+            .render(body, frame);
+        record_detail_content_area(inner);
+        Rect::new(area.x, area.y, main_width, area.height)
+    }
+
+    /// Render the label dashboard as Go bv's `LabelDashboardModel`: a
+    /// table of Label | Health (score and colored 10-cell bar) | Blocked |
+    /// Velocity 7d/30d | Stale under a primary header row, critical labels
+    /// first. Enter filters the list by the label; Tab shows its detail.
+    fn render_go_label_dashboard(&self, frame: &mut Frame, area: Rect) {
+        let area = self.go_split_with_detail(frame, area, || {
+            RichText::raw(self.label_dashboard_detail_text())
+        });
+        if area.width == 0 {
+            return;
+        }
+        let Some(result) = self
+            .label_dashboard
+            .as_ref()
+            .filter(|r| !r.labels.is_empty())
+        else {
+            Paragraph::new("No labels found")
+                .style(tokens::muted_text())
+                .render(area, frame);
+            return;
+        };
+        let width = usize::from(area.width).saturating_sub(1);
+        let label_cell = |label: &crate::analysis::label_intel::LabelHealth| {
+            let indicator = if label.health_level == "critical" {
+                " !"
+            } else if label.blocked_count > 0 {
+                " ⛔"
+            } else {
+                ""
+            };
+            format!("{}{indicator}", label.label)
+        };
+        let headers = ["Label", "Health", "Blocked", "Velocity 7d/30d", "Stale"];
+        let mut widths = [5usize, 14, 7, 15, 5];
+        for label in &result.labels {
+            widths[0] = widths[0].max(display_width(&label_cell(label)));
+            widths[2] = widths[2].max(label.blocked_count.to_string().len());
+        }
+        // The label column gives way when the table is wider than the view.
+        let total: usize = widths.iter().sum::<usize>() + widths.len() - 1 + 2;
+        if total > width {
+            widths[0] = widths[0].saturating_sub(total - width).max(4);
+        }
+        let pad = |text: &str, w: usize| {
+            let text = truncate_with_ellipsis(text, w, "…");
+            let fill = w.saturating_sub(display_width(&text));
+            format!("{text}{}", " ".repeat(fill))
+        };
+        let mut lines = vec![padded_bar(
+            &format!(
+                "  {}",
+                headers
+                    .iter()
+                    .zip(widths)
+                    .map(|(header, w)| pad(header, w))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            width,
+            tokens::list_column_header(),
+        )];
+        let rows = usize::from(area.height).saturating_sub(1);
+        let cursor = self.label_dashboard_cursor.min(result.labels.len() - 1);
+        let start = Self::go_history_scroll_start(cursor, rows);
+        for (idx, label) in result.labels.iter().enumerate().skip(start).take(rows) {
+            let selected = idx == cursor;
+            let filled = usize::try_from(label.health.clamp(0, 100)).unwrap_or(0) / 10;
+            let bar_style = match label.health_level.as_str() {
+                "healthy" => tokens::success_text(),
+                "warning" => Style::new().fg(tokens::FG_WARNING),
+                _ => tokens::status_message(true).bg(PackedRgba::TRANSPARENT),
+            };
+            let blocked = label.blocked_count.to_string();
+            let spans = vec![
+                if selected {
+                    RichSpan::styled("┃ ", tokens::primary_bold())
+                } else {
+                    RichSpan::raw("  ")
+                },
+                RichSpan::styled(
+                    format!("{} ", pad(&label_cell(label), widths[0])),
+                    if selected {
+                        Style::new().bold()
+                    } else {
+                        Style::new()
+                    },
+                ),
+                RichSpan::raw(format!("{:>3} ", label.health)),
+                RichSpan::styled("█".repeat(filled), bar_style),
+                RichSpan::styled("░".repeat(10 - filled), bar_style),
+                RichSpan::raw(" ".repeat(widths[1] - 14 + 1)),
+                RichSpan::styled(
+                    format!("{} ", pad(&blocked, widths[2])),
+                    if label.blocked_count > 0 {
+                        tokens::status_message(true).bg(PackedRgba::TRANSPARENT)
+                    } else {
+                        Style::new()
+                    },
+                ),
+                RichSpan::raw(format!(
+                    "{} ",
+                    pad(
+                        &format!(
+                            "{}/{}",
+                            label.velocity.closed_last_7_days, label.velocity.closed_last_30_days
+                        ),
+                        widths[3]
+                    )
+                )),
+                RichSpan::raw(label.freshness.stale_count.to_string()),
+            ];
+            lines.push(if selected {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        Paragraph::new(RichText::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .render(area, frame);
+    }
+
+    /// Render label attention as Go bv's `AttentionModel`: the top ten
+    /// labels in a Rank | Label | Attention | Reason table, the reason
+    /// spelling out the formula inputs (PageRank sum, staleness, block
+    /// impact, closes in the last 30 days).
+    fn render_go_attention(&self, frame: &mut Frame, area: Rect) {
+        let area =
+            self.go_split_with_detail(frame, area, || RichText::raw(self.attention_detail_text()));
+        if area.width == 0 {
+            return;
+        }
+        let Some(result) = self
+            .attention_result
+            .as_ref()
+            .filter(|r| !r.labels.is_empty())
+        else {
+            Paragraph::new("No labels to rank")
+                .style(tokens::muted_text())
+                .render(area, frame);
+            return;
+        };
+        let width = usize::from(area.width).max(40);
+        let mut widths = [4usize, 18, 10, 0];
+        widths[3] = width.saturating_sub(4 + 18 + 10 + 3 * 3 + 2).max(20);
+        let row = |cells: [String; 4]| {
+            cells
+                .iter()
+                .zip(widths)
+                .map(|(cell, w)| {
+                    let cell = truncate_with_ellipsis(cell, w, "…");
+                    let fill = w.saturating_sub(display_width(&cell));
+                    format!("{cell}{}", " ".repeat(fill))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let mut lines = vec![RichLine::from_spans([RichSpan::styled(
+            format!(
+                "  {}",
+                row([
+                    "Rank".into(),
+                    "Label".into(),
+                    "Attention".into(),
+                    "Reason".into()
+                ])
+            ),
+            tokens::primary_bold(),
+        )])];
+        let rows = usize::from(area.height).saturating_sub(1);
+        let shown = result.labels.len().min(ATTENTION_ROW_LIMIT);
+        let cursor = self.attention_cursor.min(shown - 1);
+        let start = Self::go_history_scroll_start(cursor, rows);
+        for (idx, score) in result
+            .labels
+            .iter()
+            .enumerate()
+            .take(shown)
+            .skip(start)
+            .take(rows)
+        {
+            let selected = idx == cursor;
+            let closed30 = (score.velocity_factor - 1.0).max(0.0);
+            let text = row([
+                (idx + 1).to_string(),
+                score.label.clone(),
+                format!("{:.2}", score.attention_score),
+                format!(
+                    "pr={:.2} stale={:.2} block={:.0} closed30={closed30:.0}",
+                    score.pagerank_sum, score.staleness_factor, score.block_impact
+                ),
+            ]);
+            if selected {
+                lines.push(go_highlight_row(
+                    vec![
+                        RichSpan::styled("┃ ", tokens::primary_bold()),
+                        RichSpan::styled(text, Style::new().bold()),
+                    ],
+                    width.saturating_sub(1),
+                ));
+            } else {
+                lines.push(RichLine::raw(format!("  {text}")));
+            }
+        }
+        Paragraph::new(RichText::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .render(area, frame);
+    }
+
+    /// Render the sprint view as Go bv's sprint dashboard: a centered,
+    /// rounded box for the selected sprint with dates and days remaining, a
+    /// progress bar and status breakdown, an ASCII burndown (ideal · vs
+    /// actual ●), the at-risk beads (the same four signals as
+    /// --robot-burndown), and the sprint's beads. j/k switch sprints.
+    fn render_go_sprint(&self, frame: &mut Frame, area: Rect) {
+        let box_width = area.width.saturating_sub(4).min(80);
+        if box_width < 20 || area.height < 5 {
+            return;
+        }
+        let panel = Rect::new(
+            area.x + (area.width - box_width) / 2,
+            area.y,
+            box_width,
+            area.height,
+        );
+        semantic_panel_block("", true, SemanticTone::Accent).render(panel, frame);
+        let inner = block_inner_rect(panel);
+        let body = Rect::new(
+            inner.x.saturating_add(2),
+            inner.y.saturating_add(1),
+            inner.width.saturating_sub(4),
+            inner.height.saturating_sub(1),
+        );
+        Paragraph::new(RichText::from_lines(
+            self.go_sprint_lines(usize::from(body.width)),
+        ))
+        .wrap(ftui::text::WrapMode::None)
+        .scroll((saturating_scroll_offset(self.detail_scroll_offset), 0))
+        .render(body, frame);
+    }
+
+    fn go_sprint_lines(&self, width: usize) -> Vec<RichLine> {
+        let label = |text: &str| RichSpan::styled(text.to_string(), tokens::row_id().bold());
+        let Some(sprint) = self.sprint_data.get(self.sprint_cursor) else {
+            return vec![
+                RichLine::from_spans([RichSpan::styled("📅 Sprints", tokens::primary_bold())]),
+                RichLine::raw(""),
+                RichLine::raw("No sprints defined (.beads/sprints.jsonl)"),
+                RichLine::raw(""),
+                RichLine::from_spans([RichSpan::styled(
+                    "Each line: {\"id\":\"sprint-1\",\"name\":\"Sprint Alpha\",",
+                    tokens::muted_text(),
+                )]),
+                RichLine::from_spans([RichSpan::styled(
+                    "  \"start_date\":\"…\",\"end_date\":\"…\",\"bead_ids\":[…]}",
+                    tokens::muted_text(),
+                )]),
+            ];
+        };
+        let now = sprint_reference_now();
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&format!("📅 Sprint: {}", sprint.name), width, "…"),
+                tokens::primary_bold(),
+            )]),
+            RichLine::raw(""),
+        ];
+
+        let (mut remaining_days, mut duration, mut passed) = (0i64, 0i64, 0i64);
+        if let Some(end) = sprint.end_date {
+            remaining_days = ((end - now).num_hours() / 24).max(0);
+            if let Some(start) = sprint.start_date {
+                duration = (end - start).num_hours() / 24;
+                passed = ((now - start).num_hours() / 24).clamp(0, duration.max(0));
+            }
+        }
+        let fmt_day = |day: Option<DateTime<Utc>>| {
+            day.map_or_else(|| "—".to_string(), |d| d.format("%b %-d").to_string())
+        };
+        lines.push(RichLine::from_spans([
+            label("Dates:    "),
+            RichSpan::raw(format!(
+                "{} → {}",
+                fmt_day(sprint.start_date),
+                fmt_day(sprint.end_date)
+            )),
+        ]));
+        let days_style = if remaining_days == 0 {
+            Style::new().fg(tokens::status_fg("blocked"))
+        } else if remaining_days <= 2 {
+            Style::new().fg(tokens::FG_WARNING)
+        } else {
+            Style::new()
+        };
+        lines.push(RichLine::from_spans([
+            label("Remaining:"),
+            RichSpan::styled(format!(" {remaining_days} days"), days_style),
+        ]));
+        lines.push(RichLine::raw(""));
+
+        let sprint_issues: Vec<&Issue> = self
+            .sprint_visible_issues()
+            .into_iter()
+            .map(|(_, issue)| issue)
+            .collect();
+        let total = sprint_issues.len();
+        let closed = sprint_issues.iter().filter(|i| i.is_closed_like()).count();
+        let open_like: Vec<&&Issue> = sprint_issues
+            .iter()
+            .filter(|i| !i.is_closed_like())
+            .collect();
+        let blocked = open_like
+            .iter()
+            .filter(|i| i.normalized_status() == "blocked")
+            .count();
+        let in_progress = open_like
+            .iter()
+            .filter(|i| i.normalized_status() == "in_progress")
+            .count();
+        let pct = if total == 0 {
+            0.0
+        } else {
+            closed as f64 / total as f64
+        };
+        let bar_width = width.saturating_sub(24).max(10);
+        let filled = ((bar_width as f64 * pct) as usize).min(bar_width);
+        lines.push(RichLine::from_spans([
+            label("Progress: "),
+            RichSpan::styled("█".repeat(filled), tokens::success_text()),
+            RichSpan::styled("░".repeat(bar_width - filled), tokens::muted_text()),
+            RichSpan::raw(format!(" {closed}/{total} ({:.0}%)", pct * 100.0)),
+        ]));
+        lines.push(RichLine::from_spans([
+            label("Status:   "),
+            RichSpan::styled(format!("✓{closed} "), tokens::success_text()),
+            RichSpan::styled(
+                format!("⏳{in_progress} "),
+                Style::new().fg(tokens::FG_WARNING),
+            ),
+            RichSpan::styled(
+                format!("⛔{blocked} "),
+                Style::new().fg(tokens::status_fg("blocked")),
+            ),
+            RichSpan::raw(format!("○{}", open_like.len() - in_progress - blocked)),
+        ]));
+        lines.push(RichLine::raw(""));
+
+        lines.push(RichLine::from_spans([label("Burndown:")]));
+        if duration > 0 && total > 0 {
+            const CHART_HEIGHT: usize = 5;
+            let chart_width = usize::try_from(duration.min(20)).unwrap_or(20);
+            let total_f = total as f64;
+            let remaining = (total - closed) as f64;
+            let band = total_f / CHART_HEIGHT as f64;
+            let passed_frac = passed as f64 / duration as f64;
+            for row in (0..CHART_HEIGHT).rev() {
+                let threshold = total_f * (row + 1) as f64 / CHART_HEIGHT as f64;
+                let mut spans = vec![RichSpan::raw("  ")];
+                for col in 0..=chart_width {
+                    let ideal = total_f * (1.0 - col as f64 / chart_width as f64);
+                    if ideal >= threshold - 0.5 && ideal < threshold + band {
+                        spans.push(RichSpan::styled("·", tokens::row_id()));
+                    } else if col <= (chart_width as f64 * passed_frac) as usize
+                        && remaining >= threshold - 0.5
+                        && remaining < threshold + band
+                    {
+                        spans.push(RichSpan::styled("●", tokens::primary_bold()));
+                    } else {
+                        spans.push(RichSpan::raw(" "));
+                    }
+                }
+                lines.push(RichLine::from_spans(spans));
+            }
+            lines.push(RichLine::raw(format!("  {}", "─".repeat(chart_width + 1))));
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "  · ideal  ● actual",
+                tokens::muted_text().italic(),
+            )]));
+        } else {
+            lines.push(RichLine::raw("  (insufficient data)"));
+        }
+        lines.push(RichLine::raw(""));
+
+        lines.push(RichLine::from_spans([label("At Risk:")]));
+        let at_risk = crate::analysis::alerts::detect_at_risk(
+            &self.analyzer.issues,
+            &sprint.bead_ids,
+            now,
+            crate::analysis::alerts::AtRiskThresholds::default(),
+        );
+        if at_risk.is_empty() {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "  ✓ No at-risk items",
+                tokens::success_text(),
+            )]));
+        }
+        for (idx, item) in at_risk.iter().enumerate() {
+            if idx >= 5 {
+                lines.push(RichLine::raw(format!("  … +{} more", at_risk.len() - 5)));
+                break;
+            }
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(
+                    &format!(
+                        "  ⚠ {} - {} ({})",
+                        item.id,
+                        truncate_with_ellipsis(&item.title, 30, "…"),
+                        item.signals.join(", ")
+                    ),
+                    width,
+                    "…",
+                ),
+                Style::new().fg(tokens::FG_WARNING),
+            )]));
+        }
+        lines.push(RichLine::raw(""));
+
+        lines.push(RichLine::from_spans([label("Beads in Sprint:")]));
+        for issue in sprint_issues.iter().take(10) {
+            let (icon, style) = if issue.is_closed_like() {
+                ("✓", tokens::success_text())
+            } else {
+                match issue.normalized_status().as_str() {
+                    "in_progress" => ("⏳", Style::new().fg(tokens::FG_WARNING)),
+                    "blocked" => ("⛔", Style::new().fg(tokens::status_fg("blocked"))),
+                    _ => ("○", Style::new()),
+                }
+            };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(
+                    &format!(
+                        "  {icon} {} - {}",
+                        issue.id,
+                        truncate_with_ellipsis(&issue.title, 40, "…")
+                    ),
+                    width,
+                    "…",
+                ),
+                style,
+            )]));
+        }
+        if total > 10 {
+            lines.push(RichLine::raw(format!("  … +{} more", total - 10)));
+        }
+        lines.push(RichLine::raw(""));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "S/esc: close sprint view • j/k: switch sprint",
+            tokens::muted_text().italic(),
+        )]));
+        lines
+    }
+
+    /// Whether the shortcuts sidebar is on and the terminal is wide enough
+    /// to show it beside a usable body.
+    fn shortcuts_sidebar_visible(&self) -> bool {
+        self.show_shortcuts_sidebar
+            && LAST_TERMINAL_WIDTH.with(Cell::get)
+                >= SHORTCUTS_SIDEBAR_WIDTH + SHORTCUTS_SIDEBAR_GAP + SHORTCUTS_MIN_BODY_WIDTH
+    }
+
+    /// `;`/F2: toggle Go bv's shortcuts sidebar.
+    fn toggle_shortcuts_sidebar(&mut self) {
+        self.show_shortcuts_sidebar = !self.show_shortcuts_sidebar;
+        self.shortcuts_sidebar_scroll = 0;
+        self.status_msg = if !self.show_shortcuts_sidebar {
+            String::new()
+        } else if self.shortcuts_sidebar_visible() {
+            "Shortcuts sidebar: ; hide | ctrl+↑/↓ scroll".to_string()
+        } else {
+            format!(
+                "Shortcuts sidebar needs a terminal at least {} columns wide (; to turn off)",
+                SHORTCUTS_SIDEBAR_WIDTH + SHORTCUTS_SIDEBAR_GAP + SHORTCUTS_MIN_BODY_WIDTH
+            )
+        };
+    }
+
+    /// The sidebar's sections for the current view, as Go bv's
+    /// `hardcodedSections` filtered by context, with bvr's keys.
+    fn shortcuts_sidebar_sections(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        let context = match self.mode {
+            ViewMode::Main if matches!(self.focus, FocusPane::Detail) => "detail",
+            ViewMode::Main => "list",
+            ViewMode::Board => "board",
+            ViewMode::Graph => "graph",
+            ViewMode::Insights => "insights",
+            ViewMode::History => "history",
+            ViewMode::Tree => "tree",
+            ViewMode::Actionable => "actionable",
+            _ => "label",
+        };
+        let mut sections = vec![(
+            "Navigation",
+            vec![
+                ("j/k", "Move ↓/↑"),
+                ("G/gg", "End/Start"),
+                ("^d/^u", "Page ↓/↑"),
+                ("Enter", "Details"),
+                ("Esc", "Back"),
+            ],
+        )];
+        let in_list = matches!(context, "list" | "detail");
+        if in_list {
+            sections.push((
+                "Views",
+                vec![
+                    ("a", "Actionable"),
+                    ("b", "Board"),
+                    ("g", "Graph"),
+                    ("H", "History"),
+                    ("i", "Insights"),
+                    ("E/T", "Tree"),
+                    ("[", "Label health"),
+                    ("]", "Attention"),
+                    ("f", "Flow matrix"),
+                    ("S", "Sprint"),
+                    ("!", "Alerts"),
+                    ("?", "Help"),
+                    (";", "This sidebar"),
+                    ("p", "Priority hints"),
+                ],
+            ));
+        }
+        let specific: Option<(&'static str, Vec<(&'static str, &'static str)>)> = match context {
+            "graph" => Some((
+                "Graph",
+                vec![
+                    ("hjkl", "Navigate"),
+                    ("Tab", "Edges"),
+                    ("/", "Search"),
+                    ("Enter", "Jump to issue"),
+                ],
+            )),
+            "insights" => Some((
+                "Insights",
+                vec![
+                    ("h/l", "Switch panel"),
+                    ("j/k", "Select item"),
+                    ("^j/^k", "Scroll detail"),
+                    ("e", "Explanations"),
+                    ("x", "Calc proof"),
+                    ("m", "Heatmap"),
+                    ("Enter", "Jump to issue"),
+                ],
+            )),
+            "history" => Some((
+                "History",
+                vec![
+                    ("v", "Git/Bead mode"),
+                    ("/", "Search"),
+                    ("j/k", "Navigate ↓/↑"),
+                    ("J/K", "Detail ↓/↑"),
+                    ("Tab", "Focus toggle"),
+                    ("y", "Copy SHA"),
+                    ("o", "Open in browser"),
+                    ("f", "File tree"),
+                    ("c", "Cycle filter"),
+                ],
+            )),
+            "board" => Some((
+                "Board",
+                vec![
+                    ("h/l", "Columns ←/→"),
+                    ("j/k", "Items ↓/↑"),
+                    ("Tab", "Toggle detail"),
+                    ("s", "Grouping"),
+                    ("e", "Empty lanes"),
+                    ("Enter", "Full view"),
+                ],
+            )),
+            "tree" => Some((
+                "Tree",
+                vec![
+                    ("h/l", "Fold/unfold"),
+                    ("Enter", "Toggle"),
+                    ("zR/zM", "Open/close all"),
+                    ("/", "Search"),
+                    ("Tab", "Detail"),
+                ],
+            )),
+            "actionable" => Some((
+                "Actionable",
+                vec![("j/k", "Items"), ("Tab", "Tracks/items"), ("Enter", "View")],
+            )),
+            "label" => Some((
+                "Labels",
+                vec![
+                    ("Enter", "Filter list"),
+                    ("Tab", "Detail"),
+                    ("1-9", "Attention rank"),
+                ],
+            )),
+            _ => None,
+        };
+        sections.extend(specific);
+        if in_list {
+            sections.push((
+                "Filters",
+                vec![
+                    ("o", "Open only"),
+                    ("c", "Closed only"),
+                    ("r", "Ready (no blocks)"),
+                    ("L", "Label picker"),
+                    ("/", "Search"),
+                ],
+            ));
+            sections.push((
+                "Actions",
+                vec![
+                    ("t", "Time-travel"),
+                    ("x", "Export .md"),
+                    ("C", "Copy ID"),
+                    ("O", "Open in $EDITOR"),
+                    ("'", "Recipe picker"),
+                    ("w", "Repo picker"),
+                ],
+            ));
+        }
+        sections
+    }
+
+    /// Go bv's shortcuts sidebar: a rounded box titled Shortcuts listing the
+    /// current view's key sections, scrollable with Ctrl+Up/Down.
+    fn render_shortcuts_sidebar(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_type(ftui::widgets::borders::BorderType::Rounded)
+            .border_style(tokens::row_id());
+        block.render(area, frame);
+        let inner = block_inner_rect(area);
+        let inner = Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        );
+        let width = usize::from(inner.width);
+        let pad = width.saturating_sub("Shortcuts".len()) / 2;
+        let mut lines = vec![RichLine::from_spans([
+            RichSpan::raw(" ".repeat(pad)),
+            RichSpan::styled("Shortcuts", tokens::primary_bold()),
+        ])];
+        for (title, items) in self.shortcuts_sidebar_sections() {
+            lines.push(RichLine::raw(""));
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                title,
+                tokens::row_id().bold(),
+            )]));
+            for (key, desc) in items {
+                lines.push(RichLine::from_spans([
+                    RichSpan::styled(format!("{key:<8}"), tokens::primary_bold()),
+                    RichSpan::raw(truncate_with_ellipsis(desc, width.saturating_sub(8), "…")),
+                ]));
+            }
+        }
+        let available = usize::from(inner.height).saturating_sub(1).max(1);
+        let max_scroll = lines.len().saturating_sub(available);
+        let offset = self.shortcuts_sidebar_scroll.min(max_scroll);
+        let footer = (offset * 100).checked_div(max_scroll).map_or_else(
+            || "; hide".to_string(),
+            |pct| format!("ctrl+↑/↓ scroll {pct}%"),
+        );
+        let mut shown: Vec<RichLine> = lines.into_iter().skip(offset).take(available).collect();
+        while shown.len() < available {
+            shown.push(RichLine::raw(""));
+        }
+        shown.push(RichLine::from_spans([RichSpan::styled(
+            footer,
+            tokens::footer_hint().italic(),
+        )]));
+        Paragraph::new(RichText::from_lines(shown))
+            .wrap(ftui::text::WrapMode::None)
+            .render(inner, frame);
+    }
+
+    /// Active alerts for the alerts panel: the `--robot-alerts` engine's
+    /// output minus the ones dismissed this session.
+    fn active_alert_rows(&self) -> Vec<AlertRow> {
+        self.analyzer
+            .alerts(&crate::analysis::alerts::AlertOptions::default())
+            .alerts
+            .into_iter()
+            .map(|alert| AlertRow {
+                key: format!(
+                    "{}:{}:{}",
+                    alert.alert_type.as_str(),
+                    alert.severity.as_str(),
+                    alert.issue_id.as_deref().unwrap_or_default()
+                ),
+                severity: alert.severity,
+                message: alert.message,
+                issue_id: alert.issue_id,
+                unblocks: alert.unblocks_count,
+                priority_sum: alert.downstream_priority_sum,
+            })
+            .filter(|row| !self.dismissed_alerts.contains(&row.key))
+            .collect()
+    }
+
+    /// `!`: open Go bv's alerts panel, or say there is nothing to show.
+    fn open_alerts_panel(&mut self) {
+        let rows = self.active_alert_rows();
+        if rows.is_empty() {
+            self.status_msg = "No active alerts".into();
+            return;
+        }
+        self.modal_overlay = Some(ModalOverlay::Alerts { rows, cursor: 0 });
+    }
+
+    fn handle_alerts_panel_key(&mut self, code: KeyCode, rows: &[AlertRow], cursor: usize) {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(ModalOverlay::Alerts { cursor, rows }) = &mut self.modal_overlay {
+                    *cursor = (*cursor + 1).min(rows.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(ModalOverlay::Alerts { cursor, .. }) = &mut self.modal_overlay {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                self.modal_overlay = None;
+                if let Some(id) = rows.get(cursor).and_then(|row| row.issue_id.clone()) {
+                    if !self.visible_issue_indices().iter().any(|&idx| {
+                        self.analyzer
+                            .issues
+                            .get(idx)
+                            .is_some_and(|issue| issue.id == id)
+                    }) {
+                        // Reveal an issue the current filter hides.
+                        self.set_list_filter(ListFilter::All);
+                        self.modal_label_filter = None;
+                        self.modal_repo_filter = None;
+                    }
+                    self.select_issue_by_id(&id);
+                    self.mode = ViewMode::Main;
+                    self.focus = FocusPane::List;
+                    self.ensure_selected_visible();
+                }
+            }
+            KeyCode::Char('d') => {
+                let Some(row) = rows.get(cursor) else {
+                    return;
+                };
+                self.dismissed_alerts.insert(row.key.clone());
+                let remaining: Vec<AlertRow> = rows
+                    .iter()
+                    .filter(|other| other.key != row.key)
+                    .cloned()
+                    .collect();
+                self.modal_overlay = if remaining.is_empty() {
+                    self.status_msg = "All alerts dismissed".into();
+                    None
+                } else {
+                    let cursor = cursor.min(remaining.len() - 1);
+                    Some(ModalOverlay::Alerts {
+                        rows: remaining,
+                        cursor,
+                    })
+                };
+            }
+            KeyCode::Escape | KeyCode::Char('q' | '!') => self.modal_overlay = None,
+            _ => {}
+        }
+    }
+
+    /// Go bv's alerts panel: a centered rounded box with the summary, one
+    /// line per alert (severity glyph and message), the selected alert's
+    /// issue and unblock details, and the key legend.
+    fn render_go_alerts_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &[AlertRow],
+        cursor: usize,
+    ) {
+        use crate::analysis::alerts::AlertSeverity;
+        let box_width = area.width.saturating_sub(4).min(80);
+        if box_width < 20 || area.height < 6 {
+            return;
+        }
+        let width = usize::from(box_width.saturating_sub(6));
+        let count =
+            |severity: AlertSeverity| rows.iter().filter(|row| row.severity == severity).count();
+        let mut summary = format!("{} total", rows.len());
+        for (severity, name) in [
+            (AlertSeverity::Critical, "critical"),
+            (AlertSeverity::Warning, "warning"),
+            (AlertSeverity::Info, "info"),
+        ] {
+            let n = count(severity);
+            if n > 0 {
+                summary.push_str(&format!(" • {n} {name}"));
+            }
+        }
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled("🔔 Alerts Panel", tokens::primary_bold())]),
+            RichLine::raw(""),
+            RichLine::from_spans([RichSpan::styled(summary, tokens::row_id())]),
+            RichLine::raw(""),
+        ];
+        let mut cursor_line = 0;
+        for (idx, row) in rows.iter().enumerate() {
+            let selected = idx == cursor;
+            let (icon, style) = match row.severity {
+                AlertSeverity::Critical => {
+                    ("⚠", Style::new().fg(tokens::status_fg("blocked")).bold())
+                }
+                AlertSeverity::Warning => ("⚡", Style::new().fg(tokens::FG_WARNING)),
+                AlertSeverity::Info => ("ℹ", tokens::row_id()),
+            };
+            if selected {
+                cursor_line = lines.len();
+            }
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(
+                    &format!(
+                        "{}{icon} {}",
+                        if selected { "▸ " } else { "  " },
+                        row.message
+                    ),
+                    width,
+                    "…",
+                ),
+                if selected { style.bold() } else { style },
+            )]));
+            if !selected {
+                continue;
+            }
+            if let Some(id) = row.issue_id.as_deref() {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    format!("     Issue: {id} (press Enter to jump)"),
+                    tokens::muted_text().italic(),
+                )]));
+            }
+            if let Some(unblocks) = row.unblocks.filter(|&n| n > 0) {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    format!(
+                        "     Unblocks {unblocks} items (priority sum: {})",
+                        row.priority_sum.unwrap_or_default()
+                    ),
+                    tokens::success_text(),
+                )]));
+            }
+        }
+        lines.push(RichLine::raw(""));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "j/k: navigate • Enter: jump to issue • d: dismiss • Esc: close",
+            tokens::muted_text().italic(),
+        )]));
+
+        let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let box_height = (content_height + 4).min(area.height);
+        let panel = Rect::new(
+            area.x + (area.width - box_width) / 2,
+            area.y + (area.height - box_height) / 2,
+            box_width,
+            box_height,
+        );
+        semantic_panel_block("", true, SemanticTone::Accent).render(panel, frame);
+        let inner = block_inner_rect(panel);
+        let body = Rect::new(
+            inner.x.saturating_add(2),
+            inner.y.saturating_add(1),
+            inner.width.saturating_sub(4),
+            inner.height.saturating_sub(2),
+        );
+        let visible = usize::from(body.height);
+        let offset = (cursor_line + 3).saturating_sub(visible);
+        Paragraph::new(RichText::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .scroll((saturating_scroll_offset(offset), 0))
+            .render(body, frame);
+    }
+
+    /// Go bv's per-label flow stats, highest blocking power first.
+    fn go_flow_label_stats(&self) -> Vec<GoFlowLabelStat> {
+        self.flow_matrix
+            .as_ref()
+            .map(go_flow_label_stats)
+            .unwrap_or_default()
+    }
+
+    /// The selected label's blocking relationships as (blocker, blocked)
+    /// issue-index pairs, sorted by IDs, as Go bv's flow drilldown lists
+    /// them.
+    fn go_flow_drilldown_pairs(&self) -> Vec<(usize, usize)> {
+        let Some(flow) = self.flow_matrix.as_ref() else {
+            return Vec::new();
+        };
+        let stats = self.go_flow_label_stats();
+        let Some(selected) = stats.get(self.flow_matrix_row_cursor) else {
+            return Vec::new();
+        };
+        let index: HashMap<&str, usize> = self
+            .analyzer
+            .issues
+            .iter()
+            .enumerate()
+            .map(|(idx, issue)| (issue.id.as_str(), idx))
+            .collect();
+        let mut pairs: Vec<(&str, &str)> = flow
+            .dependencies
+            .iter()
+            .filter(|dep| dep.from_label == selected.label || dep.to_label == selected.label)
+            .flat_map(|dep| dep.blocking_pairs.iter())
+            .map(|pair| (pair.blocker_id.as_str(), pair.blocked_id.as_str()))
+            .filter(|(blocker, blocked)| index.contains_key(blocker) && index.contains_key(blocked))
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+            .into_iter()
+            .map(|(blocker, blocked)| (index[blocker], index[blocked]))
+            .collect()
+    }
+
+    /// The issue under the flow drilldown cursor (pairs flatten to
+    /// blocker, blocked, blocker, ...).
+    fn go_flow_drilldown_issue(&self) -> Option<&Issue> {
+        let cursor = self.flow_drilldown?;
+        let pairs = self.go_flow_drilldown_pairs();
+        let (source, target) = pairs.get(cursor / 2)?;
+        self.analyzer
+            .issues
+            .get(if cursor % 2 == 0 { *source } else { *target })
+    }
+
+    /// Render the flow matrix as Go bv's `FlowMatrixModel`: a DEPENDENCY
+    /// FLOW header with totals, labels ranked by blocking power with bars,
+    /// and the selected label's impact panel (blocking power, bottleneck
+    /// flag, BLOCKS → / ← BLOCKED BY columns); Enter drills into the
+    /// blocking pairs behind those numbers.
+    fn render_go_flow_matrix(&self, frame: &mut Frame, area: Rect) {
+        let width = usize::from(area.width);
+        let Some(flow) = self
+            .flow_matrix
+            .as_ref()
+            .filter(|flow| !flow.labels.is_empty())
+        else {
+            Paragraph::new("No cross-label dependencies found").render(area, frame);
+            return;
+        };
+        let rule = |w: usize| {
+            RichLine::from_spans([RichSpan::styled("─".repeat(w), tokens::muted_text())])
+        };
+        if self.flow_drilldown.is_some() {
+            Paragraph::new(RichText::from_lines(
+                self.go_flow_drilldown_lines(width, usize::from(area.height)),
+            ))
+            .wrap(ftui::text::WrapMode::None)
+            .render(area, frame);
+            return;
+        }
+
+        let stats = go_flow_label_stats(flow);
+        let mut lines = vec![
+            RichLine::from_spans([
+                RichSpan::styled("DEPENDENCY FLOW  ", tokens::primary_bold()),
+                RichSpan::styled(
+                    format!(
+                        "│ {} labels │ {} cross-label deps │ {} bottlenecks",
+                        flow.labels.len(),
+                        flow.total_cross_label_deps,
+                        flow.bottleneck_labels.len()
+                    ),
+                    Style::new().fg(tokens::FG_SUBTEXT),
+                ),
+            ]),
+            rule(width),
+        ];
+        let body_height = usize::from(area.height).saturating_sub(4);
+        let left_width = (width * 35 / 100).max(25).min(width.saturating_sub(13));
+        let right_width = width.saturating_sub(left_width + 3);
+        let left = self.go_flow_labels_panel(&stats, left_width, body_height);
+        let right = self.go_flow_detail_panel(flow, &stats, right_width);
+        for row in 0..body_height {
+            let mut spans: Vec<RichSpan<'static>> = left
+                .get(row)
+                .map(|line| line.spans().to_vec())
+                .unwrap_or_default();
+            let used: usize = spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            spans.push(RichSpan::raw(" ".repeat(left_width.saturating_sub(used))));
+            spans.push(RichSpan::styled(" │ ", tokens::muted_text()));
+            if let Some(line) = right.get(row) {
+                spans.extend(line.spans().iter().cloned());
+            }
+            lines.push(RichLine::from_spans(spans));
+        }
+        lines.push(rule(width));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "j/k: navigate  Enter: drill down  Tab: switch panel  Esc: close",
+            Style::new().fg(tokens::FG_SUBTEXT),
+        )]));
+        Paragraph::new(RichText::from_lines(lines))
+            .wrap(ftui::text::WrapMode::None)
+            .render(area, frame);
+    }
+
+    fn go_flow_labels_panel(
+        &self,
+        stats: &[GoFlowLabelStat],
+        width: usize,
+        height: usize,
+    ) -> Vec<RichLine> {
+        let focus = if matches!(self.focus, FocusPane::Detail) {
+            " "
+        } else {
+            "▸"
+        };
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled(
+                format!("{focus} LABELS (by blocking power)"),
+                tokens::row_id().bold(),
+            )]),
+            RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]),
+        ];
+        let max_out = stats
+            .iter()
+            .map(|stat| stat.outgoing)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let bar_width = width.saturating_sub(20).max(5);
+        let rows = height.saturating_sub(2).max(1);
+        let cursor = self
+            .flow_matrix_row_cursor
+            .min(stats.len().saturating_sub(1));
+        let start = Self::go_history_scroll_start(cursor, rows);
+        for (idx, stat) in stats.iter().enumerate().skip(start).take(rows) {
+            let color = if stat.is_bottleneck {
+                tokens::status_fg("blocked")
+            } else if stat.score > 0.5 {
+                tokens::FG_WARNING
+            } else if stat.outgoing > 0 {
+                tokens::PRIO_P2
+            } else {
+                tokens::FG_SUBTEXT
+            };
+            let filled = (stat.outgoing * bar_width / max_out).min(bar_width);
+            let label = truncate_with_ellipsis(&stat.label, 12, "…");
+            let spans = vec![
+                RichSpan::styled(
+                    format!("{label}{} ", " ".repeat(12 - display_width(&label))),
+                    Style::new().fg(color),
+                ),
+                RichSpan::styled("█".repeat(filled), Style::new().fg(color)),
+                RichSpan::styled("░".repeat(bar_width - filled), tokens::muted_text()),
+                RichSpan::raw(format!(" {:>3}", stat.outgoing)),
+            ];
+            lines.push(if idx == cursor {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        lines
+    }
+
+    fn go_flow_detail_panel(
+        &self,
+        flow: &crate::analysis::label_intel::CrossLabelFlow,
+        stats: &[GoFlowLabelStat],
+        width: usize,
+    ) -> Vec<RichLine> {
+        let Some(stat) = stats.get(
+            self.flow_matrix_row_cursor
+                .min(stats.len().saturating_sub(1)),
+        ) else {
+            return vec![RichLine::raw("Select a label")];
+        };
+        let focus = if matches!(self.focus, FocusPane::Detail) {
+            "▸"
+        } else {
+            " "
+        };
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&format!("{focus} {}", stat.label), width, "…"),
+                tokens::primary_bold(),
+            )]),
+            RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]),
+            RichLine::raw(""),
+            RichLine::from_spans([RichSpan::styled(
+                "IMPACT SUMMARY",
+                Style::new().fg(tokens::FG_SUBTEXT),
+            )]),
+        ];
+        let (level, color) = if stat.score > 0.7 {
+            ("HIGH", tokens::status_fg("blocked"))
+        } else if stat.score > 0.3 {
+            ("Medium", tokens::FG_WARNING)
+        } else {
+            ("Low", tokens::status_fg("open"))
+        };
+        let filled = ((stat.score * 20.0) as usize).min(20);
+        lines.push(RichLine::from_spans([
+            RichSpan::raw("  Blocking Power: "),
+            RichSpan::styled("█".repeat(filled), Style::new().fg(color)),
+            RichSpan::styled("░".repeat(20 - filled), tokens::muted_text()),
+            RichSpan::raw(" "),
+            RichSpan::styled(level, Style::new().fg(color).bold()),
+        ]));
+        if stat.is_bottleneck {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "  ⚠ BOTTLENECK",
+                Style::new().fg(tokens::status_fg("blocked")).bold(),
+            )]));
+        }
+        lines.push(RichLine::raw(""));
+
+        let half = width.saturating_sub(4) / 2;
+        let column = |spans: Vec<RichSpan<'static>>| {
+            let used: usize = spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            let mut spans = spans;
+            spans.push(RichSpan::raw(" ".repeat(half.saturating_sub(used) + 2)));
+            spans
+        };
+        let mut header = column(vec![RichSpan::styled(
+            format!("BLOCKS → ({})", stat.outgoing),
+            Style::new().fg(tokens::status_fg("blocked")).bold(),
+        )]);
+        header.push(RichSpan::styled(
+            format!("← BLOCKED BY ({})", stat.incoming),
+            Style::new().fg(tokens::status_fg("in_progress")).bold(),
+        ));
+        lines.push(RichLine::from_spans(header));
+
+        let label_index: HashMap<&str, usize> = flow
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(idx, label)| (label.as_str(), idx))
+            .collect();
+        let count = |from: &str, to: &str| -> usize {
+            match (label_index.get(from), label_index.get(to)) {
+                (Some(&i), Some(&j)) => usize::try_from(flow.flow_matrix[i][j]).unwrap_or(0),
+                _ => 0,
+            }
+        };
+        let entry = |label: &str, n: usize| -> Vec<RichSpan<'static>> {
+            let (bar, rest) = go_flow_mini_bar(n, 5);
+            vec![
+                RichSpan::raw("  "),
+                bar,
+                RichSpan::raw(rest),
+                RichSpan::raw(truncate_with_ellipsis(
+                    &format!(" {label} ({n})"),
+                    half.saturating_sub(7).max(4),
+                    "…",
+                )),
+            ]
+        };
+        const MAX_ENTRIES: usize = 6;
+        for i in 0..MAX_ENTRIES {
+            let left = stat
+                .outgoing_labels
+                .get(i)
+                .map(|label| entry(label, count(&stat.label, label)))
+                .unwrap_or_default();
+            let right = stat
+                .incoming_labels
+                .get(i)
+                .map(|label| entry(label, count(label, &stat.label)))
+                .unwrap_or_default();
+            if left.is_empty() && right.is_empty() {
+                break;
+            }
+            let mut spans = column(left);
+            spans.extend(right);
+            lines.push(RichLine::from_spans(spans));
+        }
+        if stat.outgoing_labels.len() > MAX_ENTRIES || stat.incoming_labels.len() > MAX_ENTRIES {
+            let more = |n: usize| {
+                if n > MAX_ENTRIES {
+                    format!("  +{} more", n - MAX_ENTRIES)
+                } else {
+                    String::new()
+                }
+            };
+            let mut spans = column(vec![RichSpan::styled(
+                more(stat.outgoing_labels.len()),
+                tokens::muted_text().italic(),
+            )]);
+            spans.push(RichSpan::styled(
+                more(stat.incoming_labels.len()),
+                tokens::muted_text().italic(),
+            ));
+            lines.push(RichLine::from_spans(spans));
+        }
+        lines.push(RichLine::raw(""));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "Press Enter to see issues",
+            Style::new().fg(tokens::FG_SUBTEXT).italic(),
+        )]));
+        lines
+    }
+
+    /// Go bv's flow drilldown: the selected label's blocking pairs as
+    /// blocker / `blocks` blocked rows with status dots.
+    fn go_flow_drilldown_lines(&self, width: usize, height: usize) -> Vec<RichLine> {
+        let label = self
+            .go_flow_label_stats()
+            .get(self.flow_matrix_row_cursor)
+            .map(|stat| stat.label.clone())
+            .unwrap_or_default();
+        let pairs = self.go_flow_drilldown_pairs();
+        let rule =
+            || RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]);
+        let mut lines = vec![
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(
+                    &format!(
+                        "Dependencies involving: {label} ({} relationships)",
+                        pairs.len()
+                    ),
+                    width,
+                    "…",
+                ),
+                tokens::primary_bold(),
+            )]),
+            rule(),
+            RichLine::raw(""),
+        ];
+        if pairs.is_empty() {
+            lines.push(RichLine::raw("No blocking relationships found"));
+            return lines;
+        }
+        let endpoints: Vec<(usize, bool)> = pairs
+            .iter()
+            .flat_map(|&(blocker, blocked)| [(blocker, false), (blocked, true)])
+            .collect();
+        let rows = (height.saturating_sub(8) / 2 * 2).max(2);
+        let cursor = self.flow_drilldown.unwrap_or(0).min(endpoints.len() - 1);
+        let start = Self::go_history_scroll_start(cursor, rows) / 2 * 2;
+        for (idx, &(issue_index, is_blocked)) in endpoints.iter().enumerate().skip(start).take(rows)
+        {
+            let Some(issue) = self.analyzer.issues.get(issue_index) else {
+                continue;
+            };
+            let prefix = if is_blocked { "  blocks " } else { "" };
+            let spans = vec![
+                RichSpan::styled("● ", Style::new().fg(tokens::status_fg(&issue.status))),
+                RichSpan::raw(truncate_with_ellipsis(
+                    &format!("{prefix}{} {}", issue.id, issue.title),
+                    width.saturating_sub(2),
+                    "…",
+                )),
+            ];
+            lines.push(if idx == cursor {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        lines.push(RichLine::raw(""));
+        lines.push(rule());
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "j/k: endpoint  Enter: details  Esc: back",
+            Style::new().fg(tokens::FG_SUBTEXT),
+        )]));
+        lines
+    }
+
+    /// Enter (or a 1-9 rank key) on a label view: filter the issue list by
+    /// that label and return to it, as Go bv does.
+    fn filter_list_by_label_from_view(&mut self, label: &str) {
+        self.modal_label_filter = None;
+        self.set_label_filter(label);
+        self.mode = ViewMode::Main;
+        self.focus = FocusPane::List;
+        self.detail_scroll_offset = 0;
+    }
+
+    fn selected_dashboard_label(&self) -> Option<String> {
+        self.label_dashboard
+            .as_ref()
+            .and_then(|result| result.labels.get(self.label_dashboard_cursor))
+            .map(|label| label.label.clone())
+    }
+
+    fn attention_label_at(&self, rank_index: usize) -> Option<String> {
+        self.attention_result
+            .as_ref()
+            .and_then(|result| result.labels.get(rank_index))
+            .filter(|_| rank_index < ATTENTION_ROW_LIMIT)
+            .map(|score| score.label.clone())
+    }
+
+    /// Render the history view as Go bv does: a four-line header (title and
+    /// mode, stats badges, filter status, rule) over rounded panes — beads |
+    /// commits | details, with a timeline pane in wide bead mode, and
+    /// commits | related beads | details in git mode.
+    fn render_go_history(&self, frame: &mut Frame, area: Rect) {
+        let body = history_body_rect(area);
+        let header = Rect::new(area.x, area.y, area.width, body.y - area.y);
+        Paragraph::new(RichText::from_lines(
+            self.go_history_header_lines(usize::from(area.width)),
+        ))
+        .wrap(ftui::text::WrapMode::None)
+        .render(header, frame);
+        if body.height < 3 {
+            return;
+        }
+
+        let git = matches!(self.history_view_mode, HistoryViewMode::Git);
+        let layout = HistoryLayout::from_width(area.width);
+        let split_state = pane_split_state();
+        let list_focused = self.focus == FocusPane::List && !self.history_file_tree_focus;
+        let middle_focused = self.focus == FocusPane::Middle;
+        let detail_focused = self.focus == FocusPane::Detail;
+
+        let render_panel = |frame: &mut Frame, area: Rect, focused: bool, lines: Vec<RichLine>| {
+            semantic_panel_block("", focused, SemanticTone::Accent).render(area, frame);
+            Paragraph::new(RichText::from_lines(lines))
+                .wrap(ftui::text::WrapMode::None)
+                .render(block_inner_rect(area), frame);
+        };
+        let render_list = |frame: &mut Frame, area: Rect| {
+            let (list_area, tree_area) = if self.history_show_file_tree && area.height >= 10 {
+                let tree_height = area.height / 2;
+                (
+                    Rect::new(area.x, area.y, area.width, area.height - tree_height),
+                    Some(Rect::new(
+                        area.x,
+                        area.y + area.height - tree_height,
+                        area.width,
+                        tree_height,
+                    )),
+                )
+            } else {
+                (area, None)
+            };
+            let inner = block_inner_rect(list_area);
+            let lines = if git {
+                self.go_history_commit_list_lines(usize::from(inner.width), inner.height)
+            } else {
+                self.go_history_bead_list_lines(usize::from(inner.width), inner.height)
+            };
+            render_panel(frame, list_area, list_focused, lines);
+            if let Some(tree_area) = tree_area {
+                let inner = block_inner_rect(tree_area);
+                render_panel(
+                    frame,
+                    tree_area,
+                    self.history_file_tree_focus,
+                    self.go_history_file_tree_lines(usize::from(inner.width), inner.height),
+                );
+            }
+        };
+        let render_middle = |frame: &mut Frame, area: Rect| {
+            let inner = block_inner_rect(area);
+            let lines = if git {
+                self.go_history_related_bead_lines(usize::from(inner.width), inner.height)
+            } else {
+                self.go_history_bead_commit_lines(usize::from(inner.width), inner.height)
+            };
+            render_panel(frame, area, middle_focused, lines);
+        };
+        let render_detail = |frame: &mut Frame, area: Rect| {
+            let inner = block_inner_rect(area);
+            let lines = if git {
+                self.go_history_git_detail_lines(usize::from(inner.width), inner.height)
+            } else {
+                self.go_history_bead_detail_lines(usize::from(inner.width), inner.height)
+            };
+            render_panel(frame, area, detail_focused, lines);
+            record_detail_content_area(inner);
+        };
+
+        if !layout.has_middle_pane() {
+            let bp = Breakpoint::from_width(area.width);
+            let panes = Flex::horizontal()
+                .constraints([
+                    Constraint::Percentage(split_state.two_pane_list_pct(bp)),
+                    Constraint::Percentage(split_state.two_pane_detail_pct(bp)),
+                ])
+                .split(body);
+            render_list(frame, panes[0]);
+            render_detail(frame, panes[1]);
+            return;
+        }
+
+        match split_state.history_pcts(layout, self.history_view_mode) {
+            PaneSplitPreset::Two(pcts) => {
+                let panes = Flex::horizontal()
+                    .constraints(pcts.map(Constraint::Percentage))
+                    .split(body);
+                render_list(frame, panes[0]);
+                render_detail(frame, panes[1]);
+            }
+            PaneSplitPreset::Four(pcts) => {
+                let panes = Flex::horizontal()
+                    .constraints(pcts.map(Constraint::Percentage))
+                    .split(body);
+                render_list(frame, panes[0]);
+                let inner = block_inner_rect(panes[1]);
+                render_panel(
+                    frame,
+                    panes[1],
+                    false,
+                    self.go_history_timeline_lines(panes[1], usize::from(inner.width)),
+                );
+                render_middle(frame, panes[2]);
+                render_detail(frame, panes[3]);
+            }
+            PaneSplitPreset::Three(pcts) => {
+                let panes = Flex::horizontal()
+                    .constraints(pcts.map(Constraint::Percentage))
+                    .split(body);
+                render_list(frame, panes[0]);
+                render_middle(frame, panes[1]);
+                render_detail(frame, panes[2]);
+            }
+        }
+    }
+
+    /// Go bv's history header: `HISTORY ◈ Beads` with the search box or
+    /// close hint on the right, the stats badges, the filter status, and a
+    /// full-width rule.
+    fn go_history_header_lines(&self, width: usize) -> Vec<RichLine> {
+        let git = matches!(self.history_view_mode, HistoryViewMode::Git);
+        let mut title = vec![
+            RichSpan::styled(" HISTORY ", tokens::primary_bold()),
+            RichSpan::styled(
+                if git { " ◉ Git " } else { " ◈ Beads " },
+                Style::new().fg(tokens::status_fg("in_progress")).bold(),
+            ),
+        ];
+        let right = if self.history_search_active {
+            vec![
+                RichSpan::styled("╭ ", tokens::primary_bold()),
+                RichSpan::styled(
+                    format!("[{}] ", self.history_search_mode.label()),
+                    tokens::row_id(),
+                ),
+                RichSpan::raw(format!("{}▏", self.history_search_query)),
+                RichSpan::styled(" ╮", tokens::primary_bold()),
+                RichSpan::styled(" [Esc] cancel ", tokens::muted_text()),
+            ]
+        } else {
+            vec![RichSpan::styled(
+                " [/] search  [H] close ",
+                tokens::muted_text(),
+            )]
+        };
+        let used: usize = title
+            .iter()
+            .chain(right.iter())
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        title.push(RichSpan::raw(" ".repeat(width.saturating_sub(used).max(1))));
+        title.extend(right);
+
+        // Stats badges.
+        let value = |text: String| RichSpan::styled(text, tokens::primary_bold());
+        let label = |text: &str| RichSpan::styled(text.to_string(), tokens::row_id());
+        let mut badges: Vec<Vec<RichSpan<'static>>> = Vec::new();
+        if let Some(cache) = self.history_git_cache.as_ref() {
+            let commit_index: BTreeMap<String, Vec<String>> = cache
+                .commit_bead_confidence
+                .iter()
+                .map(|(sha, beads)| {
+                    (
+                        sha.clone(),
+                        beads.iter().map(|(id, _)| id.clone()).collect(),
+                    )
+                })
+                .collect();
+            let stats = crate::analysis::git_history::compute_history_stats(
+                &cache.histories,
+                &commit_index,
+                BTreeMap::new(),
+            );
+            badges.push(vec![
+                value(stats.beads_with_commits.to_string()),
+                label(" beads"),
+            ]);
+            badges.push(vec![
+                value(stats.total_commits.to_string()),
+                label(" commits"),
+            ]);
+            badges.push(vec![
+                value(stats.unique_authors.to_string()),
+                label(" authors"),
+            ]);
+            if let Some(days) = stats.avg_cycle_time_days {
+                badges.push(vec![
+                    label("⌀ "),
+                    value(go_format_cycle_time(days)),
+                    label(" cycle"),
+                ]);
+            }
+            if stats.avg_commits_per_bead > 0.0 {
+                badges.push(vec![
+                    value(format!("{:.1}", stats.avg_commits_per_bead)),
+                    label(" commits/bead"),
+                ]);
+            }
+        } else {
+            badges.push(vec![
+                value(self.analyzer.issues.len().to_string()),
+                label(" beads"),
+            ]);
+            badges.push(vec![label("git history not loaded")]);
+        }
+        let mut stats = vec![RichSpan::raw(" ")];
+        for (idx, badge) in badges.into_iter().enumerate() {
+            if idx > 0 {
+                stats.push(RichSpan::styled("  •  ", tokens::muted_text()));
+            }
+            stats.extend(badge);
+        }
+
+        // Filter status.
+        let mut active = Vec::new();
+        let min_confidence = self.history_min_confidence();
+        if min_confidence > 0.0 {
+            active.push(format!("≥{:.0}% conf", min_confidence * 100.0));
+        }
+        if let Some(path) = self.history_file_tree_filter.as_deref() {
+            active.push(format!("file:{path}"));
+        }
+        let query = self.history_search_query.trim();
+        if !query.is_empty() {
+            active.push(format!("\"{query}\""));
+        }
+        let mut filter = Vec::new();
+        if !active.is_empty() {
+            filter.push(RichSpan::styled(
+                format!(" Filter: {} ", active.join(", ")),
+                tokens::row_id(),
+            ));
+            filter.push(RichSpan::styled(" │ ", tokens::muted_text()));
+        }
+        let showing = if git {
+            let total = self
+                .history_git_cache
+                .as_ref()
+                .map_or(0, |cache| cache.commits.len());
+            let shown = self.history_git_visible_commit_indices().len();
+            if shown == total {
+                format!(" Showing all {total} commits")
+            } else {
+                format!(" Showing {shown}/{total} commits")
+            }
+        } else {
+            let total = self.visible_issue_indices().len();
+            let shown = self.history_visible_issue_indices().len();
+            if shown == total {
+                format!(" Showing all {total} beads")
+            } else {
+                format!(" Showing {shown}/{total} beads")
+            }
+        };
+        filter.push(RichSpan::styled(showing, tokens::muted_text().italic()));
+
+        vec![
+            RichLine::from_spans(title),
+            RichLine::from_spans(stats),
+            RichLine::from_spans(filter),
+            RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]),
+        ]
+    }
+
+    /// Bold primary pane header plus its rule, as every Go history pane has.
+    fn go_history_pane_header(title: &str, width: usize) -> [RichLine; 2] {
+        [
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(title, width, "…"),
+                tokens::primary_bold(),
+            )]),
+            RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]),
+        ]
+    }
+
+    /// First row to show so that `selected` stays inside `rows` visible rows.
+    const fn go_history_scroll_start(selected: usize, rows: usize) -> usize {
+        if rows == 0 || selected < rows {
+            0
+        } else {
+            selected + 1 - rows
+        }
+    }
+
+    /// Lifecycle events for a bead: git-derived when correlation ran,
+    /// otherwise from the bead's own created/updated/closed timestamps.
+    fn go_history_events(&self, issue_id: &str) -> Vec<GoHistoryEvent> {
+        if let Some(history) = self
+            .history_git_cache
+            .as_ref()
+            .and_then(|cache| cache.histories.get(issue_id))
+            .filter(|history| !history.events.is_empty())
+        {
+            return history
+                .events
+                .iter()
+                .map(|event| GoHistoryEvent {
+                    kind: event.event_type.clone(),
+                    at: parse_history_timestamp(&event.timestamp),
+                    author: event.author.clone(),
+                })
+                .collect();
+        }
+        self.analyzer
+            .history(Some(issue_id), 1)
+            .into_iter()
+            .next()
+            .map(|history| {
+                history
+                    .events
+                    .into_iter()
+                    .filter(|event| event.kind != "dependency")
+                    .map(|event| GoHistoryEvent {
+                        kind: event.kind,
+                        at: event.timestamp,
+                        author: String::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Left pane in bead mode: `BEADS WITH HISTORY` rows of status glyph,
+    /// ID, title, commit count, and lifecycle-event badge.
+    fn go_history_bead_list_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let mut lines = Vec::from(Self::go_history_pane_header("BEADS WITH HISTORY", width));
+        let visible = self.history_visible_issue_indices();
+        if visible.is_empty() {
+            let query = self.history_search_query.trim();
+            let message = if !query.is_empty() {
+                format!("No beads match \"{query}\"")
+            } else if self.visible_issue_indices().is_empty() {
+                format!("No issues match filter: {}", self.list_filter.label())
+            } else {
+                "No beads match the current filters".to_string()
+            };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&message, width, "…"),
+                tokens::muted_text(),
+            )]));
+            return lines;
+        }
+        let rows = usize::from(height).saturating_sub(2);
+        let selected_pos = visible
+            .iter()
+            .position(|&index| index == self.selected)
+            .unwrap_or(0);
+        let start = Self::go_history_scroll_start(selected_pos, rows);
+        let has_git = self.history_git_cache.is_some();
+        let id_width = visible
+            .iter()
+            .skip(start)
+            .take(rows)
+            .filter_map(|&index| self.analyzer.issues.get(index))
+            .map(|issue| display_width(&issue.id))
+            .max()
+            .unwrap_or(1)
+            .min(12)
+            .min(width / 3);
+        for &index in visible.iter().skip(start).take(rows) {
+            let Some(issue) = self.analyzer.issues.get(index) else {
+                continue;
+            };
+            let selected = index == self.selected;
+            let commit_count = if has_git {
+                format!(
+                    "{} commits",
+                    self.history_filtered_bead_commits(&issue.id).len()
+                )
+            } else {
+                String::new()
+            };
+            let events = self.go_history_events(&issue.id).len();
+            // The event badge gives way before the title shrinks to nothing.
+            let fixed = 2 + 2 + id_width + 1 + display_width(&commit_count) + 1;
+            let badge = if events > 0 && fixed + 4 + display_width(&format!(" ⚡{events}")) <= width
+            {
+                format!("⚡{events}")
+            } else {
+                String::new()
+            };
+            let right_width = display_width(&commit_count)
+                + if badge.is_empty() {
+                    0
+                } else {
+                    display_width(&badge) + 1
+                };
+            let title_width = width.saturating_sub(2 + 2 + id_width + 1 + right_width + 1);
+            let title = truncate_with_ellipsis(&issue.title, title_width, "…");
+            let title_pad = title_width.saturating_sub(display_width(&title));
+            let highlight = selected && self.focus == FocusPane::List;
+            let mut spans = vec![
+                RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                RichSpan::styled(
+                    format!("{} ", go_history_status_icon(&issue.status)),
+                    Style::new().fg(tokens::status_fg(&issue.status)),
+                ),
+                RichSpan::styled(
+                    format!(
+                        "{:<id_width$} ",
+                        truncate_with_ellipsis(&issue.id, id_width, "…")
+                    ),
+                    if highlight {
+                        tokens::primary_bold()
+                    } else {
+                        tokens::row_id()
+                    },
+                ),
+                RichSpan::styled(
+                    format!("{title}{} ", " ".repeat(title_pad)),
+                    tokens::row_title(highlight),
+                ),
+                RichSpan::styled(commit_count, tokens::muted_text()),
+            ];
+            if !badge.is_empty() {
+                spans.push(RichSpan::raw(" "));
+                spans.push(RichSpan::styled(badge, tokens::row_id()));
+            }
+            lines.push(if selected {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        lines
+    }
+
+    /// Left pane in git mode: `COMMITS` rows of short SHA, subject, and the
+    /// count of related beads.
+    fn go_history_commit_list_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let mut lines = Vec::from(Self::go_history_pane_header("COMMITS", width));
+        let Some(cache) = self.history_git_cache.as_ref() else {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                self.history_load_message(),
+                tokens::muted_text(),
+            )]));
+            return lines;
+        };
+        let visible = self.history_git_visible_commit_indices();
+        if visible.is_empty() {
+            let query = self.history_search_query.trim();
+            let message = if query.is_empty() {
+                "No commits with bead correlations found".to_string()
+            } else {
+                format!("No commits match \"{query}\"")
+            };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&message, width, "…"),
+                tokens::muted_text(),
+            )]));
+            return lines;
+        }
+        let rows = usize::from(height).saturating_sub(2);
+        let cursor = self.history_event_cursor.min(visible.len() - 1);
+        let start = Self::go_history_scroll_start(cursor, rows);
+        for (slot, &commit_idx) in visible.iter().enumerate().skip(start).take(rows) {
+            let Some(commit) = cache.commits.get(commit_idx) else {
+                continue;
+            };
+            let selected = slot == cursor;
+            let highlight = selected && self.focus == FocusPane::List;
+            let count = format!(
+                "[{}]",
+                self.history_git_related_beads_for_commit(&commit.sha).len()
+            );
+            let subject = commit.message.lines().next().unwrap_or_default();
+            let msg_width = width.saturating_sub(
+                2 + display_width(&commit.short_sha) + 1 + 1 + display_width(&count),
+            );
+            let msg = truncate_with_ellipsis(subject, msg_width, "…");
+            let pad = msg_width.saturating_sub(display_width(&msg));
+            let sha_style = if highlight {
+                tokens::primary_bold()
+            } else {
+                Style::new().fg(tokens::status_fg("review"))
+            };
+            let spans = vec![
+                RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                RichSpan::styled(format!("{} ", commit.short_sha), sha_style),
+                RichSpan::styled(
+                    format!("{msg}{} ", " ".repeat(pad)),
+                    tokens::row_title(highlight),
+                ),
+                RichSpan::styled(count, tokens::row_id()),
+            ];
+            lines.push(if selected {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        lines
+    }
+
+    /// Middle pane in bead mode: the selected bead's commits, scrolled to
+    /// the commit cursor, with Go's `↕ shown/total (pct%)` indicator.
+    fn go_history_bead_commit_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let mut lines = Vec::from(Self::go_history_pane_header("COMMITS", width));
+        let Some(issue) = self.selected_issue() else {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "Select a bead to view commits",
+                tokens::muted_text(),
+            )]));
+            return lines;
+        };
+        let commits = self.history_filtered_bead_commits(&issue.id);
+        if commits.is_empty() {
+            let message = if self.history_git_cache.is_none()
+                && (self.history_load.requested
+                    || self.history_load.cancellation.is_some()
+                    || self.history_load.error.is_some())
+            {
+                self.history_load_message()
+            } else {
+                format!("No commits correlated with {}", issue.id)
+            };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&message, width, "…"),
+                tokens::muted_text(),
+            )]));
+            return lines;
+        }
+        let total = commits.len();
+        let mut rows = usize::from(height).saturating_sub(2);
+        if total > rows {
+            rows = rows.saturating_sub(1);
+        }
+        let cursor = self.history_bead_commit_cursor.min(total - 1);
+        let start = Self::go_history_scroll_start(cursor, rows);
+        let end = (start + rows).min(total);
+        for (idx, commit) in commits.iter().enumerate().take(end).skip(start) {
+            let selected = idx == cursor && self.focus == FocusPane::Middle;
+            let msg_width = width.saturating_sub(2 + display_width(&commit.short_sha) + 1);
+            let subject = commit.message.lines().next().unwrap_or_default();
+            let spans = vec![
+                RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                RichSpan::styled(
+                    format!("{} ", commit.short_sha),
+                    if selected {
+                        tokens::primary_bold()
+                    } else {
+                        Style::new().fg(tokens::status_fg("review"))
+                    },
+                ),
+                RichSpan::styled(
+                    truncate_with_ellipsis(subject, msg_width, "…"),
+                    tokens::row_title(selected),
+                ),
+            ];
+            lines.push(if selected {
+                go_highlight_row(spans, width)
+            } else {
+                RichLine::from_spans(spans)
+            });
+        }
+        if total > rows {
+            let max_scroll = total - rows;
+            let pct = start * 100 / max_scroll.max(1);
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                format!("↕ {end}/{total} ({pct}%)"),
+                tokens::muted_text().italic(),
+            )]));
+        }
+        lines
+    }
+
+    /// Middle pane in git mode: beads related to the selected commit.
+    fn go_history_related_bead_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let mut lines = Vec::from(Self::go_history_pane_header("RELATED BEADS", width));
+        let Some(commit) = self.selected_history_git_commit() else {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "Select a commit to view beads",
+                tokens::muted_text(),
+            )]));
+            return lines;
+        };
+        let related = self.history_git_related_beads_for_commit(&commit.sha);
+        let total = related.len();
+        let mut rows = usize::from(height).saturating_sub(2);
+        if total > rows {
+            rows = rows.saturating_sub(1);
+        }
+        let cursor = self
+            .history_related_bead_cursor
+            .min(total.saturating_sub(1));
+        let start = Self::go_history_scroll_start(cursor, rows);
+        let end = (start + rows).min(total);
+        for (idx, bead_id) in related.iter().enumerate().take(end).skip(start) {
+            let selected = idx == cursor && self.focus == FocusPane::Middle;
+            lines.push(self.go_history_related_bead_row(bead_id, selected, width, false));
+        }
+        if total > rows {
+            let pct = start * 100 / (total - rows).max(1);
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                format!("↕ {end}/{total} ({pct}%)"),
+                tokens::muted_text().italic(),
+            )]));
+        }
+        lines
+    }
+
+    fn go_history_related_bead_row(
+        &self,
+        bead_id: &str,
+        selected: bool,
+        width: usize,
+        with_id: bool,
+    ) -> RichLine {
+        let issue = self.issue_by_id(bead_id);
+        let status = issue.map_or("open", |issue| issue.status.as_str());
+        let title = issue.map_or(bead_id, |issue| issue.title.as_str());
+        let mut spans = vec![
+            RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+            RichSpan::styled(
+                format!("{} ", go_history_status_icon(status)),
+                Style::new().fg(tokens::status_fg(status)),
+            ),
+        ];
+        if with_id {
+            spans.push(RichSpan::styled(format!("{bead_id} "), tokens::row_id()));
+        }
+        let used: usize = spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        spans.push(RichSpan::styled(
+            truncate_with_ellipsis(title, width.saturating_sub(used), "…"),
+            tokens::row_title(selected),
+        ));
+        if selected {
+            go_highlight_row(spans, width)
+        } else {
+            RichLine::from_spans(spans)
+        }
+    }
+
+    /// Wide bead mode's timeline pane: `TIMELINE: <id>` centered over the
+    /// bead's lifecycle-and-commit timeline.
+    fn go_history_timeline_lines(&self, pane: Rect, width: usize) -> Vec<RichLine> {
+        let title = self.selected_issue().map_or_else(
+            || "TIMELINE".to_string(),
+            |issue| format!("TIMELINE: {}", issue.id),
+        );
+        let title = truncate_with_ellipsis(&title, width, "…");
+        let pad = width.saturating_sub(display_width(&title)) / 2;
+        let mut lines = vec![RichLine::from_spans([
+            RichSpan::raw(" ".repeat(pad)),
+            RichSpan::styled(title, tokens::primary_bold()),
+        ])];
+        let text = self.history_timeline_text(pane.width, pane.height);
+        let mut body = text.lines().peekable();
+        if body
+            .peek()
+            .is_some_and(|line| line.starts_with("Timeline:") || line.starts_with("Cycle view for"))
+        {
+            body.next();
+        }
+        for line in body {
+            let style = if line.starts_with("Cycle:") || line.starts_with("Commits:") {
+                tokens::row_id()
+            } else {
+                Style::new()
+            };
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(line, width, "…"),
+                style,
+            )]));
+        }
+        lines
+    }
+
+    /// File tree pane (`f`): directories and files touched by correlated
+    /// commits, with change counts; the cursor shows while it has focus.
+    fn go_history_file_tree_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let mut lines = Vec::from(Self::go_history_pane_header("FILE TREE", width));
+        let flat = self.history_flat_file_list();
+        if flat.is_empty() {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                "No file data available",
+                tokens::muted_text(),
+            )]));
+            return lines;
+        }
+        if let Some(filter) = self.history_file_tree_filter.as_deref() {
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&format!("Filter: {filter}"), width, "…"),
+                tokens::info_text(),
+            )]));
+        }
+        let rows = usize::from(height).saturating_sub(lines.len());
+        let cursor = self.history_file_tree_cursor.min(flat.len() - 1);
+        let start = Self::go_history_scroll_start(cursor, rows);
+        for (idx, entry) in flat.iter().enumerate().skip(start).take(rows) {
+            let selected = self.history_file_tree_focus && idx == cursor;
+            let filtered = self
+                .history_file_tree_filter
+                .as_deref()
+                .is_some_and(|filter| filter == entry.path);
+            let name = if entry.is_dir {
+                format!("{}/", entry.name)
+            } else {
+                entry.name.clone()
+            };
+            let spans = vec![
+                RichSpan::styled(if selected { "▸ " } else { "  " }, tokens::primary_bold()),
+                RichSpan::raw("  ".repeat(entry.level)),
+                RichSpan::styled(
+                    if entry.is_dir { "📁 " } else { "📄 " },
+                    tokens::muted_text(),
+                ),
+                RichSpan::styled(
+                    name,
+                    if filtered {
+                        tokens::primary_bold()
+                    } else if entry.is_dir {
+                        tokens::info_text()
+                    } else {
+                        tokens::row_title(selected)
+                    },
+                ),
+                RichSpan::styled(format!(" ({})", entry.change_count), tokens::muted_text()),
+            ];
+            let line = RichLine::from_spans(spans);
+            let plain = line.to_plain_text();
+            let line = if display_width(&plain) > width {
+                RichLine::from_spans([RichSpan::raw(truncate_with_ellipsis(&plain, width, "…"))])
+            } else {
+                line
+            };
+            lines.push(if selected {
+                go_highlight_row(line.spans().to_vec(), width)
+            } else {
+                line
+            });
+        }
+        lines
+    }
+
+    /// Right pane in bead mode: `COMMIT DETAILS` with the bead, its recent
+    /// lifecycle events, every correlated commit (type glyph, SHA, age,
+    /// author badge, conventional subject, confidence and method, changed
+    /// files), and a stats footer.
+    fn go_history_bead_detail_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let height = usize::from(height);
+        let Some(issue) = self.selected_issue() else {
+            return vec![RichLine::from_spans([RichSpan::styled(
+                "No bead selected",
+                tokens::muted_text(),
+            )])];
+        };
+        let now = tui_now();
+        let mut lines = vec![RichLine::from_spans([RichSpan::styled(
+            "COMMIT DETAILS",
+            tokens::primary_bold(),
+        )])];
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            truncate_with_ellipsis(
+                &format!(
+                    "{} {}: {}",
+                    go_history_status_icon(&issue.status),
+                    issue.id,
+                    issue.title
+                ),
+                width,
+                "…",
+            ),
+            tokens::row_id(),
+        )]));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "─".repeat(width),
+            tokens::muted_text(),
+        )]));
+
+        // Lifecycle: header plus the most recent events, newest first.
+        let events = self.go_history_events(&issue.id);
+        if !events.is_empty() {
+            const MAX_EVENT_LINES: usize = 5;
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                format!("LIFECYCLE ({})", events.len()),
+                tokens::row_id().bold(),
+            )]));
+            let mut available = MAX_EVENT_LINES - 1;
+            let needs_more = events.len() > available;
+            if needs_more {
+                available -= 1;
+            }
+            let mut shown = 0usize;
+            for (idx, event) in events.iter().enumerate().rev().take(available) {
+                let (icon, icon_style) = go_history_event_icon(&event.kind);
+                let mut age = go_history_relative_time(event.at, now);
+                age.truncate(age.char_indices().nth(7).map_or(age.len(), |(i, _)| i));
+                let mut spans = vec![
+                    RichSpan::styled(if idx == 0 { "└ " } else { "│ " }, tokens::muted_text()),
+                    RichSpan::styled(format!("{icon} "), icon_style),
+                    RichSpan::styled(format!("{age:<8}"), tokens::muted_text()),
+                ];
+                if !event.author.is_empty() {
+                    spans.push(RichSpan::styled(
+                        format!(" {}", go_author_initials(&event.author)),
+                        tokens::row_id(),
+                    ));
+                }
+                lines.push(RichLine::from_spans(spans));
+                shown += 1;
+            }
+            if needs_more {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    format!("  +{} more", events.len() - shown),
+                    tokens::muted_text().italic(),
+                )]));
+            }
+            lines.push(RichLine::raw(""));
+        }
+
+        let commits = self.history_filtered_bead_commits(&issue.id);
+        let cursor = self
+            .history_bead_commit_cursor
+            .min(commits.len().saturating_sub(1));
+        let mut body: Vec<RichLine> = Vec::new();
+        let mut selected_span = (0usize, 0usize);
+        if commits.is_empty() {
+            let message = if self.history_git_cache.is_some() {
+                format!("No commits correlated with {}", issue.id)
+            } else {
+                self.history_load_message()
+            };
+            body.push(RichLine::from_spans([RichSpan::styled(
+                message,
+                tokens::muted_text(),
+            )]));
+        }
+        for (idx, commit) in commits.iter().enumerate() {
+            let selected = idx == cursor && self.focus != FocusPane::List;
+            let start = body.len();
+            let url = if selected {
+                self.history_selected_commit_url()
+            } else {
+                None
+            };
+            body.extend(Self::go_history_commit_detail(
+                commit, width, selected, now, url,
+            ));
+            if selected {
+                selected_span = (start, body.len());
+            }
+            if idx + 1 < commits.len() {
+                body.push(RichLine::raw(""));
+            }
+        }
+
+        // Stats footer (rule, totals, key hints) pinned to the bottom.
+        let footer_height = 3usize;
+        let content_rows = height.saturating_sub(lines.len() + footer_height);
+        let mut offset = if selected_span.1 > content_rows {
+            selected_span
+                .0
+                .min(selected_span.1.saturating_sub(content_rows))
+        } else {
+            0
+        };
+        if self.focus == FocusPane::Detail {
+            offset = offset.saturating_add(self.detail_scroll_offset);
+        }
+        offset = offset.min(body.len().saturating_sub(content_rows));
+        let shown = body
+            .into_iter()
+            .skip(offset)
+            .take(content_rows)
+            .collect::<Vec<_>>();
+        let pad = content_rows.saturating_sub(shown.len());
+        lines.extend(shown);
+        lines.extend(std::iter::repeat_with(|| RichLine::raw("")).take(pad));
+
+        let mut files = BTreeSet::new();
+        let (mut additions, mut deletions) = (0i64, 0i64);
+        for commit in &commits {
+            for file in &commit.files {
+                files.insert(file.path.as_str());
+                additions += file.insertions;
+                deletions += file.deletions;
+            }
+        }
+        let avg_confidence = if commits.is_empty() {
+            0.0
+        } else {
+            commits.iter().map(|commit| commit.confidence).sum::<f64>() / commits.len() as f64
+        };
+        let sep = || RichSpan::styled(" • ", tokens::muted_text());
+        let mut stats = vec![
+            RichSpan::styled(format!("{} commits", commits.len()), tokens::muted_text()),
+            sep(),
+            RichSpan::styled(format!("{} files", files.len()), tokens::muted_text()),
+        ];
+        if additions > 0 || deletions > 0 {
+            stats.push(sep());
+            stats.push(RichSpan::styled(
+                format!("+{additions}"),
+                tokens::success_text(),
+            ));
+            stats.push(RichSpan::styled("/", tokens::muted_text()));
+            stats.push(RichSpan::styled(
+                format!("-{deletions}"),
+                tokens::muted_text(),
+            ));
+        }
+        stats.push(sep());
+        stats.push(RichSpan::styled(
+            format!("{:.0}% avg", avg_confidence * 100.0),
+            go_confidence_style(avg_confidence),
+        ));
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "─".repeat(width),
+            tokens::muted_text(),
+        )]));
+        lines.push(RichLine::from_spans(stats));
+        lines.push(self.go_history_detail_hint("J/K:nav  y:copy  o:open  g:graph", width));
+        lines
+    }
+
+    /// Footer hint of a history detail pane; a pending status message (copy
+    /// or open result) takes its place.
+    fn go_history_detail_hint(&self, hint: &str, width: usize) -> RichLine {
+        if self.history_status_msg.is_empty() {
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(hint, width, "…"),
+                tokens::footer_hint().italic(),
+            )])
+        } else {
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&self.history_status_msg, width, "…"),
+                tokens::success_text().bold(),
+            )])
+        }
+    }
+
+    /// One commit in Go bv's bead-mode detail pane.
+    fn go_history_commit_detail(
+        commit: &HistoryCommitCompat,
+        width: usize,
+        selected: bool,
+        now: DateTime<Utc>,
+        url: Option<String>,
+    ) -> Vec<RichLine> {
+        let mut lines = Vec::new();
+        let at = parse_history_timestamp(&commit.timestamp);
+        let icon = go_commit_type_indicator(&commit.message);
+        let mut header = vec![RichSpan::styled(
+            if selected { "▸ " } else { "  " },
+            tokens::primary_bold(),
+        )];
+        if !icon.is_empty() {
+            header.push(RichSpan::raw(format!("{icon} ")));
+        }
+        let sha = RichSpan::styled(
+            commit.short_sha.clone(),
+            if selected {
+                tokens::primary_bold()
+            } else {
+                Style::new().fg(tokens::status_fg("review"))
+            },
+        );
+        header.push(match url {
+            Some(url) => sha.link(url),
+            None => sha,
+        });
+        header.push(RichSpan::styled(
+            format!(" ({})", go_history_relative_time(at, now)),
+            tokens::muted_text().italic(),
+        ));
+        lines.push(if selected {
+            go_highlight_row(header, width)
+        } else {
+            RichLine::from_spans(header)
+        });
+
+        let date = at.map_or_else(
+            || commit.timestamp.clone(),
+            |at| at.format("%Y-%m-%d %H:%M").to_string(),
+        );
+        let initials = format!(" {} ", go_author_initials(&commit.author));
+        let author_width = width.saturating_sub(4 + display_width(&initials) + 1 + 3 + 16);
+        lines.push(RichLine::from_spans([
+            RichSpan::raw("    "),
+            RichSpan::styled(
+                initials,
+                Style::new()
+                    .fg(tokens::status_fg("open"))
+                    .bg(tokens::row_highlight_bg())
+                    .bold(),
+            ),
+            RichSpan::raw(" "),
+            RichSpan::styled(
+                truncate_with_ellipsis(&commit.author, author_width.max(4), "…"),
+                tokens::row_id(),
+            ),
+            RichSpan::styled(format!(" • {date}"), tokens::muted_text()),
+        ]));
+
+        let cc = go_parse_conventional_commit(&commit.message);
+        if let Some(kind) = cc.kind {
+            let scope = if cc.scope.is_empty() {
+                String::new()
+            } else {
+                format!("({})", cc.scope)
+            };
+            let mut spans = vec![
+                RichSpan::raw("    "),
+                RichSpan::styled(kind, tokens::primary_bold()),
+                RichSpan::raw(scope),
+            ];
+            if cc.breaking {
+                spans.push(RichSpan::styled("!", tokens::status_message(true)));
+            }
+            spans.push(RichSpan::raw(": "));
+            let used: usize = spans
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            spans.push(RichSpan::raw(truncate_with_ellipsis(
+                &cc.subject,
+                width.saturating_sub(used),
+                "…",
+            )));
+            lines.push(RichLine::from_spans(spans));
+        } else {
+            lines.push(RichLine::from_spans([
+                RichSpan::raw("    "),
+                RichSpan::raw(truncate_with_ellipsis(
+                    &cc.subject,
+                    width.saturating_sub(4),
+                    "…",
+                )),
+            ]));
+        }
+
+        lines.push(RichLine::from_spans([
+            RichSpan::raw("    "),
+            RichSpan::styled(
+                format!("{:.0}% confidence", commit.confidence * 100.0),
+                go_confidence_style(commit.confidence),
+            ),
+            RichSpan::styled(
+                format!(" {}", go_correlation_method_label(&commit.method)),
+                tokens::muted_text(),
+            ),
+        ]));
+
+        if !commit.files.is_empty() {
+            let additions: i64 = commit.files.iter().map(|file| file.insertions).sum();
+            let deletions: i64 = commit.files.iter().map(|file| file.deletions).sum();
+            let mut summary = vec![RichSpan::raw(format!("    {} file(s)", commit.files.len()))];
+            if additions > 0 || deletions > 0 {
+                summary.push(RichSpan::styled(
+                    format!(" +{additions}"),
+                    tokens::success_text(),
+                ));
+                summary.push(RichSpan::styled(
+                    format!(" -{deletions}"),
+                    tokens::muted_text(),
+                ));
+            }
+            lines.push(RichLine::from_spans(summary));
+
+            // Files grouped by directory (in first-seen order), at most five.
+            const MAX_FILES: usize = 5;
+            let mut dirs: Vec<&str> = Vec::new();
+            for file in &commit.files {
+                let dir = file.path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+            let ordered = dirs.iter().flat_map(|dir| {
+                commit
+                    .files
+                    .iter()
+                    .filter(move |file| file.path.rsplit_once('/').map_or(".", |(d, _)| d) == *dir)
+            });
+            for file in ordered.take(MAX_FILES) {
+                let name = file
+                    .path
+                    .rsplit_once('/')
+                    .map_or(file.path.as_str(), |(_, n)| n);
+                let (glyph, style) = go_file_action(&file.action);
+                let mut spans = vec![
+                    RichSpan::raw("      "),
+                    RichSpan::styled(format!("{glyph} "), style),
+                    RichSpan::raw(truncate_with_ellipsis(
+                        name,
+                        width.saturating_sub(15).max(4),
+                        "…",
+                    )),
+                ];
+                if file.insertions > 0 || file.deletions > 0 {
+                    spans.push(RichSpan::styled(
+                        format!(" +{}", file.insertions),
+                        tokens::success_text(),
+                    ));
+                    spans.push(RichSpan::styled("/", tokens::muted_text()));
+                    spans.push(RichSpan::styled(
+                        format!("-{}", file.deletions),
+                        tokens::muted_text(),
+                    ));
+                }
+                lines.push(RichLine::from_spans(spans));
+            }
+            if commit.files.len() > MAX_FILES {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    format!("      +{} more files...", commit.files.len() - MAX_FILES),
+                    tokens::muted_text().italic(),
+                )]));
+            }
+        }
+        lines
+    }
+
+    /// Right pane in git mode: the commit's related beads above its SHA,
+    /// author, date, file count, and full message.
+    fn go_history_git_detail_lines(&self, width: usize, height: u16) -> Vec<RichLine> {
+        let height = usize::from(height);
+        let Some(commit) = self.selected_history_git_commit() else {
+            return vec![RichLine::from_spans([RichSpan::styled(
+                "No commit selected",
+                tokens::muted_text(),
+            )])];
+        };
+        let rule =
+            || RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]);
+        let mut lines = Vec::from(Self::go_history_pane_header("RELATED BEADS", width));
+        let related = self.history_git_related_beads_for_commit(&commit.sha);
+        let cursor = self
+            .history_related_bead_cursor
+            .min(related.len().saturating_sub(1));
+        for (idx, bead_id) in related.iter().enumerate() {
+            let selected = idx == cursor && self.focus == FocusPane::Detail;
+            lines.push(self.go_history_related_bead_row(bead_id, selected, width, true));
+        }
+        lines.push(RichLine::raw(""));
+        lines.push(rule());
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            "COMMIT DETAILS",
+            tokens::primary_bold(),
+        )]));
+        lines.push(rule());
+        let field = |text: String, style: Style| {
+            RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&text, width, "…"),
+                style,
+            )])
+        };
+        let sha = field(format!("SHA: {}", commit.sha), tokens::primary_bold());
+        lines.push(match self.history_selected_commit_url() {
+            Some(url) => RichLine::from_spans(
+                sha.spans()
+                    .iter()
+                    .map(|span| span.clone().link(url.clone())),
+            ),
+            None => sha,
+        });
+        lines.push(field(
+            format!("Author: {}", commit.author),
+            tokens::row_id(),
+        ));
+        lines.push(field(
+            format!("Date: {}", commit.timestamp),
+            tokens::muted_text(),
+        ));
+        lines.push(field(
+            format!("Files: {} changed", commit.files.len()),
+            tokens::muted_text(),
+        ));
+        lines.push(RichLine::raw(""));
+        for line in commit.message.lines() {
+            lines.push(field(line.to_string(), Style::new()));
+        }
+
+        let content_rows = height.saturating_sub(2);
+        let offset = if self.focus == FocusPane::Detail {
+            self.detail_scroll_offset
+                .min(lines.len().saturating_sub(content_rows))
+        } else {
+            0
+        };
+        let mut lines: Vec<RichLine> = lines.into_iter().skip(offset).take(content_rows).collect();
+        while lines.len() < content_rows {
+            lines.push(RichLine::raw(""));
+        }
+        lines.push(rule());
+        lines.push(self.go_history_detail_hint("J/K:bead  y:copy  o:open  g:graph", width));
+        lines
+    }
+
+    /// Render `?` help as Go bv's keyboard-shortcut modal: a titled frame of
+    /// color-coded rounded section boxes in balanced columns. Returns false
+    /// when the sections do not fit, so the caller can use the scrollable
+    /// text rendering instead.
+    fn render_go_help(&self, frame: &mut Frame, area: Rect) -> bool {
+        let sections = help_sections();
+        let columns = if area.width >= 120 {
+            3
+        } else if area.width >= 80 {
+            2
+        } else {
+            1
+        };
+        // Greedy balance: each section goes to the currently shortest column.
+        // A section box is its bindings + title + two border rows, plus a gap.
+        let heights: Vec<u16> = sections
+            .iter()
+            .map(|section| {
+                u16::try_from(section.bindings.len())
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(4)
+            })
+            .collect();
+        let mut column_items: Vec<Vec<usize>> = vec![Vec::new(); columns];
+        let mut column_heights = vec![0u16; columns];
+        for (index, height) in heights.iter().enumerate() {
+            let target = (0..columns)
+                .min_by_key(|col| column_heights[*col])
+                .unwrap_or(0);
+            column_items[target].push(index);
+            column_heights[target] = column_heights[target].saturating_add(*height);
+        }
+        let inner_height = area.height.saturating_sub(4);
+        if column_heights.iter().any(|height| *height > inner_height) {
+            return false;
+        }
+
+        Block::bordered()
+            .border_type(ftui::widgets::borders::BorderType::Rounded)
+            .border_style(Style::new().fg(tokens::FG_ACCENT))
+            .render(area, frame);
+        Paragraph::new(RichText::from_lines([RichLine::from_spans([
+            RichSpan::styled("⌨  Keyboard Shortcuts", tokens::primary_bold()),
+            RichSpan::styled(
+                "    ` or Ctrl+T: Tutorial │ ? or Esc to close",
+                tokens::muted_text(),
+            ),
+        ])]))
+        .alignment(ftui::widgets::block::Alignment::Center)
+        .render(
+            Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1),
+            frame,
+        );
+
+        let palette = |title: &str| -> (&'static str, PackedRgba) {
+            match title {
+                "Navigation" => ("🧭", tokens::FG_ACCENT),
+                "Views" => ("👁", PackedRgba::rgb(255, 121, 198)),
+                "Filters" => ("🔍", tokens::FG_SUCCESS),
+                "Search" => ("🔎", tokens::FG_INFO),
+                "Actions" => ("⚡", tokens::FG_WARNING),
+                "History" => ("📜", PackedRgba::rgb(255, 183, 108)),
+                "Board" => ("📋", PackedRgba::rgb(100, 181, 246)),
+                "Tree" => ("🌳", PackedRgba::rgb(129, 199, 132)),
+                "Insights" => ("💡", PackedRgba::rgb(241, 250, 140)),
+                _ => ("🌐", tokens::FG_INFO),
+            }
+        };
+        let content_width = area.width.saturating_sub(4);
+        let column_width = content_width / u16::try_from(columns).unwrap_or(1);
+        for (col, items) in column_items.iter().enumerate() {
+            let x = area.x + 2 + column_width * u16::try_from(col).unwrap_or(0);
+            let mut y = area.y + 3;
+            for &index in items {
+                let section = &sections[index];
+                let height = heights[index];
+                let (emoji, color) = palette(section.title);
+                let rect = Rect::new(
+                    x,
+                    y,
+                    column_width.saturating_sub(1),
+                    height.saturating_sub(1),
+                );
+                Block::bordered()
+                    .border_type(ftui::widgets::borders::BorderType::Rounded)
+                    .border_style(Style::new().fg(color))
+                    .render(rect, frame);
+                let key_width = section
+                    .bindings
+                    .iter()
+                    .map(|(key, _)| display_width(key))
+                    .max()
+                    .unwrap_or(4)
+                    .clamp(4, 16);
+                let mut lines = vec![RichLine::from_spans([RichSpan::styled(
+                    format!("{emoji} {}", section.title),
+                    Style::new().fg(color).bold(),
+                )])];
+                for (key, desc) in &section.bindings {
+                    lines.push(RichLine::from_spans([
+                        RichSpan::styled(
+                            format!("{key:<key_width$}  "),
+                            Style::new().fg(color).bold(),
+                        ),
+                        RichSpan::raw((*desc).to_string()),
+                    ]));
+                }
+                Paragraph::new(RichText::from_lines(lines)).render(
+                    Rect::new(
+                        rect.x + 2,
+                        rect.y + 1,
+                        rect.width.saturating_sub(4),
+                        rect.height.saturating_sub(2),
+                    ),
+                    frame,
+                );
+                y = y.saturating_add(height);
+            }
+        }
+        true
+    }
+
+    /// Go bv lane presentation for a board lane key: (emoji, title, color).
+    fn go_board_lane_meta(&self, key: &str) -> (&'static str, String, PackedRgba) {
+        match (self.board_grouping, key) {
+            (BoardGrouping::Status, "open") => ("📋", "OPEN".into(), tokens::status_fg("open")),
+            (BoardGrouping::Status, "in_progress") => {
+                ("🔄", "IN PROGRESS".into(), tokens::status_fg("in_progress"))
+            }
+            (BoardGrouping::Status, "blocked") => {
+                ("🚫", "BLOCKED".into(), tokens::status_fg("blocked"))
+            }
+            (BoardGrouping::Status, "closed") => {
+                ("✅", "CLOSED".into(), tokens::status_fg("closed"))
+            }
+            (BoardGrouping::Priority, "p0") => {
+                ("🔴", "P0 CRITICAL".into(), PackedRgba::rgb(239, 83, 80))
+            }
+            (BoardGrouping::Priority, "p1") => {
+                ("🟡", "P1 HIGH".into(), PackedRgba::rgb(255, 183, 77))
+            }
+            (BoardGrouping::Priority, "p2") => {
+                ("🔵", "P2 MEDIUM".into(), PackedRgba::rgb(100, 181, 246))
+            }
+            (BoardGrouping::Priority, _) => {
+                ("⚪", "P3+ OTHER".into(), PackedRgba::rgb(158, 158, 158))
+            }
+            (BoardGrouping::Type, kind) => (
+                go_type_icon(kind),
+                kind.to_ascii_uppercase(),
+                tokens::type_fg(kind),
+            ),
+            (_, other) => ("•", other.to_ascii_uppercase(), tokens::FG_MUTED),
+        }
+    }
+
+    /// Render the Go bv kanban board into `area`: title bar, one bordered
+    /// column per lane with a colored header, and priority-coded cards.
+    fn render_go_board(&self, frame: &mut Frame, area: Rect) {
+        let lanes = self.board_lane_indices();
+        if lanes.is_empty() || area.height < 6 {
+            Paragraph::new("No issues to display")
+                .style(tokens::muted_text())
+                .alignment(ftui::widgets::block::Alignment::Center)
+                .render(area, frame);
+            return;
+        }
+        let show_detail = matches!(self.focus, FocusPane::Detail);
+        let detail_width = if !show_detail {
+            0
+        } else if area.width >= 100 {
+            (area.width * 35 / 100).clamp(40, 80)
+        } else {
+            area.width
+        };
+        let board_width = area.width.saturating_sub(detail_width);
+        if board_width == 0 {
+            self.render_go_board_detail(frame, area);
+            return;
+        }
+        let title = format!("BOARD [by: {}]", {
+            let mut name = self.board_grouping.label().to_string();
+            if let Some(first) = name.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            name
+        });
+        Paragraph::new(title)
+            .style(tokens::primary_bold())
+            .alignment(ftui::widgets::block::Alignment::Center)
+            .render(Rect::new(area.x, area.y, board_width, 1), frame);
+
+        let col_count = u16::try_from(lanes.len()).unwrap_or(1).max(1);
+        let col_width = (board_width / col_count).max(12);
+        let focused_lane = lanes
+            .iter()
+            .position(|(_, idx)| idx.contains(&self.selected));
+        let search_hits: HashSet<usize> = self.board_search_matches().into_iter().collect();
+        let current_hit = {
+            let matches = self.board_search_matches();
+            matches
+                .get(
+                    self.board_search_match_cursor
+                        .min(matches.len().saturating_sub(1)),
+                )
+                .copied()
+        };
+        let now = tui_now();
+
+        for (slot, (key, indices)) in lanes.iter().enumerate() {
+            let x = area.x + col_width * u16::try_from(slot).unwrap_or(0);
+            if x >= area.x + board_width {
+                break;
+            }
+            let width = col_width.min(area.x + board_width - x);
+            let focused = focused_lane == Some(slot);
+            let (emoji, lane_title, color) = self.go_board_lane_meta(key);
+
+            // Header with P0/P1 counts and the oldest item's age.
+            let issues: Vec<&Issue> = indices
+                .iter()
+                .filter_map(|i| self.analyzer.issues.get(*i))
+                .collect();
+            let mut header = format!("{emoji} {lane_title} ({})", issues.len());
+            if area.width >= 100 {
+                let p0 = issues.iter().filter(|i| i.priority == 0).count();
+                let p1 = issues.iter().filter(|i| i.priority == 1).count();
+                if p0 > 0 {
+                    let _ = write!(header, " {p0}🔴");
+                }
+                if p1 > 0 {
+                    let _ = write!(header, " {p1}🟡");
+                }
+                if area.width >= 140
+                    && let Some(oldest) = issues.iter().filter_map(|i| i.created_at).min()
+                {
+                    let days = (now - oldest).num_days();
+                    let age = if days < 1 {
+                        "<1d".to_string()
+                    } else if days < 7 {
+                        format!("{days}d")
+                    } else if days < 30 {
+                        format!("{}w", days / 7)
+                    } else {
+                        format!("{}mo", days / 30)
+                    };
+                    let _ = write!(header, " ⏱{age}");
+                }
+            }
+            let header_style = if focused {
+                Style::new()
+                    .fg(PackedRgba::rgb(26, 26, 26))
+                    .bg(color)
+                    .bold()
+            } else {
+                Style::new()
+                    .fg(color)
+                    .bg(PackedRgba::rgb(42, 42, 42))
+                    .bold()
+            };
+            Paragraph::new(truncate_with_ellipsis(&header, usize::from(width), "…"))
+                .style(header_style)
+                .alignment(ftui::widgets::block::Alignment::Center)
+                .render(Rect::new(x, area.y + 1, width, 1), frame);
+
+            let column = Rect::new(x, area.y + 2, width, area.height.saturating_sub(2));
+            Block::bordered()
+                .border_type(ftui::widgets::borders::BorderType::Rounded)
+                .border_style(Style::new().fg(if focused { color } else { tokens::FG_MUTED }))
+                .render(column, frame);
+            let inner = Rect::new(
+                column.x + 2,
+                column.y + 1,
+                column.width.saturating_sub(4),
+                column.height.saturating_sub(2),
+            );
+            if issues.is_empty() {
+                Paragraph::new("(empty)")
+                    .style(tokens::muted_text().italic())
+                    .alignment(ftui::widgets::block::Alignment::Center)
+                    .render(
+                        Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1),
+                        frame,
+                    );
+                continue;
+            }
+
+            const CARD_HEIGHT: u16 = 6; // 3 lines + 2 border + 1 gap
+            let visible_cards = usize::from((inner.height.saturating_sub(1) / CARD_HEIGHT).max(1));
+            let sel = indices
+                .iter()
+                .position(|i| *i == self.selected)
+                .unwrap_or(0);
+            let start = sel.saturating_sub(visible_cards - 1);
+            for (row, &index) in indices.iter().enumerate().skip(start).take(visible_cards) {
+                let issue = &self.analyzer.issues[index];
+                let y = inner.y + u16::try_from(row - start).unwrap_or(0) * CARD_HEIGHT;
+                let card = Rect::new(inner.x, y, inner.width, 5);
+                let selected = focused && index == self.selected;
+                self.render_go_board_card(
+                    frame,
+                    card,
+                    issue,
+                    selected,
+                    current_hit == Some(index),
+                    search_hits.contains(&index),
+                    now,
+                );
+            }
+            if issues.len() > visible_cards {
+                Paragraph::new(format!("↕ {}/{}", sel + 1, issues.len()))
+                    .style(tokens::muted_text().italic())
+                    .alignment(ftui::widgets::block::Alignment::Center)
+                    .render(
+                        Rect::new(
+                            inner.x,
+                            inner.y + inner.height.saturating_sub(1),
+                            inner.width,
+                            1,
+                        ),
+                        frame,
+                    );
+            }
+        }
+
+        if show_detail {
+            self.render_go_board_detail(
+                frame,
+                Rect::new(area.x + board_width, area.y, detail_width, area.height),
+            );
+        }
+    }
+
+    fn render_go_board_detail(&self, frame: &mut Frame, panel: Rect) {
+        semantic_panel_block("", true, SemanticTone::Accent).render(panel, frame);
+        let inner = block_inner_rect(panel);
+        let body = Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        );
+        Paragraph::new(self.main_go_detail_text(body.width))
+            .wrap(ftui::text::WrapMode::WordChar)
+            .scroll((saturating_scroll_offset(self.go_detail_scroll_offset()), 0))
+            .render(body, frame);
+        record_detail_content_area(body);
+    }
+
+    /// Scroll offset of the Go-style detail pane in the current view: the
+    /// board keeps its own; every other view uses the shared detail offset.
+    fn go_detail_scroll_offset(&self) -> usize {
+        if matches!(self.mode, ViewMode::Board) {
+            self.board_detail_scroll_offset
+        } else {
+            usize::from(saturating_scroll_offset(self.detail_scroll_offset))
+        }
+    }
+
+    /// One Go bv board card: type glyph, priority, ID, age; title; first
+    /// blocker, unblock count, and labels. The border color encodes state.
+    #[allow(clippy::too_many_arguments)]
+    fn render_go_board_card(
+        &self,
+        frame: &mut Frame,
+        card: Rect,
+        issue: &Issue,
+        selected: bool,
+        current_hit: bool,
+        any_hit: bool,
+        now: DateTime<Utc>,
+    ) {
+        let blockers: Vec<String> = self
+            .analyzer
+            .graph
+            .open_blockers(&issue.id)
+            .into_iter()
+            .collect();
+        let blocks = self
+            .analyzer
+            .graph
+            .dependents(&issue.id)
+            .into_iter()
+            .filter(|dep| {
+                self.analyzer
+                    .graph
+                    .issue(dep)
+                    .is_some_and(Issue::is_open_like)
+            })
+            .count();
+        let border = if selected {
+            tokens::FG_ACCENT
+        } else if current_hit {
+            PackedRgba::rgb(206, 147, 216)
+        } else if any_hit {
+            PackedRgba::rgb(100, 181, 246)
+        } else if !blockers.is_empty() {
+            PackedRgba::rgb(239, 83, 80)
+        } else if blocks > 0 {
+            PackedRgba::rgb(255, 183, 77)
+        } else if issue.normalized_status() == "open" {
+            PackedRgba::rgb(129, 199, 132)
+        } else {
+            tokens::FG_MUTED
+        };
+        let mut block = Block::bordered()
+            .border_type(ftui::widgets::borders::BorderType::Rounded)
+            .border_style(Style::new().fg(border));
+        if selected {
+            block = block.style(Style::new().bg(tokens::row_highlight_bg()));
+        }
+        block.render(card, frame);
+        let inner = Rect::new(card.x + 2, card.y + 1, card.width.saturating_sub(4), 3);
+        let width = usize::from(inner.width);
+
+        let prio = issue.priority.clamp(0, 4);
+        let prio_style = if prio <= 1 {
+            Style::new().fg(PackedRgba::rgb(239, 83, 80)).bold()
+        } else {
+            tokens::row_id().bold()
+        };
+        let age_days = issue.updated_at.map(|t| (now - t).num_days());
+        let age_color = match age_days {
+            Some(d) if d < 7 => PackedRgba::rgb(129, 199, 132),
+            Some(d) if d < 30 => PackedRgba::rgb(255, 183, 77),
+            Some(_) => PackedRgba::rgb(229, 115, 115),
+            None => tokens::FG_MUTED,
+        };
+        let age = truncate_to_width(&go_time_rel(issue.updated_at, now), 6);
+        let id = truncate_with_ellipsis(&issue.id, width.saturating_sub(14).max(6), "…");
+        let line1 = RichLine::from_spans([
+            RichSpan::styled(
+                go_type_icon(&issue.issue_type),
+                Style::new().fg(tokens::type_fg(&issue.issue_type)),
+            ),
+            RichSpan::raw(" "),
+            RichSpan::styled(format!("P{prio}"), prio_style),
+            RichSpan::raw(" "),
+            RichSpan::styled(id, tokens::row_id().bold()),
+            RichSpan::raw(" "),
+            RichSpan::styled(age, Style::new().fg(age_color)),
+        ]);
+        let line2 = RichLine::from_spans([RichSpan::styled(
+            truncate_with_ellipsis(&issue.title, width, "…"),
+            tokens::row_title(selected),
+        )]);
+        let mut meta: Vec<RichSpan<'static>> = Vec::new();
+        if let Some(first) = blockers.first() {
+            let snippet = self
+                .analyzer
+                .graph
+                .issue(first)
+                .map(|b| format!(" ({})", truncate_with_ellipsis(&b.title, 12, "…")))
+                .unwrap_or_default();
+            meta.push(RichSpan::styled(
+                format!("🚫←{}{snippet} ", truncate_with_ellipsis(first, 10, "…")),
+                Style::new().fg(tokens::status_fg("blocked")),
+            ));
+        }
+        if blocks > 0 {
+            meta.push(RichSpan::styled(
+                format!("⚡→{blocks} "),
+                Style::new().fg(tokens::type_fg("feature")),
+            ));
+        }
+        if !issue.labels.is_empty() {
+            let labels: Vec<String> = issue
+                .labels
+                .iter()
+                .take(3)
+                .map(|label| truncate_to_width(label, 8))
+                .collect();
+            meta.push(RichSpan::styled(
+                labels.join(","),
+                Style::new().fg(tokens::status_fg("in_progress")),
+            ));
+        }
+        let mut text_lines = Vec::new();
+        for line in [line1, line2, RichLine::from_spans(meta)] {
+            let plain: String = line.spans().iter().map(|s| s.content.as_ref()).collect();
+            if display_width(&plain) > width {
+                // Truncate by rebuilding spans up to the width budget.
+                let mut budget = width.saturating_sub(1);
+                let mut out = RichLine::new();
+                for span in line.spans() {
+                    if budget == 0 {
+                        break;
+                    }
+                    let content = truncate_to_width(span.content.as_ref(), budget);
+                    budget = budget.saturating_sub(display_width(&content));
+                    out.push_span(RichSpan::styled(content, span.style.unwrap_or_default()));
+                }
+                out.push_span(RichSpan::raw("…"));
+                text_lines.push(out);
+            } else {
+                text_lines.push(line);
+            }
+        }
+        let mut para = Paragraph::new(RichText::from_lines(text_lines));
+        if selected {
+            para = para.style(Style::new().bg(tokens::row_highlight_bg()));
+        }
+        para.render(inner, frame);
+    }
+
+    /// Left-click on a main-list row selects it and focuses the list
+    /// (Go bv bv-162). Returns false when the click is not on a row.
+    fn mouse_select_main_row(&mut self, x: u16, y: u16) -> bool {
+        if !matches!(self.mode, ViewMode::Main) {
+            return false;
+        }
+        let area = cached_main_list_area();
+        if !rect_contains(area, x, y) {
+            return false;
+        }
+        let chrome = 1 + usize::from(self.main_search_active || !self.main_search_query.is_empty());
+        let Some(row) = usize::from(y - area.y).checked_sub(chrome) else {
+            return false;
+        };
+        let rows = self.list_viewport_height.get();
+        if row >= rows {
+            return false;
+        }
+        let visible = self.visible_issue_indices();
+        let (start, end, ..) = self.main_list_window(&visible, rows);
+        match visible.get(start + row) {
+            Some(&index) if start + row < end => {
+                self.selected = index;
+                self.focus = FocusPane::List;
+                self.detail_scroll_offset = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Column header of the Go-style issue list.
+    const MAIN_LIST_COLUMNS: &'static str =
+        "  TYPE PRI STATUS      ID                                   TITLE";
+
+    /// The visible window of the main list for a viewport of `rows` rows:
+    /// `(start, end, page, pages, total)`, paged so the selection's page is
+    /// shown (Go bv pages rather than scrolls).
+    fn main_list_window(
+        &self,
+        visible: &[usize],
+        rows: usize,
+    ) -> (usize, usize, usize, usize, usize) {
+        let total = visible.len();
+        let per_page = rows.max(1);
+        let slot = self.selected_visible_slot(visible).unwrap_or(0);
+        let page = slot / per_page;
+        let pages = total.div_ceil(per_page).max(1);
+        let start = (page * per_page).min(total);
+        let end = (start + per_page).min(total);
+        (start, end, page + 1, pages, total)
+    }
+
+    /// One Go bv-style list row: caret, type icon, priority badge, triage
+    /// marker, status badge, ID, title, then right-aligned age, comment
+    /// count, and (wider panes) assignee and labels.
+    fn main_go_row(
+        &self,
+        issue: &Issue,
+        selected: bool,
+        width: usize,
+        now: DateTime<Utc>,
+    ) -> RichLine {
+        // One spare column keeps wide glyphs (emoji) off the pane border.
+        let width = width.saturating_sub(1);
+        let mut right: Vec<RichSpan<'static>> = Vec::new();
+        let mut right_width = 0usize;
+        if width > 60 {
+            let age = format!("{:>8}", go_time_rel(issue.created_at, now));
+            right_width += display_width(&age);
+            right.push(RichSpan::styled(age, tokens::muted_text()));
+            right.push(RichSpan::raw(" "));
+            right_width += 1;
+            if issue.comments.is_empty() {
+                right.push(RichSpan::raw("   "));
+                right_width += 3;
+            } else {
+                let comments = format!("💬{}", issue.comments.len());
+                right_width += display_width(&comments);
+                right.push(RichSpan::styled(comments, tokens::info_text()));
+            }
+        }
+        if width > 100 && !issue.assignee.trim().is_empty() {
+            let assignee = format!(
+                " @{:<12}",
+                truncate_with_ellipsis(issue.assignee.trim(), 12, "…")
+            );
+            right_width += display_width(&assignee);
+            right.push(RichSpan::styled(assignee, tokens::row_id()));
+        }
+        if width > 140 && !issue.labels.is_empty() {
+            let labels = format!(
+                " {} ",
+                truncate_with_ellipsis(&issue.labels.join(","), 20, "…")
+            );
+            right_width += display_width(&labels) + 1;
+            right.push(RichSpan::raw(" "));
+            right.push(RichSpan::styled(
+                labels,
+                Style::new().fg(tokens::FG_ACCENT).bg(tokens::BG_SURFACE),
+            ));
+        }
+
+        let mut left: Vec<RichSpan<'static>> = Vec::new();
+        left.push(if selected {
+            RichSpan::styled("▸ ", tokens::primary_bold())
+        } else {
+            RichSpan::raw("  ")
+        });
+        left.push(RichSpan::styled(
+            go_type_icon(&issue.issue_type),
+            Style::new().fg(tokens::type_fg(&issue.issue_type)),
+        ));
+        left.push(RichSpan::raw(" "));
+        let prio = u8::try_from(issue.priority.clamp(0, 4)).unwrap_or(4);
+        left.push(RichSpan::styled(
+            format!("P{prio}"),
+            tokens::priority_badge(prio),
+        ));
+        left.push(RichSpan::raw(" "));
+
+        let open_dependents = self
+            .analyzer
+            .graph
+            .dependents(&issue.id)
+            .into_iter()
+            .filter(|dep| {
+                self.analyzer
+                    .graph
+                    .issue(dep)
+                    .is_some_and(Issue::is_open_like)
+            })
+            .count();
+        if open_dependents > 0 && issue.is_open_like() {
+            let blocker = self.analyzer.graph.open_blockers(&issue.id).is_empty();
+            let marker = if blocker {
+                format!("🔓{open_dependents}")
+            } else {
+                format!("↪{open_dependents}")
+            };
+            left.push(RichSpan::styled(marker, tokens::triage_unblocks()));
+            left.push(RichSpan::raw(" "));
+        }
+
+        let status = issue.normalized_status();
+        left.push(RichSpan::styled(
+            tokens::status_badge_label(&status).to_string(),
+            Style::new()
+                .fg(tokens::status_fg(&status))
+                .bg(tokens::status_bg(&status)),
+        ));
+        left.push(RichSpan::raw(" "));
+        let id = truncate_with_ellipsis(&issue.id, 35, "…");
+        let id_style = if selected {
+            tokens::row_id().bold()
+        } else {
+            tokens::row_id()
+        };
+        left.push(RichSpan::styled(id, id_style));
+        left.push(RichSpan::raw(" "));
+
+        let left_width: usize = left
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        let title_width = width.saturating_sub(left_width + right_width + 1).max(5);
+        let title = truncate_with_ellipsis(&issue.title, title_width, "…");
+        let pad = width.saturating_sub(left_width + display_width(&title) + right_width);
+        left.push(RichSpan::styled(title, tokens::row_title(selected)));
+        left.push(RichSpan::raw(" ".repeat(pad)));
+        left.extend(right);
+
+        let mut line = RichLine::new();
+        for span in left {
+            if selected {
+                let style = span
+                    .style
+                    .unwrap_or_default()
+                    .bg(tokens::row_highlight_bg());
+                line.push_span(RichSpan::styled(span.content.into_owned(), style));
+            } else {
+                line.push_span(span);
+            }
+        }
+        line
+    }
+
+    /// The Go bv-style main list: a column header bar, one page of rows, and
+    /// a right-aligned page indicator, sized to `width` x `height` (inner).
+    fn main_go_list_text(&self, width: u16, height: u16) -> RichText {
+        let width = usize::from(width);
+        let mut lines = Vec::new();
+        let header = format!(
+            "{:<width$}",
+            truncate_to_width(Self::MAIN_LIST_COLUMNS, width),
+            width = width
+        );
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            header,
+            tokens::list_column_header(),
+        )]));
+        if self.main_search_active || !self.main_search_query.is_empty() {
+            let matches = self.main_search_matches().len();
+            let status = if self.main_search_query.is_empty() {
+                String::new()
+            } else if matches == 0 {
+                "  no matches".to_string()
+            } else {
+                let position = self.main_search_match_cursor.min(matches - 1) + 1;
+                format!("  match {position}/{matches}  (n/N cycle)")
+            };
+            let prompt = format!(
+                " 🔎 /{}{}{status}",
+                self.main_search_query,
+                if self.main_search_active { "▏" } else { "" },
+            );
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                prompt,
+                tokens::info_text(),
+            )]));
+        }
+
+        let visible = self.visible_issue_indices();
+        let chrome = lines.len() + 1; // header (+ search line) + page line
+        let rows = usize::from(height).saturating_sub(chrome).max(1);
+        self.list_viewport_height.set(rows);
+        if visible.is_empty() {
+            lines.extend(self.main_list_empty_state_lines());
+            return RichText::from_lines(lines);
+        }
+        let (start, end, page, pages, total) = self.main_list_window(&visible, rows);
+        let now = tui_now();
+        for index in &visible[start..end] {
+            if let Some(issue) = self.analyzer.issues.get(*index) {
+                lines.push(self.main_go_row(issue, *index == self.selected, width, now));
+            }
+        }
+        for _ in end - start..rows {
+            lines.push(RichLine::raw(""));
+        }
+        let page_info = format!(
+            " Page {page} of {pages} (items {}-{end} of {total}) ",
+            start + 1
+        );
+        lines.push(RichLine::from_spans([RichSpan::styled(
+            format!("{page_info:>width$}"),
+            tokens::row_id(),
+        )]));
+        RichText::from_lines(lines)
+    }
+
+    /// Markdown source for the Go bv-style detail pane of the selection.
+    fn main_go_detail_markdown(&self, issue: Option<&Issue>) -> (String, String) {
+        let Some(issue) = issue else {
+            return ("No issues selected".to_string(), String::new());
+        };
+        let mut md = String::new();
+        let _ = writeln!(md, "# {} {}", go_type_icon(&issue.issue_type), issue.title);
+        md.push_str("| ID | Status | Priority | Assignee | Created |\n|---|---|---|---|---|\n");
+        let _ = writeln!(
+            md,
+            "| **{}** | **{}** | {} | {} | {} |\n",
+            issue.id,
+            issue.normalized_status().to_ascii_uppercase(),
+            go_priority_icon(issue.priority),
+            if issue.assignee.trim().is_empty() {
+                "—".to_string()
+            } else {
+                format!("@{}", issue.assignee.trim())
+            },
+            issue
+                .created_at
+                .map_or_else(|| "—".to_string(), |t| t.format("%Y-%m-%d").to_string()),
+        );
+        if !issue.labels.is_empty() {
+            let _ = writeln!(md, "**Labels:** {}\n", issue.labels.join(", "));
+        }
+        if let Some(until) = issue.defer_until {
+            let _ = writeln!(
+                md,
+                "**Deferred until:** {}\n",
+                until.format("%Y-%m-%d %H:%M UTC")
+            );
+        }
+        let head = std::mem::take(&mut md);
+
+        let metrics = &self.analyzer.metrics;
+        let float = |map: &HashMap<String, f64>| map.get(&issue.id).copied().unwrap_or(0.0);
+        let unblocks = metrics.blocks_count.get(&issue.id).copied().unwrap_or(0);
+        let open_blockers = self.analyzer.graph.open_blockers(&issue.id);
+        if unblocks > 0 || !open_blockers.is_empty() {
+            md.push_str("### 🎯 Triage Insights\n");
+            if unblocks > 0 {
+                let _ = writeln!(
+                    md,
+                    "- **🔓 Unblocks:** {unblocks} downstream items when completed"
+                );
+            }
+            if !open_blockers.is_empty() {
+                let _ = writeln!(md, "- **⛔ Blocked by:** {}", open_blockers.join(", "));
+            }
+            md.push('\n');
+        }
+        md.push_str("### Graph Analysis\n");
+        let _ = writeln!(
+            md,
+            "- **Impact Depth**: {} (downstream chain length)",
+            metrics.critical_depth.get(&issue.id).copied().unwrap_or(0)
+        );
+        let _ = writeln!(
+            md,
+            "- **Centrality**: PR {:.4} • BW {:.4} • EV {:.4}",
+            float(&metrics.pagerank),
+            float(&metrics.betweenness),
+            float(&metrics.eigenvector)
+        );
+        let _ = writeln!(
+            md,
+            "- **Flow Role**: Hub {:.4} • Authority {:.4}\n",
+            float(&metrics.hubs),
+            float(&metrics.authorities)
+        );
+        for (heading, body) in [
+            ("Description", &issue.description),
+            ("Design Notes", &issue.design),
+            ("Acceptance Criteria", &issue.acceptance_criteria),
+            ("Notes", &issue.notes),
+        ] {
+            if !body.trim().is_empty() {
+                let _ = writeln!(md, "### {heading}\n{}\n", body.trim_end());
+            }
+        }
+        let deps: Vec<String> = issue
+            .dependencies
+            .iter()
+            .filter(|dep| !dep.depends_on_id.trim().is_empty())
+            .map(|dep| {
+                let target = self.analyzer.graph.issue(&dep.depends_on_id);
+                let kind = if dep.dep_type.trim().is_empty() {
+                    "blocks"
+                } else {
+                    dep.dep_type.trim()
+                };
+                match target {
+                    Some(t) => format!(
+                        "- **{}** {} {} {} _({kind})_",
+                        t.id,
+                        go_type_icon(&t.issue_type),
+                        t.normalized_status().to_ascii_uppercase(),
+                        t.title
+                    ),
+                    None => format!("- **{}** _({kind}, not loaded)_", dep.depends_on_id),
+                }
+            })
+            .collect();
+        if !deps.is_empty() {
+            let _ = writeln!(
+                md,
+                "### Dependencies ({})\n{}\n",
+                deps.len(),
+                deps.join("\n")
+            );
+        }
+        if !issue.comments.is_empty() {
+            let now = tui_now();
+            let _ = writeln!(md, "### Comments ({})", issue.comments.len());
+            for comment in &issue.comments {
+                let _ = writeln!(
+                    md,
+                    "> **{}** ({})\n> \n> {}\n",
+                    comment.author,
+                    go_time_rel(comment.created_at, now),
+                    comment.text.replace('\n', "\n> ")
+                );
+            }
+        }
+        (head, md)
+    }
+
+    /// The detail pane rendered from [`Self::main_go_detail_markdown`].
+    /// The external reference is a real OSC-8 hyperlink line between the
+    /// metadata block and the body, followed by the pane's action keys.
+    fn main_go_detail_text(&self, width: u16) -> RichText {
+        self.go_issue_detail_text(self.selected_issue(), width)
+    }
+
+    /// Go bv's issue detail (markdown metadata, triage and graph sections,
+    /// body, dependencies, comments) for any issue, e.g. a tree node.
+    fn go_issue_detail_text(&self, issue: Option<&Issue>, width: u16) -> RichText {
+        let renderer =
+            ftui_extras::markdown::MarkdownRenderer::new(tokens::detail_markdown_theme())
+                .rule_width(width.saturating_sub(2).max(10))
+                .table_max_width(width.saturating_sub(2).max(10));
+        let (head, body) = self.main_go_detail_markdown(issue);
+        let mut text = renderer.render(&head);
+        if let Some(issue) = issue {
+            if let Some(url) = issue
+                .external_ref
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+            {
+                text.push_line(RichLine::from_spans([
+                    RichSpan::styled("🔗 External: ", tokens::primary_bold()),
+                    RichSpan::styled(url.to_string(), tokens::panel_title_focused())
+                        .link(url.to_string()),
+                    RichSpan::styled("  (o open, y copy)", tokens::muted_text()),
+                ]));
+            }
+            text.push_line(RichLine::from_spans([RichSpan::styled(
+                "C copy id • L label filter • w repo filter • t time-travel",
+                tokens::muted_text(),
+            )]));
+            text.push_line(RichLine::raw(""));
+        }
+        for line in renderer.render(&body).lines() {
+            text.push_line(line.clone());
+        }
+        text
+    }
+
+    /// (total, critical, warning) alert counts for the status bar, computed
+    /// once per loaded issue set.
+    fn status_alert_counts(&self) -> (usize, usize, usize) {
+        if !self.dismissed_alerts.is_empty() {
+            // Dismissals are rare; count what the alerts panel still shows.
+            use crate::analysis::alerts::AlertSeverity;
+            let rows = self.active_alert_rows();
+            let count = |severity| rows.iter().filter(|row| row.severity == severity).count();
+            return (
+                rows.len(),
+                count(AlertSeverity::Critical),
+                count(AlertSeverity::Warning),
+            );
+        }
+        // Cheap fingerprint of what alerts depend on (ids, statuses, update
+        // times, dependency counts) so a reload or a different data set in
+        // the same thread never reuses stale counts.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for issue in &self.analyzer.issues {
+                issue.id.hash(&mut hasher);
+                issue.status.hash(&mut hasher);
+                issue.priority.hash(&mut hasher);
+                issue.updated_at.map(|t| t.timestamp()).hash(&mut hasher);
+                issue.dependencies.len().hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        if let Some((cached, total, critical, warning)) = ALERT_COUNTS.with(Cell::get)
+            && cached == key
+        {
+            return (total, critical, warning);
+        }
+        let summary = self
+            .analyzer
+            .alerts(&crate::analysis::alerts::AlertOptions::default())
+            .summary;
+        ALERT_COUNTS.with(|cell| {
+            cell.set(Some((
+                key,
+                summary.total,
+                summary.critical,
+                summary.warning,
+            )));
+        });
+        (summary.total, summary.critical, summary.warning)
+    }
+
+    /// Go bv's status bar: filter badge, hints, status stats on the left;
+    /// issue count and key hints on the right (or a one-shot message).
+    fn main_go_status_bar(&self, width: u16) -> RichLine {
+        let width = usize::from(width);
+        if !self.status_msg.is_empty() {
+            let error = self.status_msg.to_ascii_lowercase().contains("error")
+                || self.status_msg.to_ascii_lowercase().contains("fail");
+            let text = format!("  {} {}  ", if error { "✗" } else { "✓" }, self.status_msg);
+            return RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&text, width, "…"),
+                tokens::status_message(error),
+            )]);
+        }
+        let (icon, name) = match self.list_filter {
+            ListFilter::All => ("📋", "ALL"),
+            ListFilter::Open => ("📂", "OPEN"),
+            ListFilter::InProgress => ("🔧", "IN PROGRESS"),
+            ListFilter::Blocked => ("⛔", "BLOCKED"),
+            ListFilter::Closed => ("✅", "CLOSED"),
+            ListFilter::Ready => ("🚀", "READY"),
+        };
+        let mode_hints = if matches!(self.mode, ViewMode::Actionable) {
+            " L:labels • h:detail ".to_string()
+        } else if matches!(self.mode, ViewMode::Graph) {
+            if self.graph_search_active || !self.graph_search_query.is_empty() {
+                let matches = self.graph_search_matches().len();
+                let position = if matches == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}/{matches}]",
+                        self.graph_search_match_cursor.min(matches - 1) + 1
+                    )
+                };
+                format!(
+                    " /{}{position} • n/N:match • enter:done • esc:cancel ",
+                    self.graph_search_query
+                )
+            } else {
+                " L:labels • h:detail ".to_string()
+            }
+        } else if matches!(self.mode, ViewMode::Insights) {
+            format!(" {} • L:labels • h:detail ", self.insights_panel.label())
+        } else if matches!(self.mode, ViewMode::LabelDashboard) {
+            self.label_dashboard
+                .as_ref()
+                .map_or_else(String::new, |result| {
+                    format!(
+                        " {} labels • {} critical • {} warning ",
+                        result.total_labels, result.critical_count, result.warning_count
+                    )
+                })
+        } else if matches!(self.mode, ViewMode::Attention) {
+            self.attention_result
+                .as_ref()
+                .map_or_else(String::new, |result| {
+                    format!(
+                        " top {} of {} labels by attention ",
+                        result.labels.len().min(ATTENTION_ROW_LIMIT),
+                        result.total_labels
+                    )
+                })
+        } else if matches!(self.mode, ViewMode::Tree) {
+            if self.tree_search_active || !self.tree_search_query.is_empty() {
+                let matches = self.tree_search_matches().len();
+                let position = if matches == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}/{matches}]",
+                        self.tree_search_match_cursor.min(matches - 1) + 1
+                    )
+                };
+                format!(
+                    " /{}{position} • n/N:match • enter:done • esc:cancel ",
+                    self.tree_search_query
+                )
+            } else {
+                " zo/zc:fold • zR/zM:all • /:search ".to_string()
+            }
+        } else if matches!(self.mode, ViewMode::History) {
+            let view = if matches!(self.history_view_mode, HistoryViewMode::Git) {
+                "b:beads"
+            } else {
+                "v:git"
+            };
+            format!(
+                " ≥{:.0}% c:conf • {view} • f:files • /:search ",
+                self.history_min_confidence() * 100.0
+            )
+        } else if matches!(self.mode, ViewMode::Board) {
+            if self.board_search_active || !self.board_search_query.is_empty() {
+                let matches = self.board_search_matches().len();
+                let position = if matches == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}/{matches}]",
+                        self.board_search_match_cursor.min(matches - 1) + 1
+                    )
+                };
+                format!(
+                    " /{}{position} • n/N:match • enter:done • esc:cancel ",
+                    self.board_search_query
+                )
+            } else {
+                " 1-4:col • o/c/r:filter • s:group • L:labels • /:search • ?:help ".to_string()
+            }
+        } else {
+            " L:labels • h:detail ".to_string()
+        };
+        let mut spans = vec![
+            RichSpan::styled(format!(" {icon} {name} "), tokens::status_filter_badge()),
+            RichSpan::styled(mode_hints, tokens::footer_hint()),
+        ];
+        if let Some(label) = self.modal_label_filter.as_deref() {
+            spans.push(RichSpan::styled(
+                format!(" 🏷 {label} "),
+                tokens::info_text(),
+            ));
+        }
+        if let Some(repo) = self.modal_repo_filter.as_deref() {
+            spans.push(RichSpan::styled(format!(" 🗂 {repo} "), tokens::info_text()));
+        }
+        let (total_alerts, critical_alerts, warning_alerts) = self.status_alert_counts();
+        if total_alerts > 0 {
+            let (icon, style) = if critical_alerts > 0 {
+                ("⚠", tokens::status_message(true))
+            } else if warning_alerts > 0 {
+                (
+                    "⚠",
+                    Style::new()
+                        .fg(tokens::FG_WARNING)
+                        .bg(tokens::BG_HIGHLIGHT)
+                        .bold(),
+                )
+            } else {
+                (
+                    "ℹ",
+                    Style::new().fg(tokens::FG_INFO).bg(tokens::BG_HIGHLIGHT),
+                )
+            };
+            spans.push(RichSpan::styled(
+                format!(" {icon} {total_alerts} alerts (!) "),
+                style,
+            ));
+            spans.push(RichSpan::raw(" "));
+        }
+        let issues = &self.analyzer.issues;
+        let not_closed = issues.iter().filter(|issue| issue.is_open_like()).count();
+        let closed = issues.len() - not_closed;
+        let blocked = issues
+            .iter()
+            .filter(|issue| issue.normalized_status() == "blocked")
+            .count();
+        let ready = self.analyzer.graph.actionable_ids_at(tui_now()).len();
+        let stats_bg = tokens::status_stats_bg();
+        spans.push(RichSpan::styled(" ", Style::new().bg(stats_bg)));
+        for (glyph, color, count) in [
+            ("○", tokens::status_fg("open"), not_closed),
+            ("◉", tokens::FG_SUCCESS, ready),
+            ("◈", tokens::FG_WARNING, blocked),
+            ("●", tokens::FG_MUTED, closed),
+        ] {
+            spans.push(RichSpan::styled(glyph, Style::new().fg(color).bg(stats_bg)));
+            spans.push(RichSpan::styled(
+                format!("{count} "),
+                Style::new().fg(tokens::status_fg("")).bg(stats_bg),
+            ));
+        }
+
+        if self.slow_metrics_pending {
+            spans.push(RichSpan::styled(
+                " ◌ computing metrics… ",
+                tokens::info_text(),
+            ));
+        }
+
+        let sep = " │ ";
+        let mut hints: Vec<(&str, &str)> = Vec::new();
+        if matches!(self.mode, ViewMode::Sprint) {
+            hints.extend([("j/k", " sprint"), ("^j/k", " scroll"), ("S", " close")]);
+        } else if matches!(self.mode, ViewMode::FlowMatrix) {
+            if self.flow_drilldown.is_some() {
+                hints.extend([("j/k", " endpoint"), ("⏎", " details"), ("esc", " back")]);
+            } else {
+                hints.extend([
+                    ("j/k", " nav"),
+                    ("tab", " panel"),
+                    ("⏎", " drill"),
+                    ("esc", " back"),
+                ]);
+            }
+        } else if matches!(self.mode, ViewMode::LabelDashboard | ViewMode::Attention) {
+            if matches!(self.focus, FocusPane::Detail) {
+                hints.push(("^j/k", " scroll"));
+            }
+            hints.push(("j/k", " nav"));
+            if matches!(self.mode, ViewMode::Attention) {
+                hints.push(("1-9", " filter"));
+            }
+            hints.extend([("⏎", " filter"), ("tab", " detail"), ("esc", " close")]);
+        } else if matches!(self.mode, ViewMode::Tree) {
+            if matches!(self.focus, FocusPane::Detail) {
+                hints.push(("^j/k", " scroll"));
+            }
+            hints.extend([
+                ("j/k", " nav"),
+                ("h/l", " fold"),
+                ("⏎", " toggle"),
+                ("tab", " detail"),
+                ("T", " list"),
+            ]);
+        } else if matches!(self.mode, ViewMode::History) {
+            if self.history_file_tree_focus {
+                hints.extend([("j/k", " tree"), ("⏎", " filter"), ("esc", " close tree")]);
+            } else {
+                hints.extend([
+                    ("j/k", " nav"),
+                    ("tab", " focus"),
+                    ("⏎", " jump"),
+                    ("y", " copy"),
+                ]);
+                if self.history_selected_commit_url().is_some() {
+                    hints.push(("o", " open commit"));
+                }
+                hints.push(("H", " close"));
+            }
+        } else if matches!(self.mode, ViewMode::Actionable) {
+            hints.extend([
+                ("j/k", " nav"),
+                ("tab", " tracks/items"),
+                ("⏎", " view"),
+                ("a", " list"),
+                ("?", " help"),
+            ]);
+        } else if matches!(self.mode, ViewMode::Graph) {
+            if matches!(self.focus, FocusPane::Detail) {
+                hints.push(("^j/k", " scroll"));
+            }
+            if self.should_open_selected_issue_external_ref() {
+                hints.push(("o", " open link"));
+                hints.push(("y", " copy link"));
+            }
+            hints.extend([
+                ("h/l", " nodes"),
+                ("j/k", " nodes"),
+                ("tab", " edges"),
+                ("/", " search"),
+                ("⏎", " details"),
+                ("g", " list"),
+            ]);
+        } else if matches!(self.mode, ViewMode::Insights) {
+            if matches!(self.focus, FocusPane::Detail) {
+                hints.push(("^j/k", " scroll"));
+                if self.should_open_selected_issue_external_ref() {
+                    hints.push(("o", " open link"));
+                    hints.push(("y", " copy link"));
+                }
+            }
+            hints.extend([
+                ("h/l", " panels"),
+                ("j/k", " items"),
+                ("/", " search"),
+                ("tab", " detail"),
+                ("?", " help"),
+            ]);
+        } else if matches!(self.mode, ViewMode::Board) {
+            if matches!(self.focus, FocusPane::Detail) {
+                hints.push(("^j/k", " scroll"));
+                if self.should_open_selected_issue_external_ref() {
+                    hints.push(("o", " open link"));
+                    hints.push(("y", " copy link"));
+                }
+            }
+            hints.extend([
+                ("hjkl", " nav"),
+                ("G", " bottom"),
+                ("tab", " detail"),
+                ("b", " list"),
+            ]);
+        } else if matches!(self.focus, FocusPane::Detail) {
+            hints.push(("^j/k", " scroll"));
+            if self.should_open_selected_issue_external_ref() {
+                hints.push(("o", " open link"));
+                hints.push(("y", " copy link"));
+            }
+        }
+        if matches!(self.mode, ViewMode::Main) {
+            hints.extend([
+                ("tab", " focus"),
+                ("C", " copy"),
+                ("x", " export"),
+                ("/", " search"),
+                ("?", " help"),
+            ]);
+        }
+        let mut left_width: usize = spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        // Key hints matter more than the generic mode hints: when everything
+        // does not fit, the mode-hint segment (span 1) gives way first.
+        let full_right: usize = hints
+            .iter()
+            .map(|(key, desc)| display_width(key) + display_width(desc) + 3)
+            .sum::<usize>()
+            + display_width(&format!("{} issues  ", self.analyzer.issues.len()))
+            + 1;
+        if left_width + full_right >= width && spans.len() > 1 {
+            left_width -= display_width(spans[1].content.as_ref());
+            spans[1] = RichSpan::raw("");
+        }
+        // Drop trailing hints (then the count) until the right side fits.
+        let count = format!("{} issues  ", self.visible_issue_indices().len());
+        for keep in (0..=hints.len()).rev() {
+            let mut right = Vec::new();
+            if keep == hints.len() || keep > 0 {
+                right.push(RichSpan::styled(count.clone(), tokens::footer_dim()));
+            }
+            for (i, (key, desc)) in hints.iter().take(keep).enumerate() {
+                if i > 0 {
+                    right.push(RichSpan::styled(sep, tokens::footer_sep()));
+                }
+                right.push(RichSpan::styled(*key, tokens::footer_key()));
+                right.push(RichSpan::styled(*desc, tokens::footer_hint()));
+            }
+            right.push(RichSpan::raw(" "));
+            let right_width: usize = right
+                .iter()
+                .map(|span| display_width(span.content.as_ref()))
+                .sum();
+            if left_width + right_width < width {
+                spans.push(RichSpan::raw(" ".repeat(width - left_width - right_width)));
+                spans.extend(right);
+                break;
+            }
+        }
+        RichLine::from_spans(spans)
     }
 
     fn main_list_text(&self) -> String {
@@ -9563,6 +15240,9 @@ impl BvrApp {
             let query = self.history_search_query.trim();
             let visible = self.history_git_visible_commit_indices();
             let cache = self.history_git_cache.as_ref();
+            if cache.is_none() {
+                return format!("Git commits: {}", self.history_load_message());
+            }
 
             if visible.is_empty() {
                 if query.is_empty() {
@@ -9757,6 +15437,9 @@ impl BvrApp {
         };
         let commits = self.history_filtered_bead_commits(&issue.id);
         if commits.is_empty() {
+            if self.history_git_cache.is_none() {
+                return self.history_load_message();
+            }
             return format!("No commits correlated with {}.", issue.id);
         }
 
@@ -10305,6 +15988,7 @@ impl BvrApp {
         // Reset computed views.
         self.actionable_plan = None;
         self.attention_result = None;
+        self.dismissed_alerts.clear();
 
         // Recompute if in a derived view.
         match self.mode {
@@ -10318,7 +16002,10 @@ impl BvrApp {
     }
 
     fn move_attention_cursor(&mut self, delta: i32) {
-        let count = self.attention_result.as_ref().map_or(0, |r| r.labels.len());
+        let count = self
+            .attention_result
+            .as_ref()
+            .map_or(0, |r| r.labels.len().min(ATTENTION_ROW_LIMIT));
         if count == 0 {
             return;
         }
@@ -10424,9 +16111,10 @@ impl BvrApp {
         // label, and/or repo) so the tree only shows matching issues
         // (and their structural parents).
         let filter_active = self.has_active_filter();
+        let ready_ids = self.ready_ids_for_filter();
         let passes: Vec<bool> = issues
             .iter()
-            .map(|issue| self.issue_matches_filter(issue))
+            .map(|issue| self.issue_matches_filter(issue, &ready_ids))
             .collect();
 
         // Build a map from issue ID to index.
@@ -10456,7 +16144,7 @@ impl BvrApp {
 
         // Deduplicate and sort children lists.
         for children in children_of.values_mut() {
-            children.sort_by(|&a, &b| issues[a].id.cmp(&issues[b].id));
+            children.sort_by(|&a, &b| go_tree_order(&issues[a], &issues[b]));
             children.dedup();
         }
 
@@ -10488,7 +16176,7 @@ impl BvrApp {
                 }
             }
             for children in blocking_children_of.values_mut() {
-                children.sort_by(|&a, &b| issues[a].id.cmp(&issues[b].id));
+                children.sort_by(|&a, &b| go_tree_order(&issues[a], &issues[b]));
                 children.dedup();
             }
 
@@ -10499,7 +16187,7 @@ impl BvrApp {
             children_of = blocking_children_of;
         }
 
-        roots.sort_by(|&a, &b| issues[a].id.cmp(&issues[b].id));
+        roots.sort_by(|&a, &b| go_tree_order(&issues[a], &issues[b]));
 
         // When a list filter is active, compute which nodes are "visible":
         // an issue that matches the filter, plus any ancestor whose subtree
@@ -11090,8 +16778,22 @@ impl BvrApp {
     fn compute_label_dashboard(&mut self) {
         use crate::analysis::label_intel::compute_all_label_health;
         let metrics = self.analyzer.graph.compute_metrics();
-        let result =
+        let mut result =
             compute_all_label_health(&self.analyzer.issues, &self.analyzer.graph, &metrics);
+        // Go bv's dashboard order: critical, then warning, then healthy;
+        // within a level the most blocked, then the least healthy, then name.
+        let level_rank = |level: &str| match level {
+            "critical" => 0,
+            "warning" => 1,
+            _ => 2,
+        };
+        result.labels.sort_by(|a, b| {
+            level_rank(&a.health_level)
+                .cmp(&level_rank(&b.health_level))
+                .then_with(|| b.blocked_count.cmp(&a.blocked_count))
+                .then_with(|| a.health.cmp(&b.health))
+                .then_with(|| a.label.cmp(&b.label))
+        });
         self.label_dashboard = Some(result);
     }
 
@@ -11273,6 +16975,7 @@ impl BvrApp {
             self.mode = ViewMode::FlowMatrix;
             self.flow_matrix_row_cursor = 0;
             self.flow_matrix_col_cursor = 0;
+            self.flow_drilldown = None;
             self.compute_flow_matrix();
         }
     }
@@ -11784,8 +17487,9 @@ impl BvrApp {
         } else {
             self.load_sprint_data();
             self.mode = ViewMode::Sprint;
-            self.sprint_cursor = 0;
+            self.sprint_cursor = go_active_sprint_index(&self.sprint_data, sprint_reference_now());
             self.sprint_issue_cursor = 0;
+            self.detail_scroll_offset = 0;
         }
     }
 
@@ -12417,6 +18121,9 @@ impl BvrApp {
                     .strip_prefix("External: ")
                     .is_some_and(|rendered| rendered == url || rendered.ends_with('…'))
             {
+                continue;
+            } else if let Some(styled_line) = go_graph_metric_line(line) {
+                lines.push(styled_line);
                 continue;
             } else if let Some(styled_line) = styled_detail_summary_line(line) {
                 lines.push(styled_line);
@@ -13598,7 +19305,7 @@ impl BvrApp {
                 self.analyzer.graph.node_count(),
                 self.analyzer.graph.edge_count(),
                 self.analyzer.metrics.cycles.len(),
-                self.analyzer.graph.actionable_ids().len()
+                self.analyzer.graph.actionable_ids_at(tui_now()).len()
             ),
             format!(
                 "Focus: node {focus_position}/{total_focusable} -> {} ({})",
@@ -14221,6 +19928,133 @@ fn open_url_in_browser(url: &str) -> bool {
     }
 }
 
+/// One help-overlay section: title and (key, description) bindings.
+struct HelpSection {
+    title: &'static str,
+    bindings: Vec<(&'static str, &'static str)>,
+}
+
+/// The keyboard reference shown by `?`, shared by the boxed (Go-style)
+/// and scrollable text renderings.
+fn help_sections() -> Vec<HelpSection> {
+    vec![
+        HelpSection {
+            title: "Navigation",
+            bindings: vec![
+                ("j/k", "Move selection up/down"),
+                ("arrows", "Move selection up/down"),
+                ("h/l", "Lateral nav (lanes, peers)"),
+                ("Ctrl+d/u", "Jump down/up by 10"),
+                ("Ctrl+j/k", "Scroll detail pane"),
+                ("Ctrl+←/→", "Resize active pane split"),
+                ("Ctrl+0", "Reset pane splits"),
+                ("PgUp/PgDn", "Jump by 10"),
+                ("Home/End", "Jump to top/bottom"),
+                ("gg", "Jump to top (any view)"),
+                ("G", "Jump to bottom"),
+                ("Ctrl+f/b", "Full page down/up"),
+                ("Tab / Shift+Tab", "Toggle focus forward/back"),
+                ("J/K", "Navigate deps in detail"),
+                ("Enter", "Return to main / drill"),
+                ("scroll", "Mouse wheel scrolls list"),
+                ("divider click", "Mouse-resize active divider"),
+            ],
+        },
+        HelpSection {
+            title: "Views",
+            bindings: vec![
+                ("a", "Toggle actionable mode"),
+                ("b", "Toggle board mode"),
+                ("i", "Toggle insights mode"),
+                ("g", "Toggle graph mode"),
+                ("H", "Toggle history mode"),
+                ("]", "Toggle attention mode"),
+                ("T / E", "Toggle tree view"),
+                ("[", "Toggle label dashboard"),
+                ("f", "Toggle flow matrix"),
+                ("!", "Alerts panel"),
+                ("v", "History: bead/git toggle"),
+            ],
+        },
+        HelpSection {
+            title: "Filters",
+            bindings: vec![
+                ("o", "Filter: open only"),
+                ("c", "Filter: closed only"),
+                ("r", "Filter: ready only"),
+                ("s", "Cycle sort/grouping/panel"),
+            ],
+        },
+        HelpSection {
+            title: "Search",
+            bindings: vec![
+                ("/", "Start search"),
+                ("n/N", "Next/prev search match"),
+                ("Tab", "Cycle search mode (in /)"),
+                ("Esc", "Cancel search"),
+                ("Enter", "Confirm search"),
+            ],
+        },
+        HelpSection {
+            title: "Actions",
+            bindings: vec![
+                ("p", "Toggle priority hints"),
+                ("P", "Pages export wizard"),
+                ("C", "Copy issue ID"),
+                ("x", "Export issue markdown"),
+                ("O", "Open in editor"),
+                ("Ctrl+R/F5", "Refresh from disk"),
+            ],
+        },
+        HelpSection {
+            title: "History",
+            bindings: vec![
+                ("c", "Cycle confidence filter"),
+                ("y", "Copy SHA/ID"),
+                ("o", "Open commit in browser"),
+                ("f", "Toggle file tree"),
+            ],
+        },
+        HelpSection {
+            title: "Board",
+            bindings: vec![
+                ("1-4", "Jump to lane"),
+                ("L", "Jump to last lane"),
+                ("0/$", "First/last in lane"),
+                ("e", "Toggle empty lanes"),
+            ],
+        },
+        HelpSection {
+            title: "Tree",
+            bindings: vec![
+                ("Enter/za", "Toggle fold"),
+                ("zo/zc", "Open/close fold"),
+                ("zR/zM", "Open/close all folds"),
+                ("zz", "Recenter cursor"),
+            ],
+        },
+        HelpSection {
+            title: "Insights",
+            bindings: vec![
+                ("h/l s/S", "Step panels back/fwd"),
+                ("m", "Toggle heatmap"),
+                ("e", "Toggle explanations"),
+                ("x", "Toggle calc-proof"),
+            ],
+        },
+        HelpSection {
+            title: "Global",
+            bindings: vec![
+                ("?/F1", "Toggle this help"),
+                ("Esc", "Back / clear / quit"),
+                ("q", "Quit / back to main"),
+                ("` / Ctrl+T", "Interactive tutorial"),
+                ("Ctrl+C", "Quit immediately"),
+            ],
+        },
+    ]
+}
+
 fn mini_bar(value: f64, max: f64) -> String {
     let width: usize = 6;
     let ratio = if max > 0.0 { value / max } else { 0.0 };
@@ -14808,6 +20642,69 @@ fn summary_line_from_pairs(
     wrote_any.then_some(out)
 }
 
+/// Go bv styling for the graph-metrics block: the "GRAPH METRICS" banner,
+/// section headings, and metric rows whose bar and rank are colored by
+/// strength (green strong, orange middling, muted weak).
+fn go_graph_metric_line(line: &str) -> Option<RichLine> {
+    if line == "GRAPH METRICS" {
+        return Some(RichLine::from_spans([RichSpan::styled(
+            format!(" 📊 GRAPH METRICS{}", " ".repeat(60)),
+            tokens::list_column_header(),
+        )]));
+    }
+    if matches!(
+        line,
+        "Importance:" | "Flow & Connectivity:" | "Connections:"
+    ) {
+        return Some(RichLine::from_spans([RichSpan::styled(
+            line.trim_end_matches(':').to_string(),
+            tokens::primary_bold(),
+        )]));
+    }
+    let bar_start = line.find(['\u{2588}', '\u{2591}'])?;
+    if !line.starts_with("  ") {
+        return None;
+    }
+    let bar_end = line[bar_start..]
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '\u{2588}' | '\u{2591}'))
+        .map_or(line.len(), |(offset, _)| bar_start + offset);
+    let bar = &line[bar_start..bar_end];
+    let filled = bar.chars().filter(|ch| *ch == '\u{2588}').count();
+    let total = bar.chars().count().max(1);
+    let strength = filled as f64 / total as f64;
+    let bar_color = if strength >= 0.66 {
+        tokens::FG_SUCCESS
+    } else if strength >= 0.33 {
+        tokens::FG_WARNING
+    } else {
+        tokens::FG_MUTED
+    };
+    let (label, value) = line[..bar_start].trim_end().split_at(
+        line[..bar_start]
+            .trim_end()
+            .rfind(' ')
+            .map_or(0, |index| index + 1),
+    );
+    let rest = &line[bar_end..];
+    let rank_color = rest
+        .trim()
+        .strip_prefix('#')
+        .and_then(|rank| rank.parse::<usize>().ok())
+        .map_or(tokens::FG_MUTED, |rank| match rank {
+            1..=3 => tokens::FG_SUCCESS,
+            4..=50 => tokens::FG_WARNING,
+            _ => tokens::FG_MUTED,
+        });
+    Some(RichLine::from_spans([
+        RichSpan::styled(label.to_string(), tokens::row_id()),
+        RichSpan::styled(value.to_string(), Style::new().bold()),
+        RichSpan::raw("  "),
+        RichSpan::styled(bar.to_string(), Style::new().fg(bar_color)),
+        RichSpan::styled(rest.to_string(), Style::new().fg(rank_color)),
+    ]))
+}
+
 fn styled_detail_summary_line(line: &str) -> Option<RichLine> {
     if line.ends_with(':') && !line.starts_with("  ") {
         return Some(RichLine::from_spans([RichSpan::styled(
@@ -14993,7 +20890,7 @@ fn new_app_with_background(
     background_config: Option<BackgroundModeConfig>,
 ) -> BvrApp {
     #[cfg(not(test))]
-    let initial_data_hash = compute_data_hash(&issues);
+    let initial_snapshot_hash = compute_snapshot_hash(&issues);
     #[cfg(not(test))]
     let background_runtime = background_config.map(|config| {
         let mut timeline = VecDeque::new();
@@ -15003,7 +20900,7 @@ fn new_app_with_background(
             config: config.normalized(),
             in_flight: false,
             cancel_requested: Arc::new(AtomicBool::new(false)),
-            last_data_hash: initial_data_hash,
+            last_snapshot_hash: initial_snapshot_hash,
             timeline,
         }
     });
@@ -15053,6 +20950,7 @@ fn new_app_with_background(
         history_related_bead_cursor: 0,
         history_bead_commit_cursor: 0,
         history_git_cache: None,
+        history_load: HistoryLoadState::default(),
         history_search_active: false,
         history_search_query: String::new(),
         history_search_match_cursor: 0,
@@ -15102,6 +21000,10 @@ fn new_app_with_background(
         flow_matrix: None,
         flow_matrix_row_cursor: 0,
         flow_matrix_col_cursor: 0,
+        flow_drilldown: None,
+        dismissed_alerts: std::collections::HashSet::new(),
+        show_shortcuts_sidebar: false,
+        shortcuts_sidebar_scroll: 0,
         time_travel_ref_input: String::new(),
         time_travel_input_active: false,
         time_travel_diff: None,
@@ -15125,6 +21027,19 @@ fn new_app_with_background(
     };
     app.select_first_visible();
     app
+}
+
+/// Apply a `--theme` preference (`light`, `dark`, or `auto`) for this
+/// process. Must be called before the TUI renders; the first call wins.
+pub fn set_theme_preference(value: &str) -> Result<()> {
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    let mode = tokens::parse_theme_preference(value, colorfgbg.as_deref()).ok_or_else(|| {
+        BvrError::InvalidArgument(format!(
+            "invalid --theme {value:?}: expected light, dark, or auto"
+        ))
+    })?;
+    let _ = tokens::THEME_OVERRIDE.set(mode);
+    Ok(())
 }
 
 pub fn run_tui(issues: Vec<Issue>) -> Result<()> {
@@ -15157,6 +21072,24 @@ fn interactive_frame_budget() -> ftui::render::budget::FrameBudgetConfig {
     ftui::render::budget::FrameBudgetConfig::strict(std::time::Duration::from_secs(1))
 }
 
+impl BvrApp {
+    /// Computed views initialise their data lazily when toggled via
+    /// keybinding, but `--view` and `--debug-render` bypass those toggle
+    /// functions. Trigger the same initialisation so the view is populated
+    /// on the very first frame.
+    fn initialize_view_data(&mut self) {
+        match self.mode {
+            ViewMode::Tree => self.build_tree_flat_nodes(),
+            ViewMode::LabelDashboard => self.compute_label_dashboard(),
+            ViewMode::FlowMatrix => self.compute_flow_matrix(),
+            ViewMode::Sprint => self.load_sprint_data(),
+            ViewMode::Actionable => self.compute_actionable_plan(),
+            ViewMode::Attention => self.compute_attention(),
+            _ => {}
+        }
+    }
+}
+
 pub fn run_tui_with_background(
     issues: Vec<Issue>,
     background_config: Option<BackgroundModeConfig>,
@@ -15168,25 +21101,423 @@ pub fn run_tui_with_background(
     if let Some(filter) = initial_filter {
         model.list_filter = filter;
     }
-    // Computed views initialise their data lazily when toggled via
-    // keybinding, but `--view` bypasses those toggle functions.
-    // Trigger the same initialisation here so the view is populated
-    // on the very first frame.
-    match mode {
-        ViewMode::Tree => model.build_tree_flat_nodes(),
-        ViewMode::LabelDashboard => model.compute_label_dashboard(),
-        ViewMode::FlowMatrix => model.compute_flow_matrix(),
-        ViewMode::Sprint => model.load_sprint_data(),
-        ViewMode::Actionable => model.compute_actionable_plan(),
-        ViewMode::Attention => model.compute_attention(),
-        _ => {}
-    }
+    model.initialize_view_data();
     model.select_first_visible();
     App::new(model)
         .screen_mode(ScreenMode::AltScreen)
         .with_budget(interactive_frame_budget())
         .run()
         .map_err(|error| BvrError::Tui(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Interactive tutorial (Go bv's `TutorialModel`)
+// ---------------------------------------------------------------------------
+
+fn tutorial_accent(accent: crate::tutorial::Accent) -> PackedRgba {
+    use crate::tutorial::Accent;
+    match accent {
+        Accent::Open => tokens::status_fg("open"),
+        Accent::InProgress => tokens::status_fg("in_progress"),
+        Accent::Blocked => tokens::status_fg("blocked"),
+        Accent::Closed => tokens::status_fg("closed"),
+        Accent::Primary => tokens::status_fg("review"),
+        Accent::Feature => tokens::FG_WARNING,
+    }
+}
+
+/// Wrap `text` to `width` columns, each line prefixed by `indent`.
+fn tutorial_wrap(text: &str, width: usize, indent: &str, style: Style) -> Vec<RichLine> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let wrapped = ftui::text::wrap_text(
+            paragraph,
+            width.saturating_sub(display_width(indent)).max(8),
+            ftui::text::WrapMode::WordChar,
+        );
+        if wrapped.is_empty() {
+            lines.push(RichLine::raw(indent.to_string()));
+        }
+        for line in wrapped {
+            lines.push(RichLine::from_spans([
+                RichSpan::raw(indent.to_string()),
+                RichSpan::styled(line, style),
+            ]));
+        }
+    }
+    lines
+}
+
+/// A rounded box around wrapped text, its title span in `color`.
+fn tutorial_box(label: &str, text: &str, color: PackedRgba, width: usize) -> Vec<RichLine> {
+    let width = width.max(12);
+    let inner = width - 4;
+    let border = Style::new().fg(color);
+    let mut lines = vec![RichLine::from_spans([RichSpan::styled(
+        format!("╭{}╮", "─".repeat(width - 2)),
+        border,
+    )])];
+    let body = format!("{label}{text}");
+    for (idx, line) in ftui::text::wrap_text(&body, inner, ftui::text::WrapMode::WordChar)
+        .into_iter()
+        .enumerate()
+    {
+        let pad = inner.saturating_sub(display_width(&line));
+        let mut spans = vec![RichSpan::styled("│ ", border)];
+        if idx == 0 && line.starts_with(label) {
+            spans.push(RichSpan::styled(label.to_string(), border.bold()));
+            spans.push(RichSpan::raw(line[label.len()..].to_string()));
+        } else {
+            spans.push(RichSpan::raw(line));
+        }
+        spans.push(RichSpan::raw(" ".repeat(pad)));
+        spans.push(RichSpan::styled(" │", border));
+        lines.push(RichLine::from_spans(spans));
+    }
+    lines.push(RichLine::from_spans([RichSpan::styled(
+        format!("╰{}╯", "─".repeat(width - 2)),
+        border,
+    )]));
+    lines
+}
+
+fn tutorial_tree_lines(
+    nodes: &[crate::tutorial::TreeNode],
+    prefix: &str,
+    lines: &mut Vec<RichLine>,
+) {
+    for (idx, node) in nodes.iter().enumerate() {
+        let last = idx + 1 == nodes.len();
+        lines.push(RichLine::from_spans([
+            RichSpan::styled(
+                format!("{prefix}{}", if last { "└── " } else { "├── " }),
+                tokens::muted_text(),
+            ),
+            RichSpan::raw(node.label),
+        ]));
+        let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+        tutorial_tree_lines(node.children, &child_prefix, lines);
+    }
+}
+
+/// Render one tutorial page's elements, as Go bv's tutorial components do.
+fn tutorial_page_lines(page: &crate::tutorial::Page, width: usize) -> Vec<RichLine> {
+    use crate::tutorial::Element;
+    let accent = tokens::primary_bold();
+    let mut lines = Vec::new();
+    for element in page.elements {
+        match element {
+            Element::Section(title) => {
+                lines.push(RichLine::from_spans([RichSpan::styled(*title, accent)]));
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    "─".repeat(display_width(title).max(3)),
+                    tokens::muted_text(),
+                )]));
+            }
+            Element::Paragraph(text) => {
+                lines.extend(tutorial_wrap(text, width, "", Style::new()));
+            }
+            Element::Spacer(count) => {
+                lines.extend((0..(*count).max(1)).map(|_| RichLine::raw("")));
+            }
+            Element::Bullet(items) => {
+                for item in *items {
+                    let mut wrapped = tutorial_wrap(item, width, "    ", Style::new());
+                    if let Some(first) = wrapped.first_mut() {
+                        let rest: Vec<RichSpan<'static>> =
+                            first.spans().iter().skip(1).cloned().collect();
+                        *first = RichLine::from_spans(
+                            std::iter::once(RichSpan::styled("  • ", accent)).chain(rest),
+                        );
+                    }
+                    lines.extend(wrapped);
+                }
+            }
+            Element::Tip(text) => {
+                lines.extend(tutorial_box("💡 TIP  ", text, tokens::FG_WARNING, width));
+            }
+            Element::Note(text) => {
+                lines.extend(tutorial_box(
+                    "ℹ️  NOTE ",
+                    text,
+                    tokens::status_fg("in_progress"),
+                    width,
+                ));
+            }
+            Element::Warning(text) => {
+                lines.extend(tutorial_box(
+                    "⚠️  WARN ",
+                    text,
+                    tokens::status_fg("blocked"),
+                    width,
+                ));
+            }
+            Element::InfoBox(title, text, color) => {
+                lines.extend(tutorial_box(
+                    &format!("{title} — "),
+                    text,
+                    tutorial_accent(*color),
+                    width,
+                ));
+            }
+            Element::ValueProp(icon, text) => {
+                let mut wrapped = tutorial_wrap(text, width, "    ", Style::new());
+                if let Some(first) = wrapped.first_mut() {
+                    let rest: Vec<RichSpan<'static>> =
+                        first.spans().iter().skip(1).cloned().collect();
+                    let icon = format!(
+                        "{icon}{}",
+                        " ".repeat(4usize.saturating_sub(display_width(icon)))
+                    );
+                    *first = RichLine::from_spans(
+                        std::iter::once(RichSpan::styled(icon, accent)).chain(rest),
+                    );
+                }
+                lines.extend(wrapped);
+            }
+            Element::Code(code) => {
+                for line in code.lines() {
+                    lines.push(RichLine::from_spans([
+                        RichSpan::styled("│ ", accent),
+                        RichSpan::styled(
+                            truncate_with_ellipsis(line, width.saturating_sub(2), "…"),
+                            tokens::success_text(),
+                        ),
+                    ]));
+                }
+            }
+            Element::KeyTable(rows) => {
+                for (key, desc) in *rows {
+                    lines.push(RichLine::from_spans([
+                        RichSpan::styled(format!(" {key:<17} "), accent),
+                        RichSpan::raw(truncate_with_ellipsis(desc, width.saturating_sub(20), "…")),
+                    ]));
+                }
+            }
+            Element::StatusFlow(steps) => {
+                let mut top = Vec::new();
+                let mut mid = Vec::new();
+                let mut bottom = Vec::new();
+                for (idx, (label, color)) in steps.iter().enumerate() {
+                    let style = Style::new().fg(tutorial_accent(*color));
+                    let w = display_width(label) + 2;
+                    top.push(RichSpan::styled(format!("╭{}╮", "─".repeat(w)), style));
+                    mid.push(RichSpan::styled(format!("│ {label} │"), style));
+                    bottom.push(RichSpan::styled(format!("╰{}╯", "─".repeat(w)), style));
+                    if idx + 1 < steps.len() {
+                        top.push(RichSpan::raw("   "));
+                        mid.push(RichSpan::styled(" → ", tokens::muted_text().bold()));
+                        bottom.push(RichSpan::raw("   "));
+                    }
+                }
+                lines.push(RichLine::from_spans(top));
+                lines.push(RichLine::from_spans(mid));
+                lines.push(RichLine::from_spans(bottom));
+            }
+            Element::Tree(root, children) => {
+                lines.push(RichLine::from_spans([RichSpan::styled(*root, accent)]));
+                tutorial_tree_lines(children, "", &mut lines);
+            }
+            Element::Divider => {
+                lines.push(RichLine::from_spans([RichSpan::styled(
+                    "─".repeat(width.saturating_sub(4).max(10)),
+                    tokens::muted_text(),
+                )]));
+            }
+        }
+    }
+    lines
+}
+
+/// Go bv's tutorial modal: title with page counter and viewed-progress bar,
+/// the page title and section, the page (with the table of contents beside
+/// it when toggled), and scroll cues.
+fn render_tutorial(frame: &mut Frame, area: Rect, state: &TutorialState) {
+    let pages = crate::tutorial::pages();
+    semantic_panel_block("", true, SemanticTone::Accent).render(area, frame);
+    let inner = block_inner_rect(area);
+    let body = Rect::new(
+        inner.x.saturating_add(2),
+        inner.y.saturating_add(1),
+        inner.width.saturating_sub(4),
+        inner.height.saturating_sub(2),
+    );
+    let Some(page) = pages.get(state.page) else {
+        Paragraph::new("No tutorial pages available.").render(body, frame);
+        return;
+    };
+    let width = usize::from(body.width);
+    let viewed = state.viewed.len().max(1);
+    let percent = viewed * 100 / pages.len().max(1);
+    let filled = (percent / 10).clamp(1, 10);
+    let header = vec![
+        RichLine::from_spans([
+            RichSpan::styled("📚 beads_viewer Tutorial", tokens::primary_bold()),
+            RichSpan::styled(
+                format!("  Page {}/{} · {percent}% ", state.page + 1, pages.len()),
+                Style::new().fg(tokens::FG_SUBTEXT),
+            ),
+            RichSpan::styled("█".repeat(filled), tokens::success_text()),
+            RichSpan::styled("░".repeat(10 - filled), tokens::muted_text()),
+        ]),
+        RichLine::from_spans([RichSpan::styled("─".repeat(width), tokens::muted_text())]),
+        RichLine::from_spans([
+            RichSpan::styled(page.title, tokens::primary_bold()),
+            RichSpan::styled(
+                format!(" — {}", page.section),
+                Style::new().fg(tokens::FG_SUBTEXT).italic(),
+            ),
+        ]),
+    ];
+    let header_rows = u16::try_from(header.len()).unwrap_or(3);
+    Paragraph::new(RichText::from_lines(header))
+        .wrap(ftui::text::WrapMode::None)
+        .render(
+            Rect::new(body.x, body.y, body.width, header_rows.min(body.height)),
+            frame,
+        );
+
+    let content_area = Rect::new(
+        body.x,
+        body.y + header_rows.min(body.height),
+        body.width,
+        body.height.saturating_sub(header_rows),
+    );
+    let (toc_area, page_area) = if state.toc_visible && content_area.width > 50 {
+        (
+            Some(Rect::new(
+                content_area.x,
+                content_area.y,
+                24,
+                content_area.height,
+            )),
+            Rect::new(
+                content_area.x + 26,
+                content_area.y,
+                content_area.width - 26,
+                content_area.height,
+            ),
+        )
+    } else {
+        (None, content_area)
+    };
+    if let Some(toc_area) = toc_area {
+        render_tutorial_toc(frame, toc_area, state);
+    }
+
+    let lines = tutorial_page_lines(page, usize::from(page_area.width));
+    let visible = usize::from(page_area.height).saturating_sub(2).max(1);
+    let max_scroll = lines.len().saturating_sub(visible);
+    let scroll = state.scroll.min(max_scroll);
+    let mut shown = Vec::with_capacity(visible + 2);
+    if scroll > 0 {
+        shown.push(RichLine::from_spans([RichSpan::styled(
+            "↑ more above",
+            tokens::muted_text(),
+        )]));
+    }
+    let more_below = scroll + visible < lines.len();
+    shown.extend(lines.into_iter().skip(scroll).take(visible));
+    if more_below {
+        shown.push(RichLine::from_spans([RichSpan::styled(
+            "↓ more below",
+            tokens::muted_text(),
+        )]));
+    }
+    Paragraph::new(RichText::from_lines(shown))
+        .wrap(ftui::text::WrapMode::None)
+        .render(page_area, frame);
+}
+
+fn render_tutorial_toc(frame: &mut Frame, area: Rect, state: &TutorialState) {
+    Block::bordered()
+        .border_style(if state.toc_focus {
+            tokens::primary_bold()
+        } else {
+            tokens::muted_text()
+        })
+        .render(area, frame);
+    let inner = block_inner_rect(area);
+    let mut lines = vec![RichLine::from_spans([
+        RichSpan::styled("Contents", tokens::primary_bold()),
+        RichSpan::styled(
+            if state.toc_focus { " ●" } else { "" },
+            tokens::primary_bold(),
+        ),
+    ])];
+    let mut section = "";
+    let mut cursor_line = 0;
+    for (idx, page) in crate::tutorial::pages().iter().enumerate() {
+        if page.section != section {
+            section = page.section;
+            lines.push(RichLine::raw(""));
+            lines.push(RichLine::from_spans([RichSpan::styled(
+                truncate_with_ellipsis(&format!("▸ {section}"), usize::from(inner.width), "…"),
+                tokens::row_id().bold(),
+            )]));
+        }
+        let (prefix, style) = if state.toc_focus && idx == state.toc_cursor {
+            cursor_line = lines.len();
+            (
+                " → ",
+                Style::new()
+                    .fg(tokens::status_fg("in_progress"))
+                    .bg(tokens::row_highlight_bg())
+                    .bold(),
+            )
+        } else if idx == state.page {
+            if !state.toc_focus {
+                cursor_line = lines.len();
+            }
+            (" ▶ ", tokens::primary_bold())
+        } else {
+            ("   ", Style::new().fg(tokens::FG_SUBTEXT))
+        };
+        let mut spans = vec![RichSpan::styled(
+            format!("{prefix}{}", truncate_with_ellipsis(page.title, 14, "…")),
+            style,
+        )];
+        if state.viewed.contains(&idx) {
+            spans.push(RichSpan::styled(" ✓", tokens::success_text()));
+        }
+        lines.push(RichLine::from_spans(spans));
+    }
+    let visible = usize::from(inner.height);
+    let offset = (cursor_line + 1).saturating_sub(visible);
+    Paragraph::new(RichText::from_lines(lines))
+        .wrap(ftui::text::WrapMode::None)
+        .scroll((saturating_scroll_offset(offset), 0))
+        .render(inner, frame);
+}
+
+/// Context-sensitive key hints under the tutorial.
+fn tutorial_footer(state: &TutorialState) -> RichLine {
+    let hints: &[(&str, &str)] = if state.toc_focus && state.toc_visible {
+        &[
+            ("j/k", " select"),
+            ("Enter", " go to page"),
+            ("Tab", " back to content"),
+            ("t", " hide TOC"),
+            ("q", " close"),
+        ]
+    } else {
+        &[
+            ("←/→/Space", " pages"),
+            ("j/k", " scroll"),
+            ("Ctrl+d/u", " half-page"),
+            ("t", " TOC"),
+            ("q", " close"),
+        ]
+    };
+    let mut spans = vec![RichSpan::raw(" ")];
+    for (idx, (key, desc)) in hints.iter().enumerate() {
+        if idx > 0 {
+            spans.push(RichSpan::styled(" │ ", tokens::footer_sep()));
+        }
+        spans.push(RichSpan::styled(*key, tokens::primary_bold()));
+        spans.push(RichSpan::styled(*desc, tokens::footer_hint()));
+    }
+    RichLine::from_spans(spans)
 }
 
 /// Render a named TUI view non-interactively at the given dimensions and
@@ -15206,6 +21537,21 @@ pub fn render_debug_view(
     let mut app = new_app(issues, mode);
     if matches!(mode, ViewMode::History) && matches!(kind, DebugRenderKind::Layout) {
         app.history_view_mode = HistoryViewMode::Bead;
+    }
+    app.initialize_view_data();
+    // Show history as the interactive viewer does once git correlation has
+    // run. Tests keep the repository's live git log out of their renders.
+    #[cfg(not(test))]
+    if matches!(mode, ViewMode::History) {
+        let repo_root = app
+            .repo_root
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)?;
+        app.history_git_cache = Some(HistoryGitCache::load(
+            &repo_root,
+            &app.analyzer.issues,
+            &mut GitHistoryScan::default(),
+        )?);
     }
     let mut pool = ftui::GraphemePool::default();
     let mut frame = Frame::new(width, height, &mut pool);
@@ -15279,17 +21625,10 @@ fn parse_debug_render_target(view_name: &str) -> Result<(ViewMode, DebugRenderKi
         (view_name, DebugRenderKind::View)
     };
 
-    let mode = match base_name {
-        "insights" => ViewMode::Insights,
-        "board" => ViewMode::Board,
-        "history" => ViewMode::History,
-        "main" => ViewMode::Main,
-        "graph" => ViewMode::Graph,
-        other => {
-            return Err(BvrError::InvalidArgument(format!(
-                "Unknown debug-render view '{other}'. Supported: insights, board, history, main, graph"
-            )));
-        }
+    let Some(mode) = ViewMode::from_cli(base_name) else {
+        return Err(BvrError::InvalidArgument(format!(
+            "Unknown debug-render view '{base_name}'. Supported: main, board, insights, graph, history, actionable, attention, tree, labels, flow, timediff, sprint"
+        )));
     };
 
     Ok((mode, kind))
@@ -15495,6 +21834,29 @@ mod tests {
         should_apply_background_reload, sprint_reference_now, status_chip,
         styled_detail_summary_line, truncate_display, type_badge, wrap_command_hints,
     };
+
+    #[test]
+    fn theme_preference_parses_and_auto_detects() {
+        use super::tokens::{ThemeMode, detect_from_colorfgbg, parse_theme_preference};
+        assert_eq!(
+            parse_theme_preference("light", None),
+            Some(ThemeMode::Light)
+        );
+        assert_eq!(parse_theme_preference("DARK", None), Some(ThemeMode::Dark));
+        assert_eq!(
+            parse_theme_preference("auto", Some("0;15")),
+            Some(ThemeMode::Light)
+        );
+        assert_eq!(
+            parse_theme_preference("auto", Some("15;0")),
+            Some(ThemeMode::Dark)
+        );
+        assert_eq!(parse_theme_preference("neon", None), None);
+        assert_eq!(detect_from_colorfgbg(Some("0;default;7")), ThemeMode::Light);
+        assert_eq!(detect_from_colorfgbg(Some("7;8")), ThemeMode::Dark);
+        assert_eq!(detect_from_colorfgbg(Some("garbage")), ThemeMode::Dark);
+        assert_eq!(detect_from_colorfgbg(None), ThemeMode::Dark);
+    }
     use crate::analysis::Analyzer;
     use crate::analysis::diff::FieldChange;
     use crate::analysis::git_history::{
@@ -15861,6 +22223,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -15910,6 +22273,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -16176,17 +22543,26 @@ mod tests {
 
     #[test]
     fn background_reload_apply_requires_no_cancel_and_hash_change() {
-        assert!(should_apply_background_reload(
-            false, "new-hash", "old-hash"
-        ));
-        assert!(!should_apply_background_reload(
-            false,
-            "same-hash",
-            "same-hash"
-        ));
-        assert!(!should_apply_background_reload(
-            true, "new-hash", "old-hash"
-        ));
+        assert!(should_apply_background_reload(false, &[1; 32], &[2; 32]));
+        assert!(!should_apply_background_reload(false, &[1; 32], &[1; 32]));
+        assert!(!should_apply_background_reload(true, &[1; 32], &[2; 32]));
+    }
+
+    #[test]
+    fn background_reload_observes_description_changes_without_timestamp_updates() {
+        let issue = Issue {
+            id: "A".to_string(),
+            description: "Original description".to_string(),
+            updated_at: crate::model::ts("2026-10-10T00:00:00Z"),
+            ..Default::default()
+        };
+        let previous = crate::robot::compute_snapshot_hash(std::slice::from_ref(&issue));
+        let mut changed = issue;
+        changed.description = "Updated description".to_string();
+        let current = crate::robot::compute_snapshot_hash(std::slice::from_ref(&changed));
+
+        assert!(should_apply_background_reload(false, &current, &previous));
+        assert!(!should_apply_background_reload(true, &current, &previous));
     }
 
     #[test]
@@ -16254,7 +22630,7 @@ mod tests {
             .expect_err("unknown view should fail");
         let message = error.to_string();
         assert!(message.contains("Unknown debug-render view 'bogus'"));
-        assert!(message.contains("insights, board, history, main, graph"));
+        assert!(message.contains("main, board, insights, graph, history"));
     }
 
     #[test]
@@ -16738,17 +23114,23 @@ mod tests {
     }
 
     #[test]
-    fn insights_mode_h_l_switch_focus_panes() {
+    fn insights_mode_h_l_step_panels() {
+        // Go bv: h/l move between insight panels; Tab moves focus.
         let mut app = new_app(ViewMode::Insights, 0);
 
-        assert_eq!(app.focus, FocusPane::List);
+        assert_eq!(app.insights_panel, InsightsPanel::Bottlenecks);
         app.update(key(KeyCode::Char('l')));
-        assert_eq!(app.focus, FocusPane::Detail);
+        assert_eq!(app.insights_panel, InsightsPanel::Bottlenecks.next());
+        assert_eq!(app.focus, FocusPane::List);
         assert!(matches!(app.mode, ViewMode::Insights));
 
         app.update(key(KeyCode::Char('h')));
-        assert_eq!(app.focus, FocusPane::List);
-        assert!(matches!(app.mode, ViewMode::Insights));
+        assert_eq!(app.insights_panel, InsightsPanel::Bottlenecks);
+        app.update(key(KeyCode::Char('h')));
+        assert_eq!(app.insights_panel, InsightsPanel::Bottlenecks.prev());
+
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, FocusPane::Detail);
     }
 
     #[test]
@@ -16913,6 +23295,57 @@ mod tests {
         app.update(key(KeyCode::Escape));
         assert!(!app.main_search_active);
         assert!(app.main_search_query.is_empty());
+    }
+
+    fn paste(text: &str) -> Msg {
+        use ftui::core::event::{Event, PasteEvent};
+        Msg::from(Event::Paste(PasteEvent::bracketed(text)))
+    }
+
+    #[test]
+    fn paste_event_fills_main_search_without_running_shortcuts() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.update(key(KeyCode::Char('/')));
+        // Typed `n` moves to the next match; a pasted `n` is part of the text.
+        app.update(paste("ependen\n"));
+        assert!(app.main_search_active);
+        assert_eq!(app.main_search_query, "ependen");
+        assert_eq!(selected_issue_id(&app), "B");
+
+        app.update(key(KeyCode::Escape));
+        app.update(key(KeyCode::Char('/')));
+        app.update(paste("Ro\r\not\t\u{7}x"));
+        assert_eq!(app.main_search_query, "Ro ot x");
+    }
+
+    #[test]
+    fn paste_event_outside_an_input_field_is_ignored() {
+        let mut app = new_app(ViewMode::Main, 1);
+        let cmd = app.update(paste("qb/"));
+        assert!(!matches!(cmd, Cmd::Quit));
+        assert!(!app.show_quit_confirm);
+        assert!(!app.main_search_active);
+        assert!(app.main_search_query.is_empty());
+        assert!(matches!(app.mode, ViewMode::Main));
+        assert_eq!(selected_issue_id(&app), "B");
+    }
+
+    #[test]
+    fn paste_event_fills_picker_filter_and_resets_cursor() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.modal_overlay = Some(ModalOverlay::RepoPicker {
+            items: vec!["api".to_string(), "web".to_string()],
+            cursor: 1,
+            filter: "w".to_string(),
+        });
+        app.update(paste("eb"));
+        match &app.modal_overlay {
+            Some(ModalOverlay::RepoPicker { cursor, filter, .. }) => {
+                assert_eq!(filter, "web");
+                assert_eq!(*cursor, 0);
+            }
+            other => panic!("repo picker closed: {other:?}"),
+        }
     }
 
     #[test]
@@ -17642,6 +24075,215 @@ mod tests {
         assert_ne!(app.history_confidence_index, initial_index);
     }
 
+    fn history_task(cmd: Cmd<Msg>) -> Box<dyn FnOnce() -> Msg + Send> {
+        match cmd {
+            Cmd::Task(_, task) => task,
+            other => panic!("history must run as a background task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_load_is_deferred_and_navigation_remains_available() {
+        let repo = tempfile::tempdir().expect("history repo");
+        let mut app = new_app(ViewMode::Main, 0);
+        app.repo_root = Some(repo.path().to_path_buf());
+        let task = history_task(app.update(key(KeyCode::Char('H'))));
+        assert!(app.history_git_cache.is_none());
+        assert!(render_app(&app, 160, 40).contains("Loading Git history"));
+
+        let selected_before = selected_issue_id(&app);
+        assert!(matches!(app.update(key(KeyCode::Char('j'))), Cmd::None));
+        assert_ne!(selected_issue_id(&app), selected_before);
+        let selected_after = selected_issue_id(&app);
+        assert!(matches!(app.update(key(KeyCode::Char('v'))), Cmd::None));
+        assert_eq!(app.history_view_mode, HistoryViewMode::Git);
+        assert!(app.history_git_cache.is_none());
+
+        // Create the repository after requesting history: the task must read
+        // Git when the runtime executes it, never during the key handler.
+        std::fs::create_dir(repo.path().join(".beads")).expect("beads directory");
+        std::fs::write(
+            repo.path().join(".beads/issues.jsonl"),
+            "{\"id\":\"A\",\"title\":\"Root\",\"status\":\"open\"}\n",
+        )
+        .expect("bead record");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", ".beads/issues.jsonl"],
+            vec![
+                "-c",
+                "user.name=History Test",
+                "-c",
+                "user.email=history@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "-m",
+                "Record the initial bead",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo.path())
+                .output()
+                .expect("fixture git");
+            assert!(output.status.success(), "{output:?}");
+        }
+
+        app.update(key(KeyCode::Char('q')));
+        assert_eq!(app.mode, ViewMode::Main);
+        let reply = task();
+        assert!(
+            matches!(&reply, Msg::HistoryLoaded { result: Ok(cache), .. }
+            if cache.commits.len() == 1 && cache.histories["A"].commits.as_ref().is_some_and(|commits| commits.len() == 1))
+        );
+        assert!(matches!(app.update(reply), Cmd::None));
+        assert!(app.history_git_cache.is_some());
+        assert_eq!(app.mode, ViewMode::Main);
+        assert_eq!(app.focus, FocusPane::List);
+        assert_eq!(selected_issue_id(&app), selected_after);
+    }
+
+    #[test]
+    fn history_load_failure_is_visible_and_reentry_retries() {
+        let repo = tempfile::tempdir().expect("history repo");
+        let mut app = new_app(ViewMode::Main, 0);
+        app.repo_root = Some(repo.path().join("missing"));
+        let task = history_task(app.update(key(KeyCode::Char('H'))));
+        app.update(task());
+        assert!(app.history_git_cache.is_none());
+        assert!(app.history_load.error.is_some());
+        assert!(render_app(&app, 160, 40).contains("Git history failed"));
+        assert!(
+            app.history_load_message()
+                .contains("reopen history (H) to retry")
+        );
+        // Navigation cannot turn a failed request into endless automatic retries.
+        assert!(matches!(app.update(key(KeyCode::Char('v'))), Cmd::None));
+        assert!(app.history_load.error.is_some());
+
+        app.update(key(KeyCode::Char('q')));
+        app.repo_root = Some(repo.path().to_path_buf());
+        let retry = history_task(app.update(key(KeyCode::Char('H'))));
+        assert!(app.history_load.error.is_none());
+        app.update(retry());
+        assert!(app.history_load.error.is_none());
+        assert!(
+            app.history_git_cache
+                .as_ref()
+                .is_some_and(|cache| cache.commits.is_empty())
+        );
+        assert!(matches!(app.update(key(KeyCode::Char('v'))), Cmd::None));
+        assert!(
+            app.history_list_text()
+                .contains("No git commits correlated")
+        );
+    }
+
+    #[test]
+    fn history_load_preserves_search_selection_and_detail_focus() {
+        let repo = tempfile::tempdir().expect("history repo");
+        let issues = ["A", "B"]
+            .into_iter()
+            .map(|id| Issue {
+                id: id.into(),
+                title: format!("Root {id}"),
+                status: "open".into(),
+                ..Issue::default()
+            })
+            .collect();
+        let mut app = new_app_with_issues(ViewMode::Main, 0, issues);
+        app.repo_root = Some(repo.path().to_path_buf());
+        let task = history_task(app.update(key(KeyCode::Char('H'))));
+        let _ = render_app(&app, 160, 40);
+        app.update(key(KeyCode::Char('/')));
+        for ch in "root".chars() {
+            app.update(key(KeyCode::Char(ch)));
+        }
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(selected_issue_id(&app), "B");
+        app.update(key(KeyCode::Tab));
+        if app.focus != FocusPane::Detail {
+            app.update(key(KeyCode::Tab));
+        }
+        assert_eq!(app.focus, FocusPane::Detail);
+        assert!(app.history_git_cache.is_none());
+
+        app.update(task());
+        assert!(app.history_git_cache.is_some());
+        assert_eq!(app.history_search_query, "root");
+        assert_eq!(selected_issue_id(&app), "B");
+        assert_eq!(app.focus, FocusPane::Detail);
+    }
+
+    #[test]
+    fn history_load_rejects_stale_results_after_issue_reload() {
+        let repo = tempfile::tempdir().expect("history repo");
+        let mut app = new_app(ViewMode::History, 0);
+        app.repo_root = Some(repo.path().to_path_buf());
+        let first = history_task(app.init());
+        let old_result = first();
+        assert!(matches!(
+            &old_result,
+            Msg::HistoryLoaded { result: Ok(_), .. }
+        ));
+
+        app.analyzer = Analyzer::new(vec![Issue {
+            id: "NEW".into(),
+            title: "Reloaded issue".into(),
+            status: "open".into(),
+            ..Issue::default()
+        }]);
+        app.invalidate_git_history();
+        let next = history_task(app.update(Msg::Noop));
+        app.update(old_result);
+        assert!(app.history_git_cache.is_none());
+        assert!(app.history_load.cancellation.is_some());
+        app.update(next());
+        let cache = app.history_git_cache.as_ref().expect("new history");
+        assert_eq!(
+            cache
+                .histories
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["NEW"]
+        );
+        assert!(app.history_load.cancellation.is_none());
+    }
+
+    #[test]
+    fn history_load_is_cancelled_on_quit_and_drop() {
+        for quit in [true, false] {
+            let repo = tempfile::tempdir().expect("history repo");
+            let mut app = new_app(ViewMode::History, 0);
+            app.repo_root = Some(repo.path().to_path_buf());
+            let task = history_task(app.init());
+            if quit {
+                assert!(matches!(
+                    app.update(Msg::KeyPress(KeyCode::Char('c'), Modifiers::CTRL)),
+                    Cmd::Quit
+                ));
+                let reply = task();
+                assert!(
+                    matches!(&reply, Msg::HistoryLoaded { result: Err(error), .. } if error.contains("cancelled"))
+                );
+                app.update(reply);
+                assert!(app.history_git_cache.is_none());
+                assert!(app.history_load.error.is_none());
+            } else {
+                drop(app);
+                assert!(
+                    matches!(task(), Msg::HistoryLoaded { result: Err(error), .. } if error.contains("cancelled"))
+                );
+            }
+        }
+    }
+
     #[test]
     fn history_git_mode_c_cycles_confidence_and_clamps_cursor() {
         let mut app = history_app_with_git_cache(HistoryViewMode::Git, 0);
@@ -17852,6 +24494,7 @@ mod tests {
     #[test]
     fn history_git_search_zero_results_show_explicit_message() {
         let mut app = new_app(ViewMode::Main, 0);
+        inject_deterministic_git_cache(&mut app);
         app.update(key(KeyCode::Char('H')));
         app.update(key(KeyCode::Char('v')));
         assert!(matches!(app.mode, ViewMode::History));
@@ -17947,6 +24590,124 @@ mod tests {
     }
 
     #[test]
+    fn ready_filter_excludes_parked_and_deferred_issues() {
+        let now = super::tui_now();
+        let mut issues: Vec<Issue> = [
+            ("open", "open"),
+            ("working", " IN_PROGRESS "),
+            ("blocked", "blocked"),
+            ("deferred", "deferred"),
+            ("draft", "draft"),
+            ("pinned", "pinned"),
+            ("hooked", "hooked"),
+            ("review", "review"),
+            ("custom", "awaiting_review"),
+            ("closed", "closed"),
+            ("tombstone", "tombstone"),
+        ]
+        .into_iter()
+        .map(|(id, status)| Issue {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            ..Issue::default()
+        })
+        .collect();
+        for (id, until) in [
+            ("future", now + chrono::Duration::seconds(1)),
+            ("due", now),
+            ("past", now - chrono::Duration::seconds(1)),
+        ] {
+            issues.push(Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                status: "open".to_string(),
+                defer_until: Some(until),
+                ..Issue::default()
+            });
+        }
+        let mut app = new_app_with_issues(ViewMode::Main, 0, issues);
+        app.update(key(KeyCode::Char('r')));
+
+        let mut ids: Vec<&str> = app
+            .visible_issue_indices()
+            .into_iter()
+            .map(|index| app.analyzer.issues[index].id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["due", "open", "past", "working"]);
+        let rendered = render_app(&app, 160, 30);
+        assert!(rendered.contains("READY"), "{rendered}");
+        assert!(rendered.contains("◉4 "), "{rendered}");
+    }
+
+    #[test]
+    fn ready_filter_inherits_parent_blockers_and_preserves_scope() {
+        let mut issues: Vec<Issue> = [
+            ("blocker", "review", "core", "viewer"),
+            ("parent", "open", "core", "viewer"),
+            ("child", "open", "core", "viewer"),
+            ("grandchild", "in_progress", "core", "viewer"),
+            ("closed-blocker", "closed", "core", "viewer"),
+            ("ready", "open", "core", "viewer"),
+            ("other-label", "open", "docs", "viewer"),
+            ("other-repo", "open", "core", "other"),
+        ]
+        .into_iter()
+        .map(|(id, status, label, repo)| Issue {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            labels: vec![label.to_string()],
+            source_repo: repo.to_string(),
+            ..Issue::default()
+        })
+        .collect();
+        for (index, depends_on_id, dep_type) in [
+            (1, "blocker", "blocks"),
+            (2, "parent", "parent-child"),
+            (3, "child", "parent-child"),
+            (5, "closed-blocker", "blocks"),
+        ] {
+            let issue = &mut issues[index];
+            issue.dependencies.push(Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: depends_on_id.to_string(),
+                dep_type: dep_type.to_string(),
+                ..Dependency::default()
+            });
+        }
+        let mut app = new_app_with_issues(ViewMode::Main, 0, issues);
+        app.update(key(KeyCode::Char('r')));
+        let mut ids: Vec<&str> = app
+            .visible_issue_indices()
+            .into_iter()
+            .map(|index| app.analyzer.issues[index].id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["other-label", "other-repo", "ready"]);
+        assert!(render_app(&app, 160, 30).contains("◉3 "));
+
+        app.modal_label_filter = Some("CORE".to_string());
+        app.modal_repo_filter = Some("viewer".to_string());
+        let scoped_ids: Vec<&str> = app
+            .visible_issue_indices()
+            .into_iter()
+            .map(|index| app.analyzer.issues[index].id.as_str())
+            .collect();
+        assert_eq!(scoped_ids, ["ready"]);
+
+        app.mode = ViewMode::Tree;
+        app.build_tree_flat_nodes();
+        let tree_ids: Vec<&str> = app
+            .tree_flat_nodes
+            .iter()
+            .map(|node| app.analyzer.issues[node.issue_index].id.as_str())
+            .collect();
+        assert_eq!(tree_ids, ["ready"]);
+    }
+
+    #[test]
     fn list_navigation_respects_active_filter() {
         let mut app = new_app(ViewMode::Main, 0);
         app.update(key(KeyCode::Char('o')));
@@ -17986,6 +24747,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18035,6 +24797,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18096,6 +24862,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18145,6 +24912,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18200,6 +24971,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18249,6 +25021,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18322,6 +25098,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18371,6 +25148,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18428,6 +25209,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18477,6 +25259,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18535,6 +25321,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18584,6 +25371,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18643,6 +25434,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18692,6 +25484,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18746,6 +25542,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18795,6 +25592,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -18864,6 +25665,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -18913,6 +25715,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -19006,6 +25812,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -19055,6 +25862,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -19253,6 +26064,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -19302,6 +26114,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -19363,6 +26179,7 @@ mod tests {
             history_related_bead_cursor: 0,
             history_bead_commit_cursor: 0,
             history_git_cache: None,
+            history_load: super::HistoryLoadState::default(),
             history_search_active: false,
             history_search_query: String::new(),
             history_search_match_cursor: 0,
@@ -19412,6 +26229,10 @@ mod tests {
             flow_matrix: None,
             flow_matrix_row_cursor: 0,
             flow_matrix_col_cursor: 0,
+            flow_drilldown: None,
+            dismissed_alerts: std::collections::HashSet::new(),
+            show_shortcuts_sidebar: false,
+            shortcuts_sidebar_scroll: 0,
             time_travel_ref_input: String::new(),
             time_travel_input_active: false,
             time_travel_diff: None,
@@ -19651,11 +26472,14 @@ mod tests {
 
         app.mode = ViewMode::Board;
         let _ = render_app(&app, 100, 24);
+        app.update(Msg::KeyPress(KeyCode::Left, Modifiers::CTRL));
         assert_eq!(
             super::pane_split_state().two_pane_list_pct(Breakpoint::Medium),
             46.0
         );
 
+        app.mode = ViewMode::Main;
+        let _ = render_app(&app, 100, 24);
         for _ in 0..20 {
             app.update(Msg::KeyPress(KeyCode::Left, Modifiers::CTRL));
         }
@@ -19765,6 +26589,124 @@ mod tests {
             super::pane_split_state().two_pane_list_pct(Breakpoint::Medium),
             38.0
         );
+    }
+
+    #[test]
+    fn pane_split_full_width_views_ignore_hidden_resize_targets() {
+        for width in [60, 100, 160] {
+            for mode in ViewMode::navigation_order() {
+                let full_width = matches!(
+                    mode,
+                    ViewMode::Board
+                        | ViewMode::Insights
+                        | ViewMode::Actionable
+                        | ViewMode::Attention
+                        | ViewMode::Tree
+                        | ViewMode::LabelDashboard
+                        | ViewMode::FlowMatrix
+                        | ViewMode::Sprint
+                ) || (width < 80
+                    && matches!(mode, ViewMode::Main | ViewMode::Graph));
+                if !full_width {
+                    continue;
+                }
+                for focus in [FocusPane::List, FocusPane::Detail] {
+                    let mut app = new_app(mode, 0);
+                    app.initialize_view_data();
+                    app.focus = focus;
+                    let _ = render_app(&app, width, 30);
+                    let before = super::pane_split_state();
+                    assert!(
+                        super::splitter_hit_boxes(&app, width, 30).is_empty(),
+                        "{mode:?} at {width} columns must not expose a hidden splitter"
+                    );
+                    let old_divider_x = (f32::from(width)
+                        * before.two_pane_list_pct(Breakpoint::from_width(width))
+                        / 100.0) as u16;
+                    app.update(mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        old_divider_x,
+                        5,
+                    ));
+                    assert_eq!(app.focus, focus, "{mode:?} at {width} columns");
+                    app.update(key_ctrl(KeyCode::Right));
+                    app.update(mouse(MouseEventKind::ScrollDown, old_divider_x, 5));
+                    assert_eq!(
+                        super::pane_split_state(),
+                        before,
+                        "{mode:?} at {width} columns changed an invisible split"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_split_hidden_divider_wheel_navigates_full_width_board() {
+        let mut app = new_app(ViewMode::Board, 0);
+        let _ = render_app(&app, 100, 30);
+        let before = super::pane_split_state();
+        assert_eq!(selected_issue_id(&app), "A");
+
+        app.update(mouse(MouseEventKind::ScrollDown, 42, 5));
+
+        assert_eq!(selected_issue_id(&app), "B");
+        assert_eq!(app.focus, FocusPane::List);
+        assert_eq!(super::pane_split_state(), before);
+    }
+
+    #[test]
+    fn pane_split_history_hit_boxes_follow_visible_panes() {
+        for (width, view_mode, divider_count) in [
+            (80, HistoryViewMode::Bead, 1),
+            (120, HistoryViewMode::Bead, 2),
+            (160, HistoryViewMode::Bead, 3),
+            (160, HistoryViewMode::Git, 2),
+        ] {
+            let mut app = history_app_with_git_cache(view_mode, 0);
+            let _ = render_app(&app, width, 30);
+            let hit_boxes = super::splitter_hit_boxes(&app, width, 30);
+            assert_eq!(hit_boxes.len(), divider_count);
+            for hit_box in hit_boxes {
+                assert_eq!(hit_box.rect.y, 4, "history's header is not a divider");
+                assert_eq!(hit_box.rect.height, 25, "history's footer is not a divider");
+                let before = super::pane_split_state();
+                app.update(mouse(MouseEventKind::ScrollUp, hit_box.rect.x, 1));
+                assert_eq!(super::pane_split_state(), before);
+                app.update(mouse(
+                    MouseEventKind::ScrollUp,
+                    hit_box.rect.x,
+                    hit_box.rect.y + 1,
+                ));
+                assert_ne!(super::pane_split_state(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_split_graph_and_heatmap_keep_visible_resize_controls() {
+        for mode in [
+            ViewMode::Graph,
+            ViewMode::Insights,
+            ViewMode::TimeTravelDiff,
+        ] {
+            let mut app = new_app(mode, 0);
+            if mode == ViewMode::Insights {
+                app.insights_heatmap = Some(super::InsightsHeatmapState::default());
+            }
+            let _ = render_app(&app, 100, 30);
+            let hit_box = super::splitter_hit_boxes(&app, 100, 30)
+                .into_iter()
+                .next()
+                .expect("rendered two-pane view should remain resizable");
+            let before = super::pane_split_state();
+            app.update(mouse(
+                MouseEventKind::ScrollUp,
+                hit_box.rect.x,
+                hit_box.rect.y + 1,
+            ));
+            assert_ne!(super::pane_split_state(), before, "{mode:?}");
+        }
     }
 
     // -- Visual token tests --------------------------------------------------
@@ -19881,7 +26823,7 @@ mod tests {
             h.contains("[ Labels"),
             "wide header should expose secondary tabs"
         );
-        assert!(h.contains("] Flow"), "wide header should expose flow tab");
+        assert!(h.contains("f Flow"), "wide header should expose flow tab");
         assert!(
             h.contains("sort=default"),
             "wide header should show sort metric"
@@ -19908,7 +26850,7 @@ mod tests {
         let help = app.help_overlay_text(120);
         assert!(help.contains("Ctrl+\u{2190}/\u{2192}"));
         assert!(help.contains("Ctrl+0"));
-        assert!(help.contains("splitter click/scroll"));
+        assert!(help.contains("divider click"));
     }
 
     #[test]
@@ -20234,6 +27176,31 @@ mod tests {
     }
 
     #[test]
+    fn help_renders_go_style_section_boxes_with_every_binding() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.show_help = true;
+        let rendered = render_app(&app, 160, 50);
+        assert!(rendered.contains("Keyboard Shortcuts"), "{rendered}");
+        for section in super::help_sections() {
+            assert!(
+                rendered.contains(section.title),
+                "missing section {}",
+                section.title
+            );
+            let (_, last) = section.bindings.last().expect("section bindings");
+            assert!(
+                rendered.contains(last),
+                "{} lost its last binding {last}",
+                section.title
+            );
+        }
+
+        // Too short for the boxes: the scrollable text rendering is used.
+        let compact = render_app(&app, 160, 20);
+        assert!(compact.contains("[Navigation]"), "{compact}");
+    }
+
+    #[test]
     fn help_overlay_text_switches_column_layout_at_width_thresholds() {
         let app = new_app(ViewMode::Main, 0);
 
@@ -20512,28 +27479,32 @@ mod tests {
     fn history_standard_bead_renders_three_legacy_panes() {
         let app = history_app_with_git_cache(HistoryViewMode::Bead, 0);
         let text = render_app(&app, 120, 30);
-        assert!(text.contains("Beads With History [focus]"));
-        assert!(text.contains("Commits"));
-        assert!(text.contains("Commit Details"));
+        assert!(text.contains("HISTORY  ◈ Beads"));
+        assert!(text.contains("BEADS WITH HISTORY"));
+        assert!(text.contains("COMMITS"));
+        assert!(text.contains("COMMIT DETAILS"));
+        assert!(!text.contains("TIMELINE"));
     }
 
     #[test]
     fn history_standard_git_renders_three_legacy_panes() {
         let app = history_app_with_git_cache(HistoryViewMode::Git, 0);
         let text = render_app(&app, 120, 30);
-        assert!(text.contains("Commits [focus]"));
-        assert!(text.contains("Related Beads"));
-        assert!(text.contains("Commit Details"));
+        assert!(text.contains("HISTORY  ◉ Git"));
+        assert!(text.contains("COMMITS"));
+        assert!(text.contains("RELATED BEADS"));
+        assert!(text.contains("COMMIT DETAILS"));
+        assert!(text.contains("SHA: aaaa1111"));
     }
 
     #[test]
     fn history_wide_bead_renders_timeline_pane() {
         let app = history_app_with_git_cache(HistoryViewMode::Bead, 0);
         let text = render_app(&app, 160, 30);
-        assert!(text.contains("Beads With History [focus]"));
-        assert!(text.contains("Timeline: A"));
-        assert!(text.contains("Commits"));
-        assert!(text.contains("Commit Details"));
+        assert!(text.contains("BEADS WITH HISTORY"));
+        assert!(text.contains("TIMELINE: A"));
+        assert!(text.contains("COMMITS"));
+        assert!(text.contains("COMMIT DETAILS"));
     }
 
     #[test]
@@ -20850,7 +27821,7 @@ mod tests {
     fn history_status_line_shows_legacy_mode_indicator() {
         let bead_view =
             render_debug_view(sample_issues(), "history", 100, 30).expect("history view renders");
-        assert!(bead_view.contains("mode=History ◈ Beads"));
+        assert!(bead_view.contains("HISTORY  ◈ Beads"));
 
         let mut app = new_app(ViewMode::History, 0);
         app.handle_key(KeyCode::Char('v'), Modifiers::NONE);
@@ -20858,7 +27829,7 @@ mod tests {
         let mut frame = ftui::render::frame::Frame::new(100, 30, &mut pool);
         app.view(&mut frame);
         let git_view = buffer_to_text(&frame.buffer, &pool);
-        assert!(git_view.contains("mode=History ◉ Git"));
+        assert!(git_view.contains("HISTORY  ◉ Git"));
     }
 
     #[test]
@@ -21272,11 +28243,11 @@ mod tests {
             "expected history footer to advertise file-tree navigation, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("Enter filter"),
+            rendered.contains("⏎ filter"),
             "expected history footer to advertise file-tree filtering, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("Esc close tree"),
+            rendered.contains("esc close tree"),
             "expected history footer to advertise closing the file tree, got:\n{rendered}"
         );
         assert!(
@@ -21455,20 +28426,8 @@ mod tests {
             "expected inline external-ref action hint, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("(C copy id)"),
-            "expected issue-id action hint, got:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("(w repo filter)"),
-            "expected repo-filter action hint, got:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("(L label filter)"),
-            "expected label-filter action hint, got:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("(t time-travel)"),
-            "expected time-travel action hint, got:\n{rendered}"
+            rendered.contains("C copy id • L label filter • w repo filter • t time-travel"),
+            "expected detail action hints, got:\n{rendered}"
         );
     }
 
@@ -21764,11 +28723,11 @@ mod tests {
 
         let rendered = render_app(&app, 240, 40);
         assert!(
-            rendered.contains("Tab focus"),
+            rendered.contains("tab detail"),
             "expected board footer to advertise focus switching, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("/ search"),
+            rendered.contains("/:search"),
             "expected board footer to advertise search, got:\n{rendered}"
         );
     }
@@ -21824,9 +28783,9 @@ mod tests {
     fn insights_footer_advertises_focus_and_search_controls() {
         let app = new_app(ViewMode::Insights, 0);
 
-        let rendered = render_app(&app, 120, 40);
+        let rendered = render_app(&app, 160, 40);
         assert!(
-            rendered.contains("Tab focus"),
+            rendered.contains("tab detail"),
             "expected insights footer to advertise focus switching, got:\n{rendered}"
         );
         assert!(
@@ -21876,7 +28835,7 @@ mod tests {
     fn graph_footer_keeps_open_details_wording() {
         let rendered = render_frame(ViewMode::Graph, 120, 40);
         assert!(
-            rendered.contains("Enter open details"),
+            rendered.contains("⏎ details"),
             "expected graph footer to describe Enter accurately, got:\n{rendered}"
         );
     }
@@ -22134,7 +29093,8 @@ mod tests {
 
     #[test]
     fn mouse_left_click_on_header_mode_tab_switches_mode() {
-        let mut app = new_app(ViewMode::Main, 0);
+        // Go bv views have no tab header; the Rust-only modes do.
+        let mut app = new_app(ViewMode::TimeTravelDiff, 0);
         let (x, y) =
             header_tab_click_point(&app, 120, 24, ViewMode::Graph).expect("graph header tab point");
 
@@ -22143,6 +29103,194 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Graph);
         assert_eq!(app.focus, FocusPane::List);
         assert_eq!(app.status_msg, "Switched to Graph");
+    }
+
+    #[test]
+    fn modal_mouse_clicks_preserve_underlying_view() {
+        let cases = [
+            ("help", true, false, None),
+            ("quit", false, true, None),
+            (
+                "tutorial",
+                false,
+                false,
+                Some(ModalOverlay::Tutorial(super::TutorialState::new())),
+            ),
+            (
+                "confirm",
+                false,
+                false,
+                Some(ModalOverlay::Confirm {
+                    title: "Confirm".to_string(),
+                    message: "Continue?".to_string(),
+                    resume_overlay: None,
+                }),
+            ),
+            (
+                "pages wizard",
+                false,
+                false,
+                Some(ModalOverlay::PagesWizard(super::PagesWizardState::new())),
+            ),
+            (
+                "recipe picker",
+                false,
+                false,
+                Some(ModalOverlay::RecipePicker {
+                    items: vec![("ready".to_string(), "Ready work".to_string())],
+                    cursor: 0,
+                }),
+            ),
+            (
+                "label picker",
+                false,
+                false,
+                Some(ModalOverlay::LabelPicker {
+                    items: vec![("core".to_string(), 1)],
+                    cursor: 0,
+                    filter: String::new(),
+                }),
+            ),
+            (
+                "repo picker",
+                false,
+                false,
+                Some(ModalOverlay::RepoPicker {
+                    items: vec!["viewer".to_string()],
+                    cursor: 0,
+                    filter: String::new(),
+                }),
+            ),
+            (
+                "alerts",
+                false,
+                false,
+                Some(ModalOverlay::Alerts {
+                    rows: Vec::new(),
+                    cursor: 0,
+                }),
+            ),
+        ];
+        for (name, help, quit, overlay) in cases {
+            let mut app = new_app(ViewMode::Main, 0);
+            app.focus = FocusPane::Detail;
+            app.analyzer.issues[0].external_ref =
+                Some("https://github.com/org/repo/issues/42".to_string());
+            let (link_x, link_y) = detail_link_click_point(&app, 100, 40)
+                .expect("normal detail view should have a clickable link");
+            let list = super::cached_main_list_area();
+            let split = super::splitter_hit_boxes(&app, 100, 40)[0];
+            let before_split = super::pane_split_state();
+            app.status_msg.clear();
+            app.show_help = help;
+            app.show_quit_confirm = quit;
+            app.modal_overlay = overlay.clone();
+            let _ = render_app(&app, 100, 40);
+
+            for (button, x, y) in [
+                (MouseButton::Left, list.x + 1, list.y + 2),
+                (MouseButton::Left, split.rect.x, split.rect.y + 1),
+                (MouseButton::Left, link_x, link_y),
+                (MouseButton::Right, link_x, link_y),
+            ] {
+                let cmd = app.update(mouse(MouseEventKind::Down(button), x, y));
+                assert!(matches!(cmd, Cmd::None), "{name}");
+                assert_eq!(selected_issue_id(&app), "A", "{name}");
+                assert_eq!(app.focus, FocusPane::Detail, "{name}");
+                assert_eq!(app.mode, ViewMode::Main, "{name}");
+                assert_eq!(super::pane_split_state(), before_split, "{name}");
+                assert_eq!(app.modal_overlay, overlay, "{name}");
+                assert_eq!(app.show_help, help, "{name}");
+                assert_eq!(app.show_quit_confirm, quit, "{name}");
+                assert!(app.modal_confirm_result.is_none(), "{name}");
+                assert!(app.status_msg.is_empty(), "{name}: {}", app.status_msg);
+            }
+        }
+    }
+
+    #[test]
+    fn modal_mouse_clicks_cannot_activate_header_tabs() {
+        for help in [true, false] {
+            let mut app = new_app(ViewMode::TimeTravelDiff, 0);
+            let (x, y) = header_tab_click_point(&app, 120, 30, ViewMode::Graph)
+                .expect("graph tab should be present in time-travel header");
+            app.show_help = help;
+            if !help {
+                app.open_tutorial();
+            }
+            let _ = render_app(&app, 120, 30);
+            app.update(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+            assert_eq!(app.mode, ViewMode::TimeTravelDiff);
+            assert_eq!(app.mode_back_stack, [] as [ViewMode; 0]);
+        }
+    }
+
+    #[test]
+    fn modal_mouse_wheel_navigates_overlay_without_resizing() {
+        let mut app = new_app(ViewMode::Main, 0);
+        let _ = render_app(&app, 100, 30);
+        let split = super::splitter_hit_boxes(&app, 100, 30)[0];
+        let before_split = super::pane_split_state();
+        let x = split.rect.x;
+        let y = split.rect.y + 1;
+
+        app.show_help = true;
+        app.update(mouse(MouseEventKind::ScrollDown, x, y));
+        assert_eq!(app.help_scroll_offset, 1);
+        app.update(mouse(MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.help_scroll_offset, 0);
+        app.show_help = false;
+
+        app.open_tutorial();
+        app.update(mouse(MouseEventKind::ScrollDown, x, y));
+        assert!(matches!(
+            app.modal_overlay,
+            Some(ModalOverlay::Tutorial(super::TutorialState {
+                scroll: 1,
+                ..
+            }))
+        ));
+        app.modal_overlay = Some(ModalOverlay::RecipePicker {
+            items: vec![
+                ("first".to_string(), String::new()),
+                ("second".to_string(), String::new()),
+            ],
+            cursor: 0,
+        });
+        app.update(mouse(MouseEventKind::ScrollDown, x, y));
+        assert!(matches!(
+            app.modal_overlay,
+            Some(ModalOverlay::RecipePicker { cursor: 1, .. })
+        ));
+        app.modal_overlay = Some(ModalOverlay::Confirm {
+            title: "Confirm".to_string(),
+            message: "Continue?".to_string(),
+            resume_overlay: None,
+        });
+        app.update(mouse(MouseEventKind::ScrollDown, x, y));
+        assert!(matches!(
+            app.modal_overlay,
+            Some(ModalOverlay::Confirm { .. })
+        ));
+        assert!(app.modal_confirm_result.is_none());
+        assert_eq!(selected_issue_id(&app), "A");
+        assert_eq!(app.focus, FocusPane::List);
+        assert_eq!(super::pane_split_state(), before_split);
+    }
+
+    #[test]
+    fn modal_mouse_wheel_keeps_quit_confirmation_open() {
+        let mut app = new_app(ViewMode::Main, 0);
+        let _ = render_app(&app, 100, 30);
+        app.update(key(KeyCode::Escape));
+        assert!(app.show_quit_confirm);
+
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            let cmd = app.update(mouse(kind, 5, 5));
+            assert!(matches!(cmd, Cmd::None));
+            assert!(app.show_quit_confirm);
+        }
+        assert!(matches!(app.update(key(KeyCode::Char('y'))), Cmd::Quit));
     }
 
     #[test]
@@ -22174,26 +29322,17 @@ mod tests {
         app.analyzer.issues[0].external_ref = Some("https://github.com/org/repo/issues/42".into());
 
         let _ = render_app(&app, 120, 40);
+        let rendered = render_app(&app, 120, 40);
         let link_area = app
             .current_detail_link_row_area()
             .expect("board detail link row area");
-        let detail_area = cached_detail_content_area();
-        let detail = app.board_detail_render_text();
-        let expected_row = detail
+        let row = rendered
             .lines()
-            .iter()
-            .position(|line| {
-                ftui::text::Line::spans(line)
-                    .iter()
-                    .any(|span| span.link.is_some())
-            })
-            .expect("board detail hyperlink row");
-
-        assert_eq!(
-            link_area.y,
-            detail_area
-                .y
-                .saturating_add(saturating_scroll_offset(expected_row)),
+            .nth(usize::from(link_area.y))
+            .expect("rendered link row");
+        assert!(
+            row.contains("🔗 External:"),
+            "link row area must point at the rendered hyperlink row: {row}"
         );
     }
 
@@ -22283,27 +29422,17 @@ mod tests {
             issue.external_ref = Some("https://github.com/org/repo/issues/42".into());
         }
 
-        let _ = render_app(&app, 120, 40);
+        let rendered = render_app(&app, 120, 40);
         let link_area = app
             .current_detail_link_row_area()
             .expect("insights detail link row area");
-        let detail_area = cached_detail_content_area();
-        let detail = app.insights_detail_render_text();
-        let expected_row = detail
+        let row = rendered
             .lines()
-            .iter()
-            .position(|line| {
-                ftui::text::Line::spans(line)
-                    .iter()
-                    .any(|span| span.link.is_some())
-            })
-            .expect("insights detail hyperlink row");
-
-        assert_eq!(
-            link_area.y,
-            detail_area
-                .y
-                .saturating_add(saturating_scroll_offset(expected_row)),
+            .nth(usize::from(link_area.y))
+            .expect("rendered link row");
+        assert!(
+            row.contains("🔗 External:"),
+            "link row area must point at the rendered hyperlink row: {row}"
         );
     }
 
@@ -22347,6 +29476,34 @@ mod tests {
             "expected click to trigger copy-link status"
         );
         assert_ne!(app.status_msg, "No external issue reference");
+    }
+
+    #[test]
+    fn insights_side_detail_link_row_tracks_shared_detail_scroll() {
+        // At 160 columns the insights grid shows the detail beside it; it
+        // scrolls with the shared detail offset, and the link hit area must
+        // follow the rendered row.
+        let mut app = new_app(ViewMode::Insights, 0);
+        app.focus = FocusPane::Detail;
+        for issue in &mut app.analyzer.issues {
+            issue.external_ref = Some("https://github.com/org/repo/issues/42".into());
+        }
+        let rendered = render_app(&app, 160, 40);
+        let initial = app
+            .current_detail_link_row_area()
+            .expect("insights side detail link area");
+        let row = rendered
+            .lines()
+            .nth(usize::from(initial.y))
+            .expect("link row");
+        assert!(row.contains("🔗 External:"), "{row}");
+
+        app.detail_scroll_offset = 1;
+        let _ = render_app(&app, 160, 40);
+        let scrolled = app
+            .current_detail_link_row_area()
+            .expect("scrolled insights link area");
+        assert_eq!(scrolled.y, initial.y.saturating_sub(1));
     }
 
     #[test]
@@ -22514,6 +29671,138 @@ mod tests {
         assert!(matches!(app.mode, ViewMode::Main));
     }
 
+    fn cross_label_flow_issues() -> Vec<Issue> {
+        let issue = |id: &str, labels: &[&str], deps: &[&str]| Issue {
+            id: id.to_string(),
+            title: format!("{id} work"),
+            status: "open".to_string(),
+            issue_type: "task".to_string(),
+            labels: labels.iter().map(ToString::to_string).collect(),
+            dependencies: deps
+                .iter()
+                .map(|dep| Dependency {
+                    issue_id: id.to_string(),
+                    depends_on_id: (*dep).to_string(),
+                    dep_type: "blocks".to_string(),
+                    ..Dependency::default()
+                })
+                .collect(),
+            ..Issue::default()
+        };
+        vec![
+            issue("api-1", &["api"], &[]),
+            issue("core-1", &["core"], &[]),
+            issue("ui-1", &["ui"], &["api-1", "core-1"]),
+            issue("ui-2", &["ui"], &["api-1"]),
+            issue("db-1", &["db"], &["api-1"]),
+        ]
+    }
+
+    #[test]
+    fn flow_stats_rank_labels_by_blocking_power() {
+        let mut app = new_app_with_issues(ViewMode::FlowMatrix, 0, cross_label_flow_issues());
+        app.compute_flow_matrix();
+        let stats = app.go_flow_label_stats();
+        let order: Vec<(&str, usize, usize)> = stats
+            .iter()
+            .map(|stat| (stat.label.as_str(), stat.outgoing, stat.incoming))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("api", 3, 0), ("core", 1, 0), ("db", 0, 1), ("ui", 0, 3)]
+        );
+        assert_eq!(stats[0].outgoing_labels, vec!["db", "ui"]);
+        assert!((stats[1].score - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flow_drilldown_walks_blocking_pairs_and_opens_issue() {
+        let mut app = new_app_with_issues(ViewMode::FlowMatrix, 0, cross_label_flow_issues());
+        app.compute_flow_matrix();
+        let text = render_app(&app, 120, 24);
+        assert!(text.contains("DEPENDENCY FLOW"), "{text}");
+        assert!(text.contains("BLOCKS → (3)"), "{text}");
+
+        app.handle_key(KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(app.flow_drilldown, Some(0));
+        let text = render_app(&app, 120, 24);
+        assert!(
+            text.contains("Dependencies involving: api (3 relationships)"),
+            "{text}"
+        );
+        assert!(text.contains("blocks db-1 db-1 work"), "{text}");
+
+        // Endpoint 1 is the blocked side of the first pair (api-1 → db-1).
+        app.handle_key(KeyCode::Char('j'), Modifiers::NONE);
+        assert_eq!(app.flow_drilldown, Some(1));
+        assert_eq!(
+            app.go_flow_drilldown_issue().map(|i| i.id.as_str()),
+            Some("db-1")
+        );
+
+        app.handle_key(KeyCode::Escape, Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::FlowMatrix);
+        assert_eq!(app.flow_drilldown, None);
+
+        app.handle_key(KeyCode::Enter, Modifiers::NONE);
+        app.handle_key(KeyCode::Char('j'), Modifiers::NONE);
+        app.handle_key(KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::Main);
+        assert_eq!(app.focus, FocusPane::Detail);
+        assert_eq!(app.selected_issue().map(|i| i.id.as_str()), Some("db-1"));
+    }
+
+    #[test]
+    fn label_dashboard_enter_filters_list_by_selected_label() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.handle_key(KeyCode::Char('['), Modifiers::NONE);
+        let label = app
+            .selected_dashboard_label()
+            .expect("sample issues carry labels");
+        app.handle_key(KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::Main);
+        assert_eq!(app.focus, FocusPane::List);
+        assert_eq!(app.modal_label_filter.as_deref(), Some(label.as_str()));
+    }
+
+    #[test]
+    fn label_dashboard_orders_critical_then_blocked_then_health() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.handle_key(KeyCode::Char('['), Modifiers::NONE);
+        let labels = &app.label_dashboard.as_ref().expect("dashboard").labels;
+        let rank = |level: &str| match level {
+            "critical" => 0,
+            "warning" => 1,
+            _ => 2,
+        };
+        for pair in labels.windows(2) {
+            let key = |l: &crate::analysis::label_intel::LabelHealth| {
+                (
+                    rank(&l.health_level),
+                    std::cmp::Reverse(l.blocked_count),
+                    l.health,
+                )
+            };
+            assert!(
+                key(&pair[0]) <= key(&pair[1]),
+                "dashboard order broken: {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_rank_digit_filters_list_and_view_caps_at_ten() {
+        let mut app = new_app(ViewMode::Attention, 0);
+        app.compute_attention();
+        let second = app
+            .attention_label_at(1)
+            .expect("at least two ranked labels");
+        app.handle_key(KeyCode::Char('2'), Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::Main);
+        assert_eq!(app.modal_label_filter.as_deref(), Some(second.as_str()));
+        assert!(app.attention_label_at(super::ATTENTION_ROW_LIMIT).is_none());
+    }
+
     #[test]
     fn label_dashboard_navigation() {
         let mut app = new_app(ViewMode::Main, 0);
@@ -22588,19 +29877,19 @@ mod tests {
         assert!(matches!(app.mode, ViewMode::Main));
 
         // ] toggles to FlowMatrix
-        app.handle_key(KeyCode::Char(']'), Modifiers::NONE);
+        app.handle_key(KeyCode::Char('f'), Modifiers::NONE);
         assert!(matches!(app.mode, ViewMode::FlowMatrix));
         assert!(app.flow_matrix.is_some());
 
         // ] toggles back
-        app.handle_key(KeyCode::Char(']'), Modifiers::NONE);
+        app.handle_key(KeyCode::Char('f'), Modifiers::NONE);
         assert!(matches!(app.mode, ViewMode::Main));
     }
 
     #[test]
     fn flow_matrix_navigation() {
         let mut app = new_app(ViewMode::Main, 0);
-        app.handle_key(KeyCode::Char(']'), Modifiers::NONE);
+        app.handle_key(KeyCode::Char('f'), Modifiers::NONE);
         assert_eq!(app.flow_matrix_row_cursor, 0);
         assert_eq!(app.flow_matrix_col_cursor, 0);
 
@@ -22623,7 +29912,7 @@ mod tests {
     #[test]
     fn flow_matrix_renders_list_and_detail() {
         let mut app = new_app(ViewMode::Main, 0);
-        app.handle_key(KeyCode::Char(']'), Modifiers::NONE);
+        app.handle_key(KeyCode::Char('f'), Modifiers::NONE);
 
         let list = app.flow_matrix_list_text();
         assert!(
@@ -22728,13 +30017,40 @@ mod tests {
     // ── Modal overlay tests ─────────────────────────────────────────
 
     #[test]
-    fn modal_tutorial_dismisses_on_any_key() {
+    fn modal_tutorial_pages_toc_and_closes() {
+        let pages = crate::tutorial::pages().len();
         let mut app = new_app(ViewMode::Main, 0);
-        app.open_tutorial();
-        assert!(app.modal_overlay.is_some());
-        assert!(matches!(app.modal_overlay, Some(ModalOverlay::Tutorial)));
+        app.update(key(KeyCode::Char('`')));
+        let page = |app: &BvrApp| match &app.modal_overlay {
+            Some(ModalOverlay::Tutorial(state)) => state.clone(),
+            other => panic!("tutorial should be open: {other:?}"),
+        };
+        assert_eq!(page(&app).page, 0);
+        let text = render_app(&app, 120, 40);
+        assert!(text.contains("📚 beads_viewer Tutorial"), "{text}");
+        assert!(text.contains(&format!("Page 1/{pages}")), "{text}");
 
-        app.update(key(KeyCode::Char('x')));
+        // Other keys page and scroll instead of closing.
+        app.update(key(KeyCode::Char(' ')));
+        app.update(key(KeyCode::Right));
+        assert_eq!(page(&app).page, 2.min(pages - 1));
+        app.update(key(KeyCode::Left));
+        assert_eq!(page(&app).page, 1.min(pages - 1));
+        app.update(key(KeyCode::Char('3')));
+        assert_eq!(page(&app).page, 2.min(pages - 1));
+        assert!(page(&app).viewed.len() >= 2.min(pages));
+
+        // The table of contents takes focus and Enter opens a page.
+        app.update(key(KeyCode::Char('t')));
+        assert!(page(&app).toc_visible && page(&app).toc_focus);
+        let text = render_app(&app, 120, 40);
+        assert!(text.contains("Contents"), "{text}");
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(page(&app).page, 0);
+        assert!(!page(&app).toc_focus);
+
+        app.update(key(KeyCode::Char('q')));
         assert!(app.modal_overlay.is_none());
     }
 
@@ -22743,9 +30059,9 @@ mod tests {
         let mut app = new_app(ViewMode::Main, 0);
 
         app.update(key_ctrl(KeyCode::Char('t')));
-        assert!(matches!(app.modal_overlay, Some(ModalOverlay::Tutorial)));
+        assert!(matches!(app.modal_overlay, Some(ModalOverlay::Tutorial(_))));
 
-        app.update(key(KeyCode::Char('x')));
+        app.update(key(KeyCode::Escape));
         assert!(app.modal_overlay.is_none());
     }
 
@@ -22945,7 +30261,10 @@ mod tests {
         assert!(app.modal_overlay.is_some());
         assert!(!app.show_help);
 
+        // Enter does not close the tutorial (it pages in the contents); Esc does.
         app.update(key(KeyCode::Enter));
+        assert!(app.modal_overlay.is_some());
+        app.update(key(KeyCode::Escape));
         assert!(app.modal_overlay.is_none());
     }
 
@@ -23338,7 +30657,7 @@ mod tests {
         assert!(app.insights_show_calc_proof);
 
         // Switch focus
-        app.update(key(KeyCode::Char('l')));
+        app.update(key(KeyCode::Tab));
         assert_eq!(app.focus, FocusPane::Detail);
 
         // Return
@@ -23522,10 +30841,10 @@ mod tests {
 
         // Open tutorial
         app.open_tutorial();
-        assert!(matches!(app.modal_overlay, Some(ModalOverlay::Tutorial)));
+        assert!(matches!(app.modal_overlay, Some(ModalOverlay::Tutorial(_))));
 
         // Dismiss
-        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('q')));
         assert!(app.modal_overlay.is_none());
 
         // Open confirm
@@ -23846,24 +31165,188 @@ mod tests {
     }
 
     #[test]
+    fn alerts_panel_lists_jumps_and_dismisses() {
+        let mut app = new_app(ViewMode::Main, 0);
+        let rows = app.active_alert_rows();
+        assert!(rows.len() >= 2, "sample data should raise alerts: {rows:?}");
+
+        app.handle_key(KeyCode::Char('!'), Modifiers::NONE);
+        let text = render_app(&app, 120, 30);
+        assert!(text.contains("🔔 Alerts Panel"), "{text}");
+        assert!(text.contains(&format!("{} total", rows.len())), "{text}");
+        assert!(text.contains("d: dismiss"), "{text}");
+
+        // Dismiss the first alert: it leaves the panel and the badge count.
+        app.handle_key(KeyCode::Char('d'), Modifiers::NONE);
+        assert_eq!(app.active_alert_rows().len(), rows.len() - 1);
+        assert!(app.dismissed_alerts.contains(&rows[0].key));
+        assert_eq!(app.status_alert_counts().0, rows.len() - 1);
+
+        // Enter jumps to the selected alert's issue and closes the panel.
+        let target = match &app.modal_overlay {
+            Some(ModalOverlay::Alerts { rows, cursor }) => rows[*cursor].issue_id.clone(),
+            other => panic!("alerts panel should stay open: {other:?}"),
+        };
+        app.handle_key(KeyCode::Enter, Modifiers::NONE);
+        assert!(app.modal_overlay.is_none());
+        if let Some(id) = target {
+            assert_eq!(app.selected_issue().map(|i| i.id.clone()), Some(id));
+        }
+
+        // `!` again reopens; Esc closes.
+        app.handle_key(KeyCode::Char('!'), Modifiers::NONE);
+        assert!(matches!(
+            app.modal_overlay,
+            Some(ModalOverlay::Alerts { .. })
+        ));
+        app.handle_key(KeyCode::Escape, Modifiers::NONE);
+        assert!(app.modal_overlay.is_none());
+    }
+
+    #[test]
+    fn shortcuts_sidebar_toggles_and_reserves_its_column() {
+        let mut app = new_app(ViewMode::Main, 0);
+        let _ = render_app(&app, 140, 30);
+        app.handle_key(KeyCode::Char(';'), Modifiers::NONE);
+        assert!(app.show_shortcuts_sidebar);
+        assert!(app.status_msg.contains("; hide"), "{}", app.status_msg);
+        let text = render_app(&app, 140, 30);
+        assert!(text.contains("Shortcuts"), "{text}");
+        assert!(text.contains("This sidebar"), "{text}");
+        // The body lays out into the remaining width.
+        assert_eq!(super::cached_view_width(), 140 - 36);
+
+        // Context follows the view: the board lists board keys.
+        app.handle_key(KeyCode::Char('b'), Modifiers::NONE);
+        let text = render_app(&app, 140, 30);
+        assert!(text.contains("Columns ←/→"), "{text}");
+
+        app.handle_key(KeyCode::Char(';'), Modifiers::NONE);
+        assert!(!app.show_shortcuts_sidebar);
+        let _ = render_app(&app, 140, 30);
+        assert_eq!(super::cached_view_width(), 140);
+    }
+
+    #[test]
+    fn shortcuts_sidebar_waits_for_a_wide_enough_terminal() {
+        let mut app = new_app(ViewMode::Main, 0);
+        let _ = render_app(&app, 50, 20);
+        app.handle_key(KeyCode::F(2), Modifiers::NONE);
+        assert!(app.show_shortcuts_sidebar);
+        assert!(
+            app.status_msg.contains("at least 56 columns"),
+            "{}",
+            app.status_msg
+        );
+        let text = render_app(&app, 50, 20);
+        assert!(!text.contains("This sidebar"));
+    }
+
+    #[test]
+    fn shortcuts_sidebar_does_not_capture_detail_scroll() {
+        for mode in [
+            ViewMode::Main,
+            ViewMode::Board,
+            ViewMode::Graph,
+            ViewMode::Insights,
+            ViewMode::Tree,
+        ] {
+            let mut app = new_app(mode, 0);
+            app.initialize_view_data();
+            app.focus = FocusPane::Detail;
+            app.show_shortcuts_sidebar = true;
+            app.shortcuts_sidebar_scroll = 5;
+            let _ = render_app(&app, 160, 30);
+            assert!(app.shortcuts_sidebar_visible());
+
+            app.update(key_ctrl(KeyCode::Char('j')));
+            let offset = if mode == ViewMode::Board {
+                app.board_detail_scroll_offset
+            } else {
+                app.detail_scroll_offset
+            };
+            assert_eq!(offset, 3, "{mode:?}");
+            assert_eq!(app.shortcuts_sidebar_scroll, 5, "{mode:?}");
+
+            app.update(key_ctrl(KeyCode::Char('k')));
+            assert_eq!(app.board_detail_scroll_offset, 0, "{mode:?}");
+            assert_eq!(app.detail_scroll_offset, 0, "{mode:?}");
+            assert_eq!(app.shortcuts_sidebar_scroll, 5, "{mode:?}");
+
+            app.update(key_ctrl(KeyCode::Down));
+            assert_eq!(app.shortcuts_sidebar_scroll, 6, "{mode:?}");
+            app.update(key_ctrl(KeyCode::Up));
+            assert_eq!(app.shortcuts_sidebar_scroll, 5, "{mode:?}");
+            assert_eq!(app.board_detail_scroll_offset, 0, "{mode:?}");
+            assert_eq!(app.detail_scroll_offset, 0, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn shortcuts_sidebar_scroll_preserves_list_selection() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.show_shortcuts_sidebar = true;
+        let _ = render_app(&app, 160, 30);
+
+        for code in [KeyCode::Char('j'), KeyCode::Down] {
+            app.update(key_ctrl(code));
+        }
+        assert_eq!(app.shortcuts_sidebar_scroll, 2);
+        assert_eq!(selected_issue_id(&app), "A");
+        assert_eq!(app.detail_scroll_offset, 0);
+
+        for code in [KeyCode::Char('k'), KeyCode::Up] {
+            app.update(key_ctrl(code));
+        }
+        assert_eq!(app.shortcuts_sidebar_scroll, 0);
+        assert_eq!(selected_issue_id(&app), "A");
+
+        app.update(key(KeyCode::Char('?')));
+        app.update(key_ctrl(KeyCode::Char('j')));
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll_offset, 1);
+        assert_eq!(app.shortcuts_sidebar_scroll, 0);
+        assert_eq!(app.detail_scroll_offset, 0);
+    }
+
+    #[test]
+    fn alerts_panel_reports_when_nothing_is_active() {
+        let mut app = new_app_with_issues(ViewMode::Main, 0, vec![]);
+        app.handle_key(KeyCode::Char('!'), Modifiers::NONE);
+        assert!(app.modal_overlay.is_none());
+        assert_eq!(app.status_msg, "No active alerts");
+    }
+
+    #[test]
+    fn go_view_keys_open_attention_flow_and_tree() {
+        let mut app = new_app(ViewMode::Main, 0);
+        app.handle_key(KeyCode::Char(']'), Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::Attention);
+        app.handle_key(KeyCode::Char('f'), Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::FlowMatrix);
+        app.handle_key(KeyCode::Char('E'), Modifiers::NONE);
+        assert_eq!(app.mode, ViewMode::Tree);
+    }
+
+    #[test]
     fn attention_view_toggle_and_state() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
 
         // Press ! to enter Attention mode
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert!(matches!(app.mode, ViewMode::Attention));
         assert!(app.attention_result.is_some());
         assert_eq!(app.attention_cursor, 0);
 
         // Press ! again to return to Main
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert!(matches!(app.mode, ViewMode::Main));
     }
 
     #[test]
     fn attention_view_navigation() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert!(matches!(app.mode, ViewMode::Attention));
 
         let label_count = app.attention_result.as_ref().unwrap().labels.len();
@@ -23885,7 +31368,7 @@ mod tests {
     #[test]
     fn attention_view_renders_list_and_detail() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
 
         let list = app.list_panel_text();
         assert!(list.contains("Rank"));
@@ -23901,7 +31384,7 @@ mod tests {
     #[test]
     fn attention_view_empty_issues_no_panic() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, vec![]);
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert!(matches!(app.mode, ViewMode::Attention));
 
         let list = app.list_panel_text();
@@ -23931,7 +31414,7 @@ mod tests {
     #[test]
     fn refresh_preserves_mode() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert!(matches!(app.mode, ViewMode::Attention));
 
         // Refresh in Attention mode — fails silently but stays in Attention
@@ -24584,7 +32067,7 @@ mod tests {
     #[test]
     fn snap_attention_detail_focus() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         app.update(key(KeyCode::Tab));
         let text = render_app(&app, 100, 30);
         insta::assert_snapshot!(text);
@@ -24611,7 +32094,7 @@ mod tests {
     #[test]
     fn snap_flow_matrix_detail_focus() {
         let mut app = new_app(ViewMode::Main, 0);
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         app.update(key(KeyCode::Tab));
         let text = render_app(&app, 100, 30);
         insta::assert_snapshot!(text);
@@ -24703,7 +32186,7 @@ mod tests {
     #[test]
     fn flow_matrix_empty_issues_no_panic() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, vec![]);
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         let list = app.list_panel_text();
         assert!(!list.is_empty());
         app.update(key(KeyCode::Char('j')));
@@ -24851,10 +32334,10 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Main);
 
         // Attention
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Attention);
         app.update(key(KeyCode::Char('j')));
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Main);
 
         // Tree
@@ -24873,7 +32356,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Main);
 
         // FlowMatrix
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         assert_eq!(app.mode, ViewMode::FlowMatrix);
         app.update(key(KeyCode::Char('j')));
         app.update(key(KeyCode::Char('q')));
@@ -24966,13 +32449,13 @@ mod tests {
             KeyCode::Char('q'), // Back
             KeyCode::Char('a'), // Actionable
             KeyCode::Char('a'), // Back
-            KeyCode::Char('!'), // Attention
-            KeyCode::Char('!'), // Back
+            KeyCode::Char(']'), // Attention
+            KeyCode::Char(']'), // Back
             KeyCode::Char('T'), // Tree
             KeyCode::Char('q'), // Back
             KeyCode::Char('['), // LabelDashboard
             KeyCode::Char('q'), // Back
-            KeyCode::Char(']'), // FlowMatrix
+            KeyCode::Char('f'), // FlowMatrix
             KeyCode::Char('q'), // Back
             KeyCode::Char('t'), // TimeTravelDiff
             KeyCode::Escape,    // Cancel
@@ -24993,10 +32476,10 @@ mod tests {
         // Test j/k/Tab/Esc in each newer mode
         for mode_key in [
             KeyCode::Char('a'), // Actionable
-            KeyCode::Char('!'), // Attention
+            KeyCode::Char(']'), // Attention
             KeyCode::Char('T'), // Tree
             KeyCode::Char('['), // LabelDashboard
-            KeyCode::Char(']'), // FlowMatrix
+            KeyCode::Char('f'), // FlowMatrix
         ] {
             app.update(key(mode_key));
             app.update(key(KeyCode::Char('j')));
@@ -25008,7 +32491,7 @@ mod tests {
             // Return to main
             let exit_key = match mode_key {
                 KeyCode::Char('a') => KeyCode::Char('a'),
-                KeyCode::Char('!') => KeyCode::Char('!'),
+                KeyCode::Char(']') => KeyCode::Char(']'),
                 _ => KeyCode::Char('q'),
             };
             app.update(key(exit_key));
@@ -25029,7 +32512,7 @@ mod tests {
             KeyCode::Char('a'),
             KeyCode::Char('T'),
             KeyCode::Char('['),
-            KeyCode::Char(']'),
+            KeyCode::Char('f'),
         ] {
             app.update(key(mode_key));
             app.update(key(KeyCode::Char('?')));
@@ -25110,7 +32593,7 @@ mod tests {
     #[test]
     fn attention_detail_shows_correct_label_on_navigation() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         let labels_count = app.attention_result.as_ref().unwrap().labels.len();
         if labels_count >= 2 {
             let detail_0 = app.detail_panel_text();
@@ -25228,14 +32711,19 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_combined_filters() {
+    fn main_status_bar_shows_combined_filters() {
         let mut app = new_app(ViewMode::Main, 0);
         app.modal_label_filter = Some("core".to_string());
         app.modal_repo_filter = Some("viewer".to_string());
-        let text = render_app(&app, 100, 3);
+        let text = render_app(&app, 140, 12);
+        let status = text.lines().last().unwrap_or_default();
         assert!(
-            text.contains("label:core") || text.contains("core"),
-            "header should mention label filter: {text}"
+            status.contains("🏷 core"),
+            "status bar should show label filter: {status}"
+        );
+        assert!(
+            status.contains("🗂 viewer"),
+            "status bar should show repo filter: {status}"
         );
     }
 
@@ -25251,13 +32739,16 @@ mod tests {
     }
 
     #[test]
-    fn slow_metrics_pending_shows_in_header() {
+    fn slow_metrics_pending_shows_in_main_status_bar() {
         let mut app = new_app(ViewMode::Main, 0);
         app.slow_metrics_pending = true;
-        let text = render_app(&app, 120, 3);
+        let text = render_app(&app, 160, 12);
         assert!(
-            text.contains("computing"),
-            "header should show metrics computing indicator: {text}"
+            text.lines()
+                .last()
+                .unwrap_or_default()
+                .contains("computing metrics"),
+            "status bar should show metrics computing indicator: {text}"
         );
     }
 
@@ -25841,7 +33332,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Main);
 
         // Enter Attention mode
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Attention);
         assert!(app.attention_result.is_some());
         assert_eq!(app.focus, FocusPane::List);
@@ -25882,14 +33373,14 @@ mod tests {
         assert!(!app.show_help);
 
         // Return to Main
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Main);
     }
 
     #[test]
     fn attention_narrow_width_rendering_no_panic() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Attention);
 
         // Render at narrow width — should not panic
@@ -25910,7 +33401,7 @@ mod tests {
     #[test]
     fn attention_tab_focus_updates_detail_context() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
 
         // In list focus, get detail for cursor 0
         let detail_at_0 = app.detail_panel_text();
@@ -25937,7 +33428,7 @@ mod tests {
     #[test]
     fn attention_cursor_clamp_at_boundary() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
 
         let label_count = app.attention_result.as_ref().unwrap().labels.len();
 
@@ -25962,7 +33453,7 @@ mod tests {
     #[test]
     fn snap_attention_list_overview() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         // List focus, cursor at 0
         let text = render_app(&app, 100, 30);
         insta::assert_snapshot!(text);
@@ -25976,7 +33467,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Main);
 
         // Enter FlowMatrix mode
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         assert_eq!(app.mode, ViewMode::FlowMatrix);
         assert!(app.flow_matrix.is_some());
         assert_eq!(app.focus, FocusPane::List);
@@ -26025,14 +33516,14 @@ mod tests {
         assert!(!app.show_help);
 
         // Return to Main
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         assert_eq!(app.mode, ViewMode::Main);
     }
 
     #[test]
     fn flow_matrix_narrow_width_rendering_no_panic() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         assert_eq!(app.mode, ViewMode::FlowMatrix);
 
         // Render at narrow width — should not panic
@@ -26053,7 +33544,7 @@ mod tests {
     #[test]
     fn flow_matrix_detail_changes_on_cell_navigation() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
 
         let label_count = app.flow_matrix.as_ref().map_or(0, |f| f.labels.len());
         if label_count >= 2 {
@@ -26083,7 +33574,7 @@ mod tests {
     #[test]
     fn flow_matrix_cursor_clamp_at_boundary() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
 
         let label_count = app.flow_matrix.as_ref().map_or(0, |f| f.labels.len());
         if label_count > 0 {
@@ -26124,7 +33615,7 @@ mod tests {
     #[test]
     fn snap_flow_matrix_list_overview() {
         let mut app = new_app_with_issues(ViewMode::Main, 0, labeled_issues());
-        app.update(key(KeyCode::Char(']')));
+        app.update(key(KeyCode::Char('f')));
         // List focus, cursors at (0,0)
         let text = render_app(&app, 100, 30);
         insta::assert_snapshot!(text);
@@ -26200,7 +33691,7 @@ mod tests {
         // Step 1: Start in Main — verify issue list
         let text = journey_capture(&app, w, h, "main_list_start", &mut caps);
         assert!(
-            text.contains("mode=Main") || text.contains("Issues"),
+            text.contains("TYPE PRI STATUS"),
             "main should show issue list: {text}"
         );
 
@@ -26209,7 +33700,7 @@ mod tests {
         app.update(key(KeyCode::Tab));
         let text = journey_capture(&app, w, h, "main_detail_focus", &mut caps);
         assert!(
-            text.contains("ID:") || text.contains("Status:"),
+            text.contains("Status") && text.contains("Graph Analysis"),
             "detail should show issue: {text}"
         );
 
@@ -26218,7 +33709,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Board);
         let text = journey_capture(&app, w, h, "board_entry", &mut caps);
         assert!(
-            text.contains("open") || text.contains("Board"),
+            text.contains("OPEN") || text.contains("BOARD"),
             "board should show lane content: {text}"
         );
 
@@ -26260,7 +33751,7 @@ mod tests {
         app.update(key(KeyCode::Escape));
         assert_eq!(app.mode, ViewMode::Main);
         let text = journey_capture(&app, w, h, "main_return", &mut caps);
-        assert!(text.contains("mode=Main") || text.contains("Issues"));
+        assert!(text.contains("TYPE PRI STATUS"));
 
         // Snapshot the full journey artifact
         let artifact = journey_artifact("main→board→graph→insights→main", w, h, &caps);
@@ -26297,7 +33788,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Tree);
         let text = journey_capture(&app, w, h, "tree_entry", &mut caps);
         assert!(
-            text.contains("Dependency tree") || text.contains("no dependency tree"),
+            text.contains("P1 A Feature work") || text.contains("Tree View"),
             "tree should show structure: {text}"
         );
 
@@ -26319,7 +33810,7 @@ mod tests {
         // Step 6: Return to Main, enter Attention
         app.update(key(KeyCode::Char('T')));
         assert_eq!(app.mode, ViewMode::Main);
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Attention);
         let text = journey_capture(&app, w, h, "attention_entry", &mut caps);
         assert!(
@@ -26333,7 +33824,7 @@ mod tests {
         journey_capture(&app, w, h, "attention_detail", &mut caps);
 
         // Step 8: Return to Main
-        app.update(key(KeyCode::Char('!')));
+        app.update(key(KeyCode::Char(']')));
         assert_eq!(app.mode, ViewMode::Main);
         journey_capture(&app, w, h, "main_return", &mut caps);
 
@@ -26348,26 +33839,24 @@ mod tests {
         let mut caps: Vec<(String, String)> = Vec::new();
 
         let text = journey_capture(&app, w, h, "main_start", &mut caps);
-        assert!(text.contains("Focus: list owns selection"));
+        assert!(text.contains("TYPE PRI STATUS"));
 
         app.update(key(KeyCode::Char('/')));
         app.update(key(KeyCode::Char('d')));
         let text = journey_capture(&app, w, h, "search_active", &mut caps);
-        assert!(text.contains("Search (active): /d"));
+        assert!(text.contains("🔎 /d▏"), "search active frame: {text}");
 
         app.update(key(KeyCode::Enter));
         let text = journey_capture(&app, w, h, "search_committed", &mut caps);
-        assert!(text.contains("Matches: 1/3"));
-        assert!(text.contains("hit 1/3"), "search committed frame: {text}");
+        assert!(text.contains("match 1/3"), "search committed frame: {text}");
 
         app.update(key(KeyCode::Char('n')));
         let text = journey_capture(&app, w, h, "search_cycle_second_hit", &mut caps);
-        assert!(text.contains("Matches: 2/3"));
-        assert!(text.contains("hit 2/3"), "search cycled frame: {text}");
+        assert!(text.contains("match 2/3"), "search cycled frame: {text}");
 
         app.update(key(KeyCode::Tab));
         let text = journey_capture(&app, w, h, "detail_focus", &mut caps);
-        assert!(text.contains("Focus: detail owns J/K deps"));
+        assert!(text.contains("^j/k scroll"), "detail focus frame: {text}");
 
         app.update(key(KeyCode::Escape));
         let text = journey_capture(&app, w, h, "focus_recovered", &mut caps);
@@ -26377,7 +33866,7 @@ mod tests {
         app.update(key(KeyCode::Char('z')));
         app.update(key(KeyCode::Enter));
         let text = journey_capture(&app, w, h, "search_no_hit", &mut caps);
-        assert!(text.contains("Matches: none in visible issues"));
+        assert!(text.contains("no matches"), "no-hit frame: {text}");
 
         app.update(key(KeyCode::Escape));
         let text = journey_capture(&app, w, h, "search_cleared", &mut caps);
@@ -26385,11 +33874,11 @@ mod tests {
 
         app.update(key(KeyCode::Char('o')));
         let text = journey_capture(&app, w, h, "open_filter", &mut caps);
-        assert!(text.contains("scope=open"));
+        assert!(text.contains("📂 OPEN"), "open filter frame: {text}");
 
         app.update(key(KeyCode::Escape));
         let text = journey_capture(&app, w, h, "filter_cleared", &mut caps);
-        assert!(text.contains("scope=all"));
+        assert!(text.contains("📋 ALL"), "filter cleared frame: {text}");
     }
 
     #[test]

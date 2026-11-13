@@ -254,7 +254,10 @@ fn debug_render_cli_rejects_unknown_view() {
 
     command.assert().failure().stderr(
         predicate::str::contains("Unknown debug-render view 'bogus'").and(
-            predicate::str::contains("insights, board, history, main, graph"),
+            predicate::str::contains(
+                "Supported: main, board, insights, graph, history, actionable, attention, tree, \
+                 labels, flow, timediff, sprint",
+            ),
         ),
     );
 }
@@ -713,6 +716,25 @@ fn robot_adversarial_triage_core_fields_match_legacy_fixture() {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     fixture_ids.sort_unstable();
+
+    // The fixture predates the legacy claimability contract (beads_viewer
+    // #173/#191): a top pick must be unassigned and not an epic. Current
+    // legacy `bv` and bvr both withhold such beads, so the captured picks are
+    // narrowed by that rule against the fixture's own input data.
+    let unclaimable: std::collections::HashSet<String> =
+        fs::read_to_string(repo_root().join("tests/testdata/adversarial_parity.jsonl"))
+            .expect("adversarial input")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|issue| {
+                issue["assignee"]
+                    .as_str()
+                    .is_some_and(|a| !a.trim().is_empty())
+                    || issue["issue_type"] == "epic"
+            })
+            .filter_map(|issue| issue["id"].as_str().map(ToString::to_string))
+            .collect();
+    fixture_ids.retain(|id| !unclaimable.contains(id));
 
     assert_eq!(actual_ids, fixture_ids);
 }
@@ -1969,16 +1991,28 @@ fn stress_triage_counts_and_top_recommendation() {
 
     // 9 issues are closed; 80 remain open/blocked
     assert_eq!(qr["total_open"], 80);
-    // 24 actionable (not blocked or in a cycle)
-    assert_eq!(qr["total_actionable"], 24);
-    // Hub epic ST-011 should be #1 recommendation (unblocks 14)
-    let top = &qr["top_picks"][0];
-    assert_eq!(top["id"], "ST-011");
-    assert_eq!(top["unblocks"], 14);
-
+    // 22 actionable: 24 issues have no open blocker and are not in a cycle,
+    // but two of them (ST-030, ST-035) carry status=blocked, which `br ready`
+    // does not surface — the status gate excludes them (issue #25).
+    assert_eq!(qr["total_actionable"], 22);
     let recs = actual["triage"]["recommendations"]
         .as_array()
         .expect("recommendations");
+    // Hub epic ST-011 is the #1 recommendation (unblocks 14) ...
+    assert_eq!(recs[0]["id"], "ST-011");
+    assert_eq!(recs[0]["unblocks"], 14);
+    // ... but an epic is a planning container, never a claimable top pick.
+    let top_ids: Vec<&str> = qr["top_picks"]
+        .as_array()
+        .expect("top picks")
+        .iter()
+        .filter_map(|pick| pick["id"].as_str())
+        .collect();
+    assert_ne!(top_ids.len(), 0, "expected claimable top picks");
+    assert!(
+        !top_ids.contains(&"ST-011"),
+        "epic surfaced as top pick: {top_ids:?}"
+    );
     assert_eq!(recs.len(), 10);
 
     let blockers = actual["triage"]["blockers_to_clear"]
@@ -2028,12 +2062,14 @@ fn stress_graph_reports_expected_node_and_edge_counts() {
 fn stress_plan_covers_all_actionable_tracks() {
     let actual = run_bvr_json(&["--robot-plan"], "tests/testdata/stress_complex_89.jsonl");
     let tracks = actual["plan"]["tracks"].as_array().expect("tracks array");
-    // Each actionable issue gets its own track
-    assert_eq!(tracks.len(), 24);
+    // Each actionable issue gets its own track (22: see
+    // stress_triage_counts_and_top_recommendation for why the two
+    // status=blocked, dependency-free issues are not actionable).
+    assert_eq!(tracks.len(), 22);
 
     let summary = &actual["plan"]["summary"];
-    assert_eq!(summary["track_count"], 24);
-    assert_eq!(summary["actionable_count"], 24);
+    assert_eq!(summary["track_count"], 22);
+    assert_eq!(summary["actionable_count"], 22);
 }
 
 #[test]

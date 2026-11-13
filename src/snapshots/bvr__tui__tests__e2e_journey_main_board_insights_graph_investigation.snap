@@ -5,155 +5,154 @@ expression: artifact
 === E2E Journey: main→board→graph→insights→main | 120x35 ===
 
 --- Step 1: main_list_start ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Main | focus=list | issues=3/3 | filter=all | sort=default |
-┌Issues [focus]──────────────────────────────┐┌Details─────────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────┐┌────────────────────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID                   ││ 📋 Root                                                                │
+│▸ 📋 P0 🔓1 OPEN A Root                     ││                                                                        │
+│  📋 P0 OPEN B Dependent                    ││ ┌────┬────────┬──────────┬──────────┬────────────┐                     │
+│  📋 P0 DONE C Closed                       ││ │ ID │ Status │ Priority │ Assignee │ Created    │                     │
+│                                            ││ ├────┼────────┼──────────┼──────────┼────────────┤                     │
+│                                            ││ │ A  │ OPEN   │ 🔥 P0    │ @alice   │ 2026-01-01 │                     │
+│                                            ││ └────┴────────┴──────────┴──────────┴────────────┘                     │
 │                                            ││                                                                        │
-│ Focus: list owns selection, / s…           ││ ────────────────────────────────────────────────                       │
-│ scope=all | label=any | repo=any | pos=1/3 ││ Summary  ready to execute                                              │
-│ Guide: / search-as-you-type | o/c/r/B/I qu ││ T A  Root  (C copy id)                                                 │
-│                                            ││ Status: open | Priority: p0 | Type: task | State: ready                │
-│ ▸ #01 ready   P0 A Root @alice             ││ Action: Pull now | Downstream impact: 1 | Critical depth: 2            │
-│   #02 blocked P0 B Dependent ⊘1            ││ Assignee: alice | Repo: viewer | Estimate: 90m  (w repo filter)        │
-│   #03 closed  P0 C Closed                  ││ Closed: n/a | Labels: [core] [parity]  (L label filter)                │
-│                                            ││ Created: 2026-01-01 | Updated: 2026-01-02 | Due: n/a  (t time-travel)  │
+│                                            ││ Labels: core, parity                                                   │
+│                                            ││ C copy id • L label filter • w repo filter • t time-travel             │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Signals  rank and graph pressure                                       │
-│                                            ││ Depth 2 | k-core 1 | slack 0.0000 | cut-point no                       │
-│                                            ││ PR ██████ 0.48  BW ░░░░░░ 0.00                                         │
-│                                            ││ EV ██████ 1.00  blockers=0 | unblocks=1                                │
+│                                            ││ 🎯 Triage Insights                                                     │
+│                                            ││ • 🔓 Unblocks: 1 downstream items when completed                       │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Dependencies  upstream, gates, downstream                              │
-│                                            ││ Upstream: none                                                         │
-│                                            ││ Open Gate: none                                                        │
-│                                            ││ Downstream: B                                                          │
+│                                            ││ Graph Analysis                                                         │
+│                                            ││ • Impact Depth: 2 (downstream chain length)                            │
+│                                            ││ • Centrality: PR 0.4805 • BW 0.0000 • EV 1.0000                        │
+│                                            ││ • Flow Role: Hub 0.0000 • Authority 1.0000                             │
 │                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
 │                                            ││ Description                                                            │
-│                                            ││   Top-level issue that unblocks downstream work once the shared baseli │
 │                                            ││                                                                        │
+│                                            ││ Top-level issue that unblocks downstream work once the shared baseline │
+│                                            ││ is solid.                                                              │
 │                                            ││                                                                        │
+│                                            ││ Design Notes                                                           │
 │                                            ││                                                                        │
+│                                            ││ Keep the main flow lean, surface the most important context first, and │
+│                                            ││ let supporting sections trail after the summary.                       │
+│                                            ││                                                                        │
+│                                            ││ Acceptance Criteria                                                    │
+│                                            ││ • Detail summary shows triage and graph context.                       │
+│               Page 1 of 1 (items 1-3 of 3) ││ • Rich body sections stay readable across narrow and wide panes.       │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize │ ^0 reset split
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                       3 issues  tab focus │ C copy │ x export │ / search │ ? help
 
 --- Step 2: main_detail_focus ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Main | focus=detail | issues=3/3 | filter=all | sort=default |
-┌Issues──────────────────────────────────────┐┌Details [focus]─────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────┐┌────────────────────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID                   ││ 📋 Dependent                                                           │
+│  📋 P0 🔓1 OPEN A Root                     ││                                                                        │
+│▸ 📋 P0 OPEN B Dependent                    ││ ┌────┬────────┬──────────┬──────────┬────────────┐                     │
+│  📋 P0 DONE C Closed                       ││ │ ID │ Status │ Priority │ Assignee │ Created    │                     │
+│                                            ││ ├────┼────────┼──────────┼──────────┼────────────┤                     │
+│                                            ││ │ B  │ OPEN   │ 🔥 P0    │ —        │ 2026-01-03 │                     │
+│                                            ││ └────┴────────┴──────────┴──────────┴────────────┘                     │
+│                                            ││ C copy id • L label filter • w repo filter • t time-travel             │
 │                                            ││                                                                        │
-│ Focus: detail owns J/K deps, ^j…           ││ ────────────────────────────────────────────────                       │
-│ scope=all | label=any | repo=any | pos=2/3 ││ Summary  waiting on blockers                                           │
-│ Guide: / search-as-you-type | o/c/r/B/I qu ││ T B  Dependent  (C copy id)                                            │
-│                                            ││ Status: open | Priority: p0 | Type: task | State: blocked              │
-│   #01 ready   P0 A Root @alice             ││ Action: Unblock first via A | Open blockers: 1 | Downstream impact: 0  │
-│ ▸ #02 blocked P0 B Dependent ⊘1            ││ Assignee: unassigned | Repo: local | Estimate: n/a  (w repo filter)    │
-│   #03 closed  P0 C Closed                  ││ Closed: n/a | Labels: none  (L label filter)                           │
-│                                            ││ Created: 2026-01-03 | Updated: 2026-01-04 | Due: n/a  (t time-travel)  │
+│                                            ││ 🎯 Triage Insights                                                     │
+│                                            ││ • ⛔ Blocked by: A                                                     │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Signals  rank and graph pressure                                       │
-│                                            ││ Depth 1 | k-core 1 | slack 0.0000 | cut-point no                       │
-│                                            ││ PR ███░░░ 0.26  BW ░░░░░░ 0.00                                         │
-│                                            ││ EV ░░░░░░ 0.00  blockers=1 | unblocks=0                                │
+│                                            ││ Graph Analysis                                                         │
+│                                            ││ • Impact Depth: 1 (downstream chain length)                            │
+│                                            ││ • Centrality: PR 0.2597 • BW 0.0000 • EV 0.0000                        │
+│                                            ││ • Flow Role: Hub 1.0000 • Authority 0.0000                             │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Dependencies  upstream, gates, downstream                              │
-│                                            ││ Upstream: A                                                            │
-│                                            ││ Open Gate: A                                                           │
-│                                            ││ Downstream: none                                                       │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
 │                                            ││ Description                                                            │
-│                                            ││   Depends on A and should report blocked state clearly.                │
+│                                            ││                                                                        │
+│                                            ││ Depends on A and should report blocked state clearly.                  │
+│                                            ││                                                                        │
+│                                            ││ Dependencies (1)                                                       │
+│                                            ││ • A 📋 OPEN Root (blocks)                                              │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│               Page 1 of 1 (items 1-3 of 3) ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ ^j/k scroll │ x export │ O edit │ ^←/→ resize
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1         3 issues  ^j/k scroll │ tab focus │ C copy │ x export │ / search │ ? help
 
 --- Step 3: board_entry ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Board | focus=list | issues=3/3 | filter=all | sort=default |
-┌Board Lanes [focus]─────────────────────────┐┌Board Focus─────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Grouping: status (s cycles) | Empty: Auto  ││ ┌────────────────────────────────────────┐                             │
-│                                            ││ │  o T B p0                              │                             │
-│ Lanes (5) | 3 issues total                 ││ │ Dependent                              │                             │
-│                                            ││ ├────────────────────────────────────────┤                             │
-│ ▸ ┌─ open [2] ██  clear                    ││ │ Lane: open                             │                             │
-│   │ oT P0 A Root↓1 @alice                  ││ │ Assignee:                              │                             │
-│   ▶ oT P0 B Dependent⊘1                    ││ │ Age: 89d | Updated: 88d ago            │                             │
-│   └────────────                            ││ │ PR:0.260 Depth:1                       │                             │
-│                                            ││ ├────────────────────────────────────────┤                             │
-│   ┌─ in_progress [0]   empty               ││ │ Depends on A and should report block…  │                             │
-│   │ (empty)                                ││ └────────────────────────────────────────┘                             │
-│   └────────────                            ││                                                                        │
-│                                            ││ Depends on (1)                                                         │
-│   ┌─ blocked [0]   empty                   ││   o A [OPEN]                                                           │
-│   │ (empty)                                ││                                                                        │
-│   └────────────                            ││ Blocked by 1 open issue(s).                                            │
-│                                            ││                                                                        │
-│   ┌─ closed [1] █  clear                   ││                                                                        │
-│   │ xT P0 C Closed                         ││                                                                        │
-│   └────────────                            ││                                                                        │
-│                                            ││                                                                        │
-│   ┌─ other [0]   empty                     ││                                                                        │
-│   │ (empty)                                ││                                                                        │
-│   └────────────                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Board │ Tab focus │ / search │ s grouping=status │ e empty-lanes=Auto │ 1-4 lanes │ 0/$ edges │ ^j/k detail scroll
+                                                   BOARD [by: Status]
+       📋 OPEN (2) 2🔴              🔄 IN PROGRESS (0)              🚫 BLOCKED (0)              ✅ CLOSED (1) 1🔴
+╭────────────────────────────╮╭────────────────────────────╮╭────────────────────────────╮╭────────────────────────────╮
+│ ╭────────────────────────╮ ││                            ││                            ││ ╭────────────────────────╮ │
+│ │ 📋 P0 A 5mo ag         │ ││                            ││                            ││ │ 📋 P0 C 4mo ag         │ │
+│ │ Root                   │ ││                            ││                            ││ │ Closed                 │ │
+│ │ ⚡→1 core,parity       │ ││                            ││                            ││ │                        │ │
+│ ╰────────────────────────╯ ││                            ││                            ││ ╰────────────────────────╯ │
+│                            ││                            ││                            ││                            │
+│ ╭────────────────────────╮ ││                            ││                            ││                            │
+│ │ 📋 P0 B 4mo ag         │ ││                            ││                            ││                            │
+│ │ Dependent              │ ││                            ││                            ││                            │
+│ │ 🚫←A (Root)            │ ││                            ││                            ││                            │
+│ ╰────────────────────────╯ ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││          (empty)           ││          (empty)           ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+╰────────────────────────────╯╰────────────────────────────╯╰────────────────────────────╯╰────────────────────────────╯
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                               3 issues  hjkl nav │ G bottom │ tab detail │ b list
 
 --- Step 4: board_navigate ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Board | focus=list | issues=3/3 | filter=all | sort=default |
-┌Board Lanes [focus]─────────────────────────┐┌Board Focus─────────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ Grouping: status (s cycles) | Empty: Auto  ││ ┌────────────────────────────────────────┐                             │
-│                                            ││ │  x T C p0                              │                             │
-│ Lanes (5) | 3 issues total                 ││ │ Closed                                 │                             │
-│                                            ││ ├────────────────────────────────────────┤                             │
-│   ┌─ open [2] ██  clear                    ││ │ Lane: closed                           │                             │
-│   │ oT P0 A Root↓1 @alice                  ││ │ Assignee:                              │                             │
-│   │ oT P0 B Dependent⊘1                    ││ │ Age: 91d | Updated: 86d ago            │                             │
-│   └────────────                            ││ │ PR:0.260 Depth:1                       │                             │
-│                                            ││ └────────────────────────────────────────┘                             │
-│   ┌─ in_progress [0]   empty               ││                                                                        │
-│   │ (empty)                                ││                                                                        │
-│   └────────────                            ││ Ready to advance to next lane.                                         │
-│                                            ││                                                                        │
-│   ┌─ blocked [0]   empty                   ││                                                                        │
-│   │ (empty)                                ││                                                                        │
-│   └────────────                            ││                                                                        │
-│                                            ││                                                                        │
-│ ▸ ┌─ closed [1] █  clear                   ││                                                                        │
-│   ▶ xT P0 C Closed                         ││                                                                        │
-│   └────────────                            ││                                                                        │
-│                                            ││                                                                        │
-│   ┌─ other [0]   empty                     ││                                                                        │
-│   │ (empty)                                ││                                                                        │
-│   └────────────                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Board │ Tab focus │ / search │ s grouping=status │ e empty-lanes=Auto │ 1-4 lanes │ 0/$ edges │ ^j/k detail scroll
+                                                   BOARD [by: Status]
+       📋 OPEN (2) 2🔴              🔄 IN PROGRESS (0)              🚫 BLOCKED (0)              ✅ CLOSED (1) 1🔴
+╭────────────────────────────╮╭────────────────────────────╮╭────────────────────────────╮╭────────────────────────────╮
+│ ╭────────────────────────╮ ││                            ││                            ││ ╭────────────────────────╮ │
+│ │ 📋 P0 A 5mo ag         │ ││                            ││                            ││ │ 📋 P0 C 4mo ag         │ │
+│ │ Root                   │ ││                            ││                            ││ │ Closed                 │ │
+│ │ ⚡→1 core,parity       │ ││                            ││                            ││ │                        │ │
+│ ╰────────────────────────╯ ││                            ││                            ││ ╰────────────────────────╯ │
+│                            ││                            ││                            ││                            │
+│ ╭────────────────────────╮ ││                            ││                            ││                            │
+│ │ 📋 P0 B 4mo ag         │ ││                            ││                            ││                            │
+│ │ Dependent              │ ││                            ││                            ││                            │
+│ │ 🚫←A (Root)            │ ││                            ││                            ││                            │
+│ ╰────────────────────────╯ ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││          (empty)           ││          (empty)           ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+│                            ││                            ││                            ││                            │
+╰────────────────────────────╯╰────────────────────────────╯╰────────────────────────────╯╰────────────────────────────╯
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                               3 issues  hjkl nav │ G bottom │ tab detail │ b list
 
 --- Step 5: graph_entry_from_board ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=list | issues=3/3 | filter=all | sort=default |
 ┌Graph Nodes [focus]─────────────────────────┐┌Graph Focus─────────────────────────────────────────────────────────────┐
 │                                            ││                                                                        │
 │ Nodes  3 by critical-path score | h/l nav  ││ Graph: nodes=3 edges=1 cycles=0 actionable=1                           │
@@ -166,16 +165,16 @@ bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=list | issu
 │                                            ││                   ║up:0 down:0                       ║                 │
 │                                            ││                   ╚══════════════════════════════════╝                 │
 │                                            ││                                                                        │
-│                                            ││ GRAPH METRICS                                                          │
-│                                            ││ Importance:                                                            │
+│                                            ││  📊 GRAPH METRICS                                                      │
+│                                            ││ Importance                                                             │
 │                                            ││   Critical Path         1  ███░░░  #2                                  │
 │                                            ││   PageRank         0.2597  ███░░░  #2                                  │
 │                                            ││   Eigenvector      0.0000  ░░░░░░  #2                                  │
-│                                            ││ Flow & Connectivity:                                                   │
+│                                            ││ Flow & Connectivity                                                    │
 │                                            ││   Betweenness      0.0000  ░░░░░░  #1                                  │
 │                                            ││   Hub Score        0.0000  ░░░░░░  #2                                  │
 │                                            ││   Authority        0.0000  ░░░░░░  #2                                  │
-│                                            ││ Connections:                                                           │
+│                                            ││ Connections                                                            │
 │                                            ││   In-Degree             0  ░░░░░░                                      │
 │                                            ││   Out-Degree            0  ░░░░░░                                      │
 │                                            ││   K-core: 0  Slack: 1.0000  Cut: no                                    │
@@ -186,11 +185,11 @@ bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=list | issu
 │                                            ││   B            0.2597                                                  │
 │                                            ││   C            0.2597                                                  │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-h/l nodes │ j/k nodes │ ^u/L jump │ Tab detail │ / search │ Enter open details │ g/Esc back │ ^←/→ resize
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1       3 issues  h/l nodes │ j/k nodes │ tab edges │ / search │ ⏎ details │ g list
 
 --- Step 6: graph_detail_focus ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=detail | issues=3/3 | filter=all | sort=default |
 ┌Graph Nodes─────────────────────────────────┐┌Graph Focus [focus]─────────────────────────────────────────────────────┐
 │                                            ││                                                                        │
 │ Nodes  3 by critical-path score | h/l nav  ││ Graph: nodes=3 edges=1 cycles=0 actionable=1                           │
@@ -203,16 +202,16 @@ bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=detail | is
 │                                            ││                   ║up:0 down:0                       ║                 │
 │                                            ││                   ╚══════════════════════════════════╝                 │
 │                                            ││                                                                        │
-│                                            ││ GRAPH METRICS                                                          │
-│                                            ││ Importance:                                                            │
+│                                            ││  📊 GRAPH METRICS                                                      │
+│                                            ││ Importance                                                             │
 │                                            ││   Critical Path         1  ███░░░  #2                                  │
 │                                            ││   PageRank         0.2597  ███░░░  #2                                  │
 │                                            ││   Eigenvector      0.0000  ░░░░░░  #2                                  │
-│                                            ││ Flow & Connectivity:                                                   │
+│                                            ││ Flow & Connectivity                                                    │
 │                                            ││   Betweenness      0.0000  ░░░░░░  #1                                  │
 │                                            ││   Hub Score        0.0000  ░░░░░░  #2                                  │
 │                                            ││   Authority        0.0000  ░░░░░░  #2                                  │
-│                                            ││ Connections:                                                           │
+│                                            ││ Connections                                                            │
 │                                            ││   In-Degree             0  ░░░░░░                                      │
 │                                            ││   Out-Degree            0  ░░░░░░                                      │
 │                                            ││   K-core: 0  Slack: 1.0000  Cut: no                                    │
@@ -223,116 +222,117 @@ bvr 1 Main b Board i Insights g Graph H History | mode=Graph | focus=detail | is
 │                                            ││   B            0.2597                                                  │
 │                                            ││   C            0.2597                                                  │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-h/Tab list │ Enter open details │ ^j/k scroll │ g/Esc back │ ^←/→ resize │ ^0 reset split
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1  3 issues  ^j/k scroll │ h/l nodes │ j/k nodes │ tab edges │ / search │ ⏎ details
 
 --- Step 7: insights_entry ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Insights | focus=list | issues=3/3 | filter=all | sort=default |
-┌Insight Queue [focus]───────────────────────┐┌Insight Detail──────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ [Bottlenecks] s/S cycles panel | e explana ││ Analytics Cockpit                                                      │
-│                                            ││ System Radar | bottlenecks=2 crit-path=3 cycles=0 cut-pts=0 k-core-max │
-│ Signal Tiles                               ││                                                                        │
-│ [Flow ] open=2 blocked=1 crit-path=3 cycle ││ Focus: A (Root)                                                        │
-│ [Risk ] bottlenecks=2 cut-points=0 zero-sl ││ Status: open | Priority: p0                                            │
-│                                            ││                                                                        │
-│ Outlier Radar                              ││ Metric Strip                                                           │
-│ [Lead ] bottleneck=A score=0.481 blocks=1  ││ [Rank ] pagerank=0.4805 betweenness=0.0000 eigenvector=1.0000          │
-│ [Rank ] influencer=A pr=0.4805             ││ [HITS ] hub=0.0000 authority=1.0000 k-core=1                           │
-│ [Act  ] next-priority=A score=0.691 p0     ││ [Risk ] crit-depth=2 slack=0.0000 cut-point=no                         │
-│                                            ││ [Flow ] blockers=0 dependents=1 crit-path=yes cycle=no                 │
-│ Panel Focus | Bottlenecks | blocking press ││ [Lead ] top-bottleneck=yes                                             │
-│                                            ││                                                                        │
-│  1. A            score=0.481 blocks=1      ││ All Metrics:                                                           │
-│  2. B            score=0.260 blocks=0      ││   PageRank:     0.4805                                                 │
-│                                            ││   Betweenness:  0.0000                                                 │
-│                                            ││   Eigenvector:  1.0000                                                 │
-│                                            ││   Hub (HITS):   0.0000                                                 │
-│                                            ││   Auth (HITS):  1.0000                                                 │
-│                                            ││   K-core:       1                                                      │
-│                                            ││   Crit depth:   2                                                      │
-│                                            ││   Slack:        0.0000                                                 │
-│                                            ││   Cut point:    no                                                     │
-│                                            ││                                                                        │
-│                                            ││ Critical Path Head:                                                    │
-│                                            ││   - A                                                                  │
-│                                            ││   - B                                                                  │
-│                                            ││   - C                                                                  │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Insights [bottlenecks] │ Tab focus │ / search │ s/S panel │ e explanations=on │ x proof=off
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🚧 Bottlenecks (2)                   ││ 🏛 Keystones (2)                      ││ 🌐 Influencers (3)                   │
+│ Betweenness Centrality               ││ Impact Depth                         ││ Eigenvector Centrality               │
+│ Measures how often a bead lies on    ││ Measures how deep in the dependency  ││ Scores beads by their connections to │
+│ ▸   0.481  📋 ● Root                 ││       2.0  📋 ● Root                 ││     1.000  📋 ● Root                 │
+│     0.260  📋 ● Dependent            ││       1.0  📋 ● Dependent            ││     0.000  📋 ● Dependent            │
+│                ↕ 1/2                 ││                ↕ 1/2                 ││                ↕ 1/3                 │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🛰 Hubs (3)                           ││ 📚 Authorities (3)                   ││ 🧠 Cores (3)                         │
+│ HITS Hub Score                       ││ HITS Authority Score                 ││ k-core Cohesion                      │
+│ Beads that depend on many important  ││ Beads that are depended upon by many ││ Nodes with highest k-core numbers    │
+│     1.000  📋 ● Dependent            ││     1.000  📋 ● Root                 ││         1  📋 ● Root                 │
+│     0.000  📋 ● Root                 ││     0.000  📋 ● Dependent            ││         1  📋 ● Dependent            │
+│                ↕ 1/3                 ││                ↕ 1/3                 ││                ↕ 1/3                 │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🪢 Cut Points (0)                    ││ ⏳ Slack (2)                         ││ 🔄 Cycles (0)                        │
+│ Articulation Vertices                ││ Longest-path slack                   ││ Circular Dependencies                │
+│ Nodes whose removal disconnects the  ││ Distance from critical chain (0 =    ││ Groups of beads forming dependency   │
+│                                      ││       0.0  📋 ● Root                 ││ ✓ No cycles detected                 │
+│                                      ││       0.0  📋 ● Dependent            ││ Graph is acyclic (DAG)               │
+│                                      ││                ↕ 1/2                 ││                                      │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ 🎯 Priority (2)   Agent-First Triage                                                                                 │
+│ ╭───────────────────────────────────╮ ╭───────────────────────────────────╮                                          │
+│ │  0.69                             │ │  0.43                             │                                          │
+│ │ 📋 OPEN ⚡P0                      │ │ 📋 OPEN ⚡P0                      │                                          │
+│ │ Root                              │ │ Dependent                         │                                          │
+│ │ PR:████████████████ BW:░░░░░░░░░░ │ │ PR:█████████░░░░░░░ BW:░░░░░░░░░░ │                                          │
+│ │ ↳ Unblocks 1                      │ │ ↳ Unblocks 0                      │                                          │
+│ ╰───────────────────────────────────╯ ╰───────────────────────────────────╯                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                 3 issues  h/l panels │ j/k items │ / search │ tab detail │ ? help
 
 --- Step 8: insights_panel_cycle ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Insights | focus=list | issues=3/3 | filter=all | sort=default |
-┌Insight Queue [focus]───────────────────────┐┌Insight Detail──────────────────────────────────────────────────────────┐
-│                                            ││                                                                        │
-│ [Keystones] s/S cycles panel | e explanati ││ Analytics Cockpit                                                      │
-│                                            ││ System Radar | bottlenecks=2 crit-path=3 cycles=0 cut-pts=0 k-core-max │
-│ Signal Tiles                               ││                                                                        │
-│ [Flow ] open=2 blocked=1 crit-path=3 cycle ││ Focus: A (Root)                                                        │
-│ [Risk ] bottlenecks=2 cut-points=0 zero-sl ││ Status: open | Priority: p0                                            │
-│                                            ││                                                                        │
-│ Outlier Radar                              ││ Metric Strip                                                           │
-│ [Lead ] bottleneck=A score=0.481 blocks=1  ││ [Rank ] pagerank=0.4805 betweenness=0.0000 eigenvector=1.0000          │
-│ [Rank ] influencer=A pr=0.4805             ││ [HITS ] hub=0.0000 authority=1.0000 k-core=1                           │
-│ [Act  ] next-priority=A score=0.691 p0     ││ [Risk ] crit-depth=2 slack=0.0000 cut-point=no                         │
-│                                            ││ [Flow ] blockers=0 dependents=1 crit-path=yes cycle=no                 │
-│ Panel Focus | Keystones | foundational cha ││ [Lead ] top-bottleneck=yes                                             │
-│                                            ││                                                                        │
-│  1. A            depth=2 unblocks=1        ││ All Metrics:                                                           │
-│  2. B            depth=1 unblocks=0        ││   PageRank:     0.4805                                                 │
-│                                            ││   Betweenness:  0.0000                                                 │
-│                                            ││   Eigenvector:  1.0000                                                 │
-│                                            ││   Hub (HITS):   0.0000                                                 │
-│                                            ││   Auth (HITS):  1.0000                                                 │
-│                                            ││   K-core:       1                                                      │
-│                                            ││   Crit depth:   2                                                      │
-│                                            ││   Slack:        0.0000                                                 │
-│                                            ││   Cut point:    no                                                     │
-│                                            ││                                                                        │
-│                                            ││ Critical Path Head:                                                    │
-│                                            ││   - A                                                                  │
-│                                            ││   - B                                                                  │
-│                                            ││   - C                                                                  │
-│                                            ││                                                                        │
-│                                            ││                                                                        │
-└────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-Insights [keystones] │ Tab focus │ / search │ s/S panel │ e explanations=on │ x proof=off
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🚧 Bottlenecks (2)                   ││ 🏛 Keystones (2)                      ││ 🌐 Influencers (3)                   │
+│ Betweenness Centrality               ││ Impact Depth                         ││ Eigenvector Centrality               │
+│ Measures how often a bead lies on    ││ Measures how deep in the dependency  ││ Scores beads by their connections to │
+│     0.481  📋 ● Root                 ││ ▸     2.0  📋 ● Root                 ││     1.000  📋 ● Root                 │
+│     0.260  📋 ● Dependent            ││       1.0  📋 ● Dependent            ││     0.000  📋 ● Dependent            │
+│                ↕ 1/2                 ││                ↕ 1/2                 ││                ↕ 1/3                 │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🛰 Hubs (3)                           ││ 📚 Authorities (3)                   ││ 🧠 Cores (3)                         │
+│ HITS Hub Score                       ││ HITS Authority Score                 ││ k-core Cohesion                      │
+│ Beads that depend on many important  ││ Beads that are depended upon by many ││ Nodes with highest k-core numbers    │
+│     1.000  📋 ● Dependent            ││     1.000  📋 ● Root                 ││         1  📋 ● Root                 │
+│     0.000  📋 ● Root                 ││     0.000  📋 ● Dependent            ││         1  📋 ● Dependent            │
+│                ↕ 1/3                 ││                ↕ 1/3                 ││                ↕ 1/3                 │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────╮╭──────────────────────────────────────╮╭──────────────────────────────────────╮
+│ 🪢 Cut Points (0)                    ││ ⏳ Slack (2)                         ││ 🔄 Cycles (0)                        │
+│ Articulation Vertices                ││ Longest-path slack                   ││ Circular Dependencies                │
+│ Nodes whose removal disconnects the  ││ Distance from critical chain (0 =    ││ Groups of beads forming dependency   │
+│                                      ││       0.0  📋 ● Root                 ││ ✓ No cycles detected                 │
+│                                      ││       0.0  📋 ● Dependent            ││ Graph is acyclic (DAG)               │
+│                                      ││                ↕ 1/2                 ││                                      │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ 🎯 Priority (2)   Agent-First Triage                                                                                 │
+│ ╭───────────────────────────────────╮ ╭───────────────────────────────────╮                                          │
+│ │  0.69                             │ │  0.43                             │                                          │
+│ │ 📋 OPEN ⚡P0                      │ │ 📋 OPEN ⚡P0                      │                                          │
+│ │ Root                              │ │ Dependent                         │                                          │
+│ │ PR:████████████████ BW:░░░░░░░░░░ │ │ PR:█████████░░░░░░░ BW:░░░░░░░░░░ │                                          │
+│ │ ↳ Unblocks 1                      │ │ ↳ Unblocks 0                      │                                          │
+│ ╰───────────────────────────────────╯ ╰───────────────────────────────────╯                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                 3 issues  h/l panels │ j/k items │ / search │ tab detail │ ? help
 
 --- Step 9: main_return ---
-bvr 1 Main b Board i Insights g Graph H History | mode=Main | focus=list | issues=3/3 | filter=all | sort=default |
-┌Issues [focus]──────────────────────────────┐┌Details─────────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────┐┌────────────────────────────────────────────────────────────────────────┐
+│  TYPE PRI STATUS      ID                   ││ 📋 Closed                                                              │
+│  📋 P0 🔓1 OPEN A Root                     ││                                                                        │
+│  📋 P0 OPEN B Dependent                    ││ ┌────┬────────┬──────────┬──────────┬────────────┐                     │
+│▸ 📋 P0 DONE C Closed                       ││ │ ID │ Status │ Priority │ Assignee │ Created    │                     │
+│                                            ││ ├────┼────────┼──────────┼──────────┼────────────┤                     │
+│                                            ││ │ C  │ CLOSED │ 🔥 P0    │ —        │ 2026-01-01 │                     │
+│                                            ││ └────┴────────┴──────────┴──────────┴────────────┘                     │
+│                                            ││ C copy id • L label filter • w repo filter • t time-travel             │
 │                                            ││                                                                        │
-│ Focus: list owns selection, / s…           ││ ────────────────────────────────────────────────                       │
-│ scope=all | label=any | repo=any | pos=3/3 ││ Summary  reference state                                               │
-│ Guide: / search-as-you-type | o/c/r/B/I qu ││ T C  Closed  (C copy id)                                               │
-│                                            ││ Status: closed | Priority: p0 | Type: task | State: closed             │
-│   #01 ready   P0 A Root @alice             ││ Action: Closed work item | Downstream still watching: 0                │
-│   #02 blocked P0 B Dependent ⊘1            ││ Assignee: unassigned | Repo: local | Estimate: n/a  (w repo filter)    │
-│ ▸ #03 closed  P0 C Closed                  ││ Closed: 2026-01-06 | Labels: none  (L label filter)                    │
-│                                            ││ Created: 2026-01-01 | Updated: 2026-01-06 | Due: n/a  (t time-travel)  │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Signals  rank and graph pressure                                       │
-│                                            ││ Depth 1 | k-core 0 | slack 1.0000 | cut-point no                       │
-│                                            ││ PR ███░░░ 0.26  BW ░░░░░░ 0.00                                         │
-│                                            ││ EV ░░░░░░ 0.00  blockers=0 | unblocks=0                                │
-│                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ Dependencies  upstream, gates, downstream                              │
-│                                            ││ Upstream: none                                                         │
-│                                            ││ Open Gate: none                                                        │
-│                                            ││ Downstream: none                                                       │
+│                                            ││ Graph Analysis                                                         │
+│                                            ││ • Impact Depth: 1 (downstream chain length)                            │
+│                                            ││ • Centrality: PR 0.2597 • BW 0.0000 • EV 0.0000                        │
+│                                            ││ • Flow Role: Hub 0.0000 • Authority 0.0000                             │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
 │                                            ││                                                                        │
-│                                            ││ ────────────────────────────────────────────────                       │
-│                                            ││ History Summary (3 events)                                             │
-│                                            ││   + 2026-01-01 Issue C created                                         │
-│                                            ││   . 2026-01-06 Current status: closed                                  │
 │                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│                                            ││                                                                        │
+│               Page 1 of 1 (items 1-3 of 3) ││                                                                        │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────┘
-b/i/g/H modes │ / search │ s default │ p hints │ C copy │ x export │ O edit │ ^←/→ resize │ ^0 reset split
+ 📋 ALL  ⚠ 2 alerts (!)   ○2 ◉1 ◈0 ●1                       3 issues  tab focus │ C copy │ x export │ / search │ ? help

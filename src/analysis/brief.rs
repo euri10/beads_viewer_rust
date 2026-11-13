@@ -88,7 +88,7 @@ pub fn generate_priority_brief(
     let _ = writeln!(out, "```bash");
     let _ = writeln!(out, "# Claim the top pick:");
     if let Some(top) = recs.first() {
-        let _ = writeln!(out, "br update {} --status=in_progress", top.id);
+        let _ = writeln!(out, "{}", top.claim_command);
     }
     let _ = writeln!(out, "\n# Refresh triage:");
     let _ = writeln!(out, "bvr --robot-triage");
@@ -248,6 +248,8 @@ mod tests {
                 actionable_count: 3,
                 blocked_count: 2,
                 in_progress_count: 1,
+                not_closed_count: 5,
+                not_actionable_count: 2,
                 top_picks: vec![QuickPick {
                     id: "A-1".to_string(),
                     title: "Fix auth".to_string(),
@@ -272,6 +274,8 @@ mod tests {
                 unblocks_ids: Vec::new(),
                 blocked_by: Vec::new(),
                 assignee: String::new(),
+                defer_until: None,
+                claimable: false,
                 claim_command: "br update A-1 --status=in_progress".to_string(),
                 show_command: "br show A-1".to_string(),
                 breakdown: None,
@@ -292,6 +296,8 @@ mod tests {
                     closed: 0,
                     actionable: 3,
                     blocked: 2,
+                    not_closed: 5,
+                    dependency_blocked: 2,
                     by_status: std::collections::BTreeMap::new(),
                     by_priority: std::collections::BTreeMap::new(),
                     by_type: std::collections::BTreeMap::new(),

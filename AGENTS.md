@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -38,7 +60,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (`rust-version = "1.85"`)
+- **Edition:** Rust 2024 (`rust-version = "1.88"`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only (single crate, not a workspace)
 - **Unsafe code:** Forbidden (`unsafe_code = "forbid"` in `[lints.rust]`)
@@ -275,10 +297,10 @@ JSONL → Loader → Issue Vec → Analyzer (IssueGraph + metrics) → Robot JSO
 | Graph | `g` | Dependency graph with centrality metrics |
 | History | `h` | Bead/git timeline with file tree |
 | Actionable | `a` | Track-based execution plan (Rust-only) |
-| Attention | `!` | Label attention scores (Rust-only) |
-| Tree | `T` | Dependency tree with collapse/expand (Rust-only) |
+| Attention | `]` | Label attention scores (Rust-only) |
+| Tree | `T` / `E` | Dependency tree with collapse/expand (Rust-only) |
 | LabelDashboard | `[` | Label health dashboard (Rust-only) |
-| FlowMatrix | `]` | Cross-label flow matrix (Rust-only) |
+| FlowMatrix | `f` | Cross-label flow matrix (Rust-only) |
 | TimeTravelDiff | `t` | Diff-against-ref view (Rust-only) |
 | Sprint | `S` | Sprint-based planning (Rust-only) |
 
@@ -546,4 +568,4 @@ git push                # Push to remote
 4. **Sync beads** - `br sync --flush-only` to export to JSONL
 5. **Hand off** - Provide context for next session
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "beads_viewer_rust-agent (+https://github.com/Dicklesworthstone/beads_viewer_rust)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

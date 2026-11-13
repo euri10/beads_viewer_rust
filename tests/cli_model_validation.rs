@@ -920,6 +920,37 @@ fn graph_modifier_without_graph_command_exits_with_error() {
 }
 
 #[test]
+fn graph_root_next_keeps_blockers_outside_the_subtree() {
+    // C is a child of epic E but is blocked by B, which is outside E's tree.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let beads_path = tmp.path().join("issues.jsonl");
+    fs::write(
+        &beads_path,
+        concat!(
+            r#"{"id":"E","title":"Epic","status":"open","priority":1,"issue_type":"epic"}"#,
+            "\n",
+            r#"{"id":"B","title":"Outside blocker","status":"open","priority":2,"issue_type":"task"}"#,
+            "\n",
+            r#"{"id":"C","title":"Child","status":"open","priority":0,"issue_type":"task","dependencies":[{"depends_on_id":"E","type":"parent-child"},{"depends_on_id":"B","type":"blocks"}]}"#,
+            "\n",
+        ),
+    )
+    .expect("write beads file");
+
+    let output = bvr()
+        .args(["--robot-next", "--graph-root", "E", "--beads-file"])
+        .arg(&beads_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let next: Value = serde_json::from_slice(&output).expect("valid JSON output");
+    assert_ne!(next["id"], "C", "blocked C offered as next work: {next}");
+    assert!(next["id"].is_null(), "unexpected pick: {next}");
+}
+
+#[test]
 fn search_modifier_without_robot_search_exits_with_error() {
     let root = repo_root();
     let beads_path = root.join("tests/testdata/minimal.jsonl");
@@ -1826,4 +1857,200 @@ fn large_fixture_triage_does_not_panic() {
         !recs.is_empty(),
         "40-node graph should produce recommendations"
     );
+}
+
+// ============================================================================
+// --export-template (legacy Go text/template reports)
+// ============================================================================
+
+#[test]
+fn export_template_renders_custom_markdown_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let template = dir.path().join("report.tmpl");
+    fs::write(
+        &template,
+        "# {{.Title}}\n{{range .Issues}}- {{.ID}} P{{.Priority}}{{if eq .Status \"closed\"}} done{{end}}\n{{end}}{{if .Graph}}graph{{else}}no graph{{end}} {{len .Issues}}\n",
+    )
+    .expect("write template");
+    let out = dir.path().join("report.md");
+    bvr()
+        .arg("--beads-file")
+        .arg(repo_root().join("tests/testdata/minimal.jsonl"))
+        .arg("--export")
+        .arg(&out)
+        .arg("--export-template")
+        .arg(&template)
+        .arg("--export-include-graph=false")
+        .arg("--no-hooks")
+        .assert()
+        .success();
+    let report = fs::read_to_string(&out).expect("report written");
+    assert!(report.starts_with("# Beads Export\n- "), "{report}");
+    assert!(report.ends_with("- B P2\nno graph 2\n"), "{report}");
+}
+
+#[test]
+fn export_template_rejects_bad_combinations_and_templates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let template = dir.path().join("bad.tmpl");
+    fs::write(&template, "{{.Missing}}").expect("write template");
+    let fixture = repo_root().join("tests/testdata/minimal.jsonl");
+    for (args, needle) in [
+        (
+            vec!["--robot-triage", "--export-template"],
+            "requires --export or --export-md",
+        ),
+        (
+            vec![
+                "--export",
+                "out.csv",
+                "--export-format",
+                "csv",
+                "--export-include-graph=false",
+                "--export-template",
+            ],
+            "custom templates require markdown export",
+        ),
+        (
+            vec!["--export", "out.md", "--export-template"],
+            "map has no entry for key \"Missing\"",
+        ),
+    ] {
+        let output = bvr()
+            .current_dir(dir.path())
+            .arg("--beads-file")
+            .arg(&fixture)
+            .args(&args)
+            .arg(&template)
+            .output()
+            .expect("run bvr");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn export_template_bounds_reject_allocation_attacks_without_overwriting_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let template = dir.path().join("bounded.tmpl");
+    let report = dir.path().join("existing.md");
+    let fixture = repo_root().join("tests/testdata/minimal.jsonl");
+    let binary = std::env::var("CARGO_BIN_EXE_bvr").expect("CARGO_BIN_EXE_bvr");
+    let nested_actions = format!("{}ok{}", "{{if true}}".repeat(2048), "{{end}}".repeat(2048));
+    let nested_expression = format!(
+        "{{{{{}print \"ok\"{}}}}}",
+        "(".repeat(2048),
+        ")".repeat(2048)
+    );
+    for (source, detail) in [
+        (
+            "{{range 1000000000}}x{{end}}",
+            "exceeds 1000000 range iterations",
+        ),
+        (
+            "{{range 1001}}{{range 1000}}{{end}}{{end}}",
+            "exceeds 1000000 range iterations",
+        ),
+        (
+            "{{printf \"%1000000000s\" \"x\"}}",
+            "printf width exceeds 16777216 bytes",
+        ),
+        (
+            "{{printf \"%184467440737095516160s\" \"x\"}}",
+            "printf width exceeds 16777216 bytes",
+        ),
+        (
+            "{{printf \"%.1000000000f\" 1.0}}",
+            "printf precision exceeds 16777216 bytes",
+        ),
+        (
+            "{{printf \"%.1s\" (printf \"%1000000000s\" \"x\")}}",
+            "printf width exceeds 16777216 bytes",
+        ),
+        (&nested_actions, "nesting exceeds 128 levels"),
+        (&nested_expression, "nesting exceeds 128 levels"),
+    ] {
+        fs::write(&template, source).expect("write bounded template");
+        fs::write(&report, "previous report\n").expect("write previous report");
+        // Keep this regression safe even if the unbounded implementation is
+        // accidentally restored. No core dumps, >256 MiB allocations, or
+        // indefinitely running child processes are permitted by the harness.
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "ulimit -v 262144 && ulimit -t 3 && ulimit -c 0 && exec \"$@\"",
+                "bounded-template",
+            ])
+            .arg(&binary)
+            .current_dir(dir.path())
+            .arg("--beads-file")
+            .arg(&fixture)
+            .arg("--export")
+            .arg(&report)
+            .arg("--export-template")
+            .arg(&template)
+            .args(["--export-include-graph=false", "--no-hooks"])
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .expect("run bounded template");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{source}: {stderr}");
+        assert!(stderr.contains(detail), "{source}: {stderr}");
+        assert!(output.stdout.is_empty(), "failed template emitted stdout");
+        assert_eq!(fs::read_to_string(&report).unwrap(), "previous report\n");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn export_template_caps_zero_metadata_streams_before_utf8_decoding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let report = dir.path().join("stream.md");
+    let fixture = repo_root().join("tests/testdata/minimal.jsonl");
+    const LIMIT: usize = 1 << 20;
+    for (source, succeeds) in [
+        ("a".repeat(LIMIT), true),
+        (format!("{}é", "a".repeat(LIMIT - 2)), true),
+        ("a".repeat(LIMIT + 1), false),
+        (format!("{}é", "a".repeat(LIMIT - 1)), false),
+        // The bounded read ends inside this four-byte character. The limit
+        // error must take precedence over an unrelated UTF-8 decode error.
+        (format!("{}💥", "a".repeat(LIMIT - 1)), false),
+    ] {
+        fs::write(&report, "previous report\n").expect("write previous report");
+        let output = bvr()
+            .current_dir(dir.path())
+            .arg("--beads-file")
+            .arg(&fixture)
+            .arg("--export")
+            .arg(&report)
+            .args([
+                "--export-template",
+                "/proc/self/fd/0",
+                "--export-include-graph=false",
+                "--no-hooks",
+            ])
+            .write_stdin(source.clone())
+            .timeout(std::time::Duration::from_secs(5))
+            .output()
+            .expect("run streamed template");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(if succeeds { 0 } else { 2 }),
+            "{stderr}"
+        );
+        if succeeds {
+            assert_eq!(fs::read_to_string(&report).unwrap(), source);
+        } else {
+            assert!(
+                stderr.contains("export template exceeds 1048576 bytes"),
+                "{stderr}"
+            );
+            assert!(output.stdout.is_empty(), "failed template emitted stdout");
+            assert_eq!(fs::read_to_string(&report).unwrap(), "previous report\n");
+        }
+    }
 }

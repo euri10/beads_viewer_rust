@@ -2,7 +2,6 @@
 source: src/tui.rs
 expression: text
 ---
-bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=3/3 | filter=all |
 ┌Help──────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                                                                                  │
 │ [Navigation]                                     | [Search]                                      │
@@ -22,13 +21,14 @@ bvr 1 Main b Board i Insights | mode=Main | focus=list | issues=3/3 | filter=all
 │   J/K          Navigate deps in detail           |                                               │
 │   Enter        Return to main / drill            | [History]                                     │
 │   scroll       Mouse wheel scrolls list          |   c            Cycle confidence filter        │
-│   splitter click/scroll Mouse-resize active div… |   y            Copy SHA/ID                    │
+│   divider click Mouse-resize active divider      |   y            Copy SHA/ID                    │
 │                                                  |   o            Open commit in browser         │
 │ [Views]                                          |   f            Toggle file tree               │
 │   a            Toggle actionable mode            |                                               │
 │   b            Toggle board mode                 | [Board]                                       │
 │   i            Toggle insights mode              |   1-4          Jump to lane                   │
 │   g            Toggle graph mode                 |   L            Jump to last lane              │
+│   H            Toggle history mode               |   0/$          First/last in lane             │
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ? or Esc close | j/k scroll | Ctrl+d/u page | line 1/45

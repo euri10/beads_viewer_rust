@@ -12,6 +12,302 @@ Binary name: **`bvr`**
 
 ---
 
+## [v0.4.1] -- 2026-10-13
+
+Fixes from the v0.4.0 release review ([#31](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/31))
+and from user reports. Three of them change behaviour that scripts may rely on:
+
+- `bvr upgrade` no longer installs without consent. It asks for `y`/`yes` at a
+  terminal; scripts must pass `--yes`.
+- Robot commands stop with an error when the selected SQLite database cannot
+  be read, instead of quietly using the JSONL export. Set
+  `BV_DATA_SOURCE=jsonl` to use the export.
+- The minimum supported Rust is now declared as 1.88. The earlier 1.85 was
+  wrong: Cargo refuses the locked dependencies on anything older than 1.88.
+
+### Data sources
+
+- **bd (Dolt) workspaces are read live.** `bvr` reads `bd export` output on
+  each load rather than a `.beads/issues.jsonl` it created once and never
+  refreshed, so later `bd` writes are visible. The export has a 5-second
+  deadline and size limits, a successful snapshot is shared for 2 seconds, and
+  a failure backs off for 30 seconds and is reported (also in robot mode).
+  `bvr` no longer writes into `.beads/`. `BV_DATA_SOURCE=jsonl` reads an
+  existing `issues.jsonl` without running `bd`.
+  ([2d94729](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/2d94729),
+  [5da519a](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/5da519a),
+  [#29](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/29))
+- **Incomplete SQLite snapshots are rejected.** Malformed rows, duplicate IDs,
+  dependencies on missing issues, unsupported required columns and invalid
+  timestamps fail the load instead of being dropped; a dropped dependency row
+  could make a blocked bead look ready. Issues, labels, dependencies and
+  comments are read from one read-only snapshot. In a workspace, a failed
+  repository aborts the load instead of being left out.
+  ([8ce9415](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/8ce9415))
+- **Tracker databases are treated as untrusted input.** Views and virtual
+  tables in a tracker database are refused, and SQLite runs with
+  `trusted_schema` off.
+  ([b8f75c2](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/b8f75c2))
+- Robot commands no longer fall back from a failed SQLite read to the JSONL
+  export on their own (see above). Interactive views and Pages exports still
+  fall back, with a visible warning.
+
+### Git history
+
+- The TUI loads Git history in the background: the views stay usable while it
+  runs, and a failed load is shown and can be retried by reopening History
+  with `H`.
+- Git scans are bounded (30 s overall, 10 s for the commit log, 5 s per probe
+  or diff, capped output). A scan that fails or exceeds a limit reports an
+  error instead of returning partial correlations.
+- Backup snapshots under `.beads/.br_history` no longer count as issue changes
+  (they inflated confidence and produced false field changes).
+  ([4d715af](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4d715af))
+- Time travel and history read each revision's own metadata and declared
+  export, follow redirects the same way as live loads, and report a damaged
+  committed snapshot as an error rather than as an empty history.
+  ([8566715](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/8566715))
+
+### TUI
+
+- **Paste works in input fields.** Pasting into the `/` search did nothing:
+  the terminal delivers a paste as one event, which the TUI ignored. Pasted
+  text now goes into the focused field: any of the searches, the label and
+  repo picker filters, the Pages wizard's text steps and the time-travel ref.
+  ([e632aa9](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/e632aa9),
+  [#35](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/35))
+- The ready filter and ready counts use the same readiness rules as the robot
+  commands, including inherited blockers and deferrals, in lists, heatmaps and
+  trees.
+- Mouse clicks and wheel input stay inside an open overlay instead of acting
+  on the view underneath. `Ctrl+j`/`Ctrl+k` scroll the focused detail pane.
+  ([b8a4184](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/b8a4184))
+
+### Robot contract
+
+- The published schemas for triage, next and burndown describe the payloads
+  the commands produce (readiness and risk fields, brief and no-pick output).
+  The payloads are unchanged.
+  ([ae7e3b0](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/ae7e3b0))
+
+### Exports and the Pages viewer
+
+- **DOMPurify 3.0.6 → 3.4.16** in the exported viewer, taken from the signed
+  upstream tag and checked against the npm package; see
+  `VIEWER_VENDOR_PROVENANCE.md`. The review of the other vendored assets is
+  still open.
+  ([522ccbe](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/522ccbe),
+  [#33](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/33))
+- Graph descriptions go through the Markdown sanitizer and tooltip text is
+  escaped. Issue IDs are no longer interpolated into Mermaid identifiers or
+  callbacks, so IDs with commas, quotes or markup render and navigate
+  correctly.
+  ([832600e](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/832600e),
+  [1de14b0](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/1de14b0),
+  [#32](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/32))
+- Large exports no longer compute exact betweenness on the main thread when
+  the page loads: above 500 nodes the viewer approximates it from 100 sources,
+  and a missing optional metric leaves the dashboard usable.
+  ([1dffe3e](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/1dffe3e),
+  [#30](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/30))
+- The standalone graph export applies the core readiness rules, and its
+  toolbar, keyboard and context-menu controls stay in sync.
+  ([de7496c](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/de7496c))
+- Search text typed while a navigation is still pending is kept.
+  ([3e2f898](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/3e2f898))
+- `--watch-export` picks up edits made while the first export is running and
+  keeps the label and repository scope on every refresh.
+  ([24806b2](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/24806b2))
+- Export templates are evaluated within fixed limits (iterations, output size,
+  nesting depth, a 1 MiB template file), so a template cannot exhaust memory.
+  ([62acfda](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/62acfda))
+
+### Upgrade command
+
+- `bvr upgrade` shows the install command and asks before running it. At a
+  terminal it needs `y` or `yes`; otherwise pass `--yes` (`-y`). Piped input
+  cannot approve an upgrade, `--dry-run` never installs, and the update flags
+  cannot be combined with robot, export or other actions. The legacy
+  `--update` aliases follow the same rules.
+  ([4d715af](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4d715af))
+
+### Toolchain and dependencies
+
+- `rust-version` is now 1.88, matching what the locked dependencies need
+  (sysinfo 0.37 and vergen 9.1). The packaged crate was installed with
+  `cargo install --locked` on stable 1.88.0; 1.87.0 is refused by Cargo.
+  ([#34](https://github.com/Dicklesworthstone/beads_viewer_rust/issues/34))
+- Lockfile refresh within the existing version ranges: 26 crates, among them
+  time 0.3.55, serde_json 1.0.154 and ICU 2.3. `tru` (TOON) goes to 0.2.3 and
+  is capped below 0.2.4, because 0.2.4 and 0.2.5 need Rust 1.95 or newer
+  through a build dependency (vergen-gix 10).
+- The test suite no longer depends on the user's Git ignore file, and an
+  intermittent "Text file busy" failure in the Git history tests is fixed.
+  ([53972b9](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/53972b9))
+
+---
+
+## [v0.4.0] -- 2026-10-08
+
+Catch-up with the current legacy `bv` (beads_viewer, October 2026). This covers
+its data-source authority, robot contract, and TUI look and feel.
+
+### Data source authority
+
+- Reads br's SQLite database directly (read-only) when `.beads/metadata.json`
+  declares it, picking whichever is fresher: the database (including its `-wal`)
+  or the JSONL export. A corrupt database falls back to the export.
+  `BV_DATA_SOURCE=auto|sqlite|jsonl` forces a store.
+  ([1a35456](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/1a35456))
+- Follows `.beads/redirect` chains like `br where`. Honors `BEADS_DB` (a file
+  or `.beads` directory) ahead of `BEADS_DIR`. `--db` accepts a SQLite
+  database, a JSONL file, or a directory.
+- Dolt-native `bd` workspaces are read only through `.beads/issues.jsonl`
+  (running `bd export` when it is missing), so a stray JSONL is never taken
+  for the issue store.
+- New `defer_until` support: deferred beads are kept out of ready work. br's
+  `due_at` now loads as the due date (it was silently dropped).
+
+### Robot contract
+
+- Claimable top picks match legacy: open, unassigned, not an epic, not a parent
+  with open children, not deferred, and none of the opt-in not-ready labels
+  (`--robot-not-ready-labels` / `BV_ROBOT_NOT_READY_LABELS`). Every
+  recommendation carries `claimable` and `defer_until`.
+  ([1a35456](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/1a35456), [18d7259](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/18d7259))
+- Strict triage counts (#165): `open_count`/`blocked_count` count exact
+  statuses. The old aggregates now live in `not_closed_count` and
+  `not_actionable_count`. **Breaking** for consumers that relied on the old
+  meanings. ([a8799c4](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/a8799c4))
+- New: `--brief` (compact triage), `--robot-capabilities` (one-call manifest),
+  `--export` with `--export-format markdown|json|csv|mermaid`, and
+  `--graph-root` scoping for triage. ([1a35456](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/1a35456), [ad6e75e](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/ad6e75e))
+- Agent-style invocations are accepted: `bvr triage --json`, `bvr robot-next`,
+  `bvr search "q" --limit 5`, `bvr graph mermaid`, `bvr --workspace w.yaml next`.
+  ([4901d36](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4901d36))
+- In workspace mode, claim/show commands `cd` into the issue's repository and
+  use its local ID. ([383ce0d](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/383ce0d))
+- `--export-graph graph.html` writes legacy's self-contained interactive force
+  graph. ([ad6e75e](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/ad6e75e))
+
+### TUI: legacy look and feel on frankentui
+
+Each view was compared side by side with the Go binary in a real terminal.
+
+- **Main**: Go's column-header list with type glyphs, P0–P4 badges, status
+  badges, ages, comment counts, and paging; a Markdown detail pane rendered by
+  ftui-extras; the Go status bar; click-to-select. ([cfb50d8](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/cfb50d8))
+- **Board**: Go's kanban with rounded lane columns, colored headers, and
+  state-colored cards. ([09aa9fd](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/09aa9fd))
+- **Insights**: Go's 3×3 metric-panel grid plus the priority strip.
+  ([8691b51](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/8691b51))
+- **Graph**: Go's GRAPH METRICS styling and status bar. ([a3d5f2b](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/a3d5f2b))
+- **Help**: Go's color-coded keyboard-shortcut modal. ([6b893b4](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/6b893b4))
+- No tab strip in the Go-styled views. `--theme light|dark|auto`.
+  ([2b32917](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/2b32917))
+- **History**: Go's HISTORY header (mode indicator, stats badges, filter
+  line) over rounded BEADS WITH HISTORY / COMMITS / COMMIT DETAILS panes, a
+  TIMELINE pane in wide bead mode, rich commit cards (type glyph, linked SHA,
+  author badge, conventional subject, confidence, files), and a stats footer.
+  ([7f5be75](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/7f5be75))
+- **Tree, label dashboard, attention, flow matrix, sprint**: Go's layouts —
+  the hierarchy with fold glyphs and status dots (Go's node order), the label
+  health table, the top-ten attention table, the DEPENDENCY FLOW dashboard
+  with a blocking-pair drilldown, and the centered sprint dashboard with an
+  ASCII burndown and at-risk beads. Enter on a label filters the list.
+  ([4dd8b67](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4dd8b67))
+- **Alerts panel** on `!` (jump to the issue, `d` dismiss), and Go's view keys:
+  `]` attention, `f` flow matrix, `E` tree.
+  ([0055151](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/0055151))
+- **Shortcuts sidebar** on `;` / `F2`, context-aware, with the body reflowing
+  beside it. ([27845e6](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/27845e6))
+- **Interactive tutorial** on `` ` `` / Ctrl+T: legacy's structured pages with
+  a table of contents and viewed progress, rewritten for bvr's keys.
+
+### Legacy flags added after the original parity pass
+
+- `--id-pattern` (custom bead-ID regexes for commit correlation and orphan
+  detection), `--search-min-score`, and `--robot-history-timeout-ms`.
+  ([93902eb](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/93902eb))
+- `--robot-burndown` reports legacy's `at_risk` sprint beads (blocked too
+  long, no activity, critical blocked, blockers not closing).
+  ([4dd8b67](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4dd8b67))
+- `--export-template`: legacy Go `text/template` Markdown reports.
+- `--update`, `--update-dry-run`, `--yes`, and `--rollback` map onto
+  `bvr upgrade`. ([9286c01](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/9286c01))
+
+### Changed behavior to check when upgrading
+
+- **Ready work is status-gated** (#25): only `open` and `in_progress` beads
+  that are not deferred count as actionable. Beads in `blocked`, `deferred`,
+  `pinned`, `hooked` or `review` leave `actionable_count`, recommendations, `--robot-plan` tracks and the TUI
+  Actionable view. **Drift baselines saved by v0.3.0 can report a false
+  `actionable_change`; re-run `--save-baseline` after upgrading.**
+  ([f631a30](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/f631a30))
+- `project_health.counts.open` and `.blocked` count exact statuses as well;
+  new `not_closed` and `dependency_blocked` counts carry the old aggregates.
+- `quick_wins` and the per-track / per-label `top_pick` use the same claimable
+  gate as `--robot-next`.
+- History time travel (`--as-of`, `--diff-since`) skips malformed or
+  custom-status lines in old snapshots instead of failing (#24).
+  ([4123c59](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/4123c59))
+- `bvr --json` on its own runs `--robot-triage`.
+- Keys: `!` opens the alerts panel (it was the attention view, now on `]`,
+  which was the flow matrix, now on `f`); `h`/`l` in Insights move between
+  panels (they used to switch focus between list and detail); `1`-`9` in the
+  attention view filter the list by that label (`1` used to just return to
+  Main); the tutorial is interactive and closes with Esc or `q`.
+
+### Static pages viewer
+
+- Dashboard search opens the issue list with the query, and pending searches
+  are cancelled when you navigate away.
+  ([bcc552a](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/bcc552a),
+  [8df379b](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/8df379b))
+- Unblock, what-if and top-K numbers are corrected (v0.3.0 used the wrong
+  edge direction and WASM field names), and recorded graph history playback
+  works (it never did in earlier releases). ([8e74f75](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/8e74f75),
+  [94cca84](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/94cca84))
+
+### Fixed
+
+- **Security: `--emit-script` keeps tracker values on their line.** An issue
+  title, reason or ID containing a newline (or another control character)
+  ended a `#` comment in the generated script and turned the rest into a
+  command the script ran. Every interpolated value is now made single-line.
+  This affects every earlier release; up to v0.3.0 the runnable `br show`
+  line also used the ID unquoted, so `;` or `$(...)` in an ID ran as well
+  (IDs are shell-quoted since 383ce0d). In fish scripts, a command whose ID
+  needed quoting is left as a comment, because the POSIX quoting does not
+  hold in fish.
+  ([3853fff](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/3853fff80c59b49d97f9e765d116b58a94629b3b),
+  [3d9f066](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/3d9f066f0b63abf7ad50d2731f58a7c6e962f7be))
+- `--robot-next` (new claimable gate in this release) could answer "No
+  actionable items available" when the ten best-scored beads were all
+  assigned, epics or not-ready while claimable work ranked lower. Top picks
+  and quick wins are drawn before the recommendation list is cut.
+  ([7a75221](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/7a75221d9bc1d5d31ede4d7e995de2961a3a7d50))
+- In workspace mode, a repository whose own IDs already carry the workspace
+  prefix (`api-12` in repo `api`) got claim/show commands for `12` (or `-12`
+  with a dashless prefix). They use the tracker's own ID again, as v0.3.0 did.
+  ([9526224](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/95262241412d0337a7da68bbe865499f113cfa65))
+- `--graph-root` triage (new in this release) offered a child as claimable
+  when its blocker was outside the subtree. Blocked state now comes from the
+  full graph.
+  ([674d8c6](https://github.com/Dicklesworthstone/beads_viewer_rust/commit/674d8c6c2c28643680d291264c16b22d06dcd2ad))
+
+### Known limitations
+
+- In Dolt-native `bd` workspaces, bvr runs `bd export` only when
+  `.beads/issues.jsonl` is missing, without a timeout, and does not refresh
+  it afterwards: re-run `bd export` after writing with `bd`.
+- The static pages viewer computes exact betweenness on load when no exported
+  value is available (above 10,000 issues), which can take seconds.
+- `rust-version` says 1.85, but the locked vergen 9.1 and sysinfo 0.37 need
+  Rust 1.88 (also true of v0.3.0).
+
+---
+
 ## [v0.3.0] -- 2026-08-22
 
 ### Self-update: new `bvr upgrade` command (#23)
