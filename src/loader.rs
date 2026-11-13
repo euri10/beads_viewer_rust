@@ -3682,7 +3682,7 @@ mod tests {
             ("id", "id=''", "issue id cannot be empty"),
             ("title", "title=''", "title cannot be empty"),
             ("type", "issue_type=''", "issue_type cannot be empty"),
-            ("status", "status='unrecognized'", "unknown status"),
+            ("status", "status='  '", "status cannot be empty"),
             (
                 "time_order",
                 "created_at='2027-01-01T00:00:00Z'",
@@ -3699,6 +3699,43 @@ mod tests {
 
             assert_sqlite_source_rejected(&db, &["issues", diagnostic]);
         }
+    }
+
+    #[test]
+    fn custom_status_records_survive_sqlite_and_jsonl_loads() {
+        // #37: one custom-status record must neither abort a SQLite load
+        // nor silently vanish from a JSONL load.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("beads.db");
+        write_br_sqlite(&db);
+        let writer = rusqlite::Connection::open(&db).expect("open writer");
+        writer
+            .execute_batch("UPDATE issues SET status='reference' WHERE id='bd-1';")
+            .expect("store custom status");
+        drop(writer);
+
+        let from_sqlite = load_issues_from_sqlite(&db).expect("sqlite load succeeds");
+        let reference = from_sqlite
+            .iter()
+            .find(|issue| issue.id == "bd-1")
+            .expect("custom-status record retained from sqlite");
+        assert_eq!(reference.status, "reference");
+
+        let jsonl = dir.path().join("issues.jsonl");
+        let lines: Vec<String> = from_sqlite
+            .iter()
+            .map(|issue| serde_json::to_string(issue).expect("serialize issue"))
+            .collect();
+        std::fs::write(&jsonl, lines.join("\n") + "\n").expect("write jsonl");
+        let from_jsonl = load_issues_from_file(&jsonl).expect("jsonl load succeeds");
+        let ids = |issues: &[Issue]| -> Vec<String> {
+            issues.iter().map(|issue| issue.id.clone()).collect()
+        };
+        assert_eq!(
+            ids(&from_jsonl),
+            ids(&from_sqlite),
+            "same records on both paths"
+        );
     }
 
     #[test]
